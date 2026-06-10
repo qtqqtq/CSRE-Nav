@@ -42,14 +42,16 @@ class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Actor, self).__init__()
 
-        self.layer_1 = nn.Linear(state_dim, 800)
-        self.layer_2 = nn.Linear(800, 600)
-        self.layer_3 = nn.Linear(600, action_dim)
+        self.layer_1 = nn.Linear(state_dim, 400)
+        torch.nn.init.kaiming_uniform_(self.layer_1.weight, nonlinearity="leaky_relu")
+        self.layer_2 = nn.Linear(400, 300)
+        torch.nn.init.kaiming_uniform_(self.layer_2.weight, nonlinearity="leaky_relu")
+        self.layer_3 = nn.Linear(300, action_dim)
         self.tanh = nn.Tanh()
 
     def forward(self, s):
-        s = F.relu(self.layer_1(s))
-        s = F.relu(self.layer_2(s))
+        s = F.leaky_relu(self.layer_1(s))
+        s = F.leaky_relu(self.layer_2(s))
         a = self.tanh(self.layer_3(s))
         return a
 
@@ -58,43 +60,51 @@ class Critic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Critic, self).__init__()
 
-        self.layer_1 = nn.Linear(state_dim, 800)
-        self.layer_2_s = nn.Linear(800, 600)
-        self.layer_2_a = nn.Linear(action_dim, 600)
-        self.layer_3 = nn.Linear(600, 1)
+        self.layer_1 = nn.Linear(state_dim, 400)
+        torch.nn.init.kaiming_uniform_(self.layer_1.weight, nonlinearity="leaky_relu")
+        self.layer_2_s = nn.Linear(400, 300)
+        torch.nn.init.kaiming_uniform_(self.layer_2_s.weight, nonlinearity="leaky_relu")
+        self.layer_2_a = nn.Linear(action_dim, 300)
+        torch.nn.init.kaiming_uniform_(self.layer_2_a.weight, nonlinearity="leaky_relu")
+        self.layer_3 = nn.Linear(300, 1)
+        torch.nn.init.kaiming_uniform_(self.layer_3.weight, nonlinearity="leaky_relu")
 
-        self.layer_4 = nn.Linear(state_dim, 800)
-        self.layer_5_s = nn.Linear(800, 600)
-        self.layer_5_a = nn.Linear(action_dim, 600)
-        self.layer_6 = nn.Linear(600, 1)
+        self.layer_4 = nn.Linear(state_dim, 400)
+        torch.nn.init.kaiming_uniform_(self.layer_1.weight, nonlinearity="leaky_relu")
+        self.layer_5_s = nn.Linear(400, 300)
+        torch.nn.init.kaiming_uniform_(self.layer_5_s.weight, nonlinearity="leaky_relu")
+        self.layer_5_a = nn.Linear(action_dim, 300)
+        torch.nn.init.kaiming_uniform_(self.layer_5_a.weight, nonlinearity="leaky_relu")
+        self.layer_6 = nn.Linear(300, 1)
+        torch.nn.init.kaiming_uniform_(self.layer_6.weight, nonlinearity="leaky_relu")
 
     def forward(self, s, a):
-        s1 = F.relu(self.layer_1(s))
+        s1 = F.leaky_relu(self.layer_1(s))
         self.layer_2_s(s1)
         self.layer_2_a(a)
         s11 = torch.mm(s1, self.layer_2_s.weight.data.t())
         s12 = torch.mm(a, self.layer_2_a.weight.data.t())
-        s1 = F.relu(s11 + s12 + self.layer_2_a.bias.data)
+        s1 = F.leaky_relu(s11 + s12 + self.layer_2_a.bias.data)
         q1 = self.layer_3(s1)
 
-        s2 = F.relu(self.layer_4(s))
+        s2 = F.leaky_relu(self.layer_4(s))
         self.layer_5_s(s2)
         self.layer_5_a(a)
         s21 = torch.mm(s2, self.layer_5_s.weight.data.t())
         s22 = torch.mm(a, self.layer_5_a.weight.data.t())
-        s2 = F.relu(s21 + s22 + self.layer_5_a.bias.data)
+        s2 = F.leaky_relu(s21 + s22 + self.layer_5_a.bias.data)
         q2 = self.layer_6(s2)
         return q1, q2
 
 
 # TD3 network
 class TD3(object):
-    def __init__(self, state_dim, action_dim, max_action):
+    def __init__(self, state_dim, action_dim, max_action,lr=1e-4):
         # Initialize the Actor network
         self.actor = Actor(state_dim, action_dim).to(device)
         self.actor_target = Actor(state_dim, action_dim).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters())
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
 
         # Initialize the Critic networks
         self.critic = Critic(state_dim, action_dim).to(device)
@@ -221,7 +231,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # cuda or
 seed = 0  # Random seed number
 eval_freq = 5e3  # After how many steps to perform the evaluation
 max_ep = 500  # maximum number of steps per episode
-eval_ep = 10  # number of episodes for evaluation
+eval_ep = 3  # number of episodes for evaluation
 max_timesteps = 5e6  # Maximum number of steps to perform
 expl_noise = 1  # Initial exploration noise starting value in range [expl_min ... 1]
 expl_decay_steps = (
@@ -235,9 +245,10 @@ policy_noise = 0.2  # Added noise for exploration
 noise_clip = 0.5  # Maximum clamping values of the noise
 policy_freq = 2  # Frequency of Actor network updates
 buffer_size = 1e6  # Maximum size of the buffer
-file_name = "TD3_velodyne"  # name of the file to store the policy
+file_name = "TD3_velodyne_GDAE"  # name of the file to store the policy
 save_model = True  # Weather to save the model or not
-load_model = False  # Weather to load a stored model
+load_model = True  # Weather to load a stored model
+load_model_name = "TD3_velodyne"  # name of the stored model to load
 random_near_obstacle = True  # To take random actions near obstacles or not
 
 # Create the network storage folders
@@ -263,7 +274,7 @@ network = TD3(state_dim, action_dim, max_action)
 replay_buffer = ReplayBuffer(buffer_size, seed)
 if load_model:
     try:
-        network.load(file_name, "./pytorch_models")
+        network.load(load_model_name, "./pytorch_models")
     except:
         print(
             "Could not load the stored model parameters, initializing training with random parameters"
@@ -299,7 +310,7 @@ while timestep < max_timesteps:
             )
 
         if timesteps_since_eval >= eval_freq:
-            print("Validating")
+            print("Validating timestep{},episode {}".format(timestep, episode_num))
             timesteps_since_eval %= eval_freq
             evaluations.append(
                 evaluate(network=network, epoch=epoch, eval_episodes=eval_ep)
