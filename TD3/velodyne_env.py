@@ -112,8 +112,6 @@ class GazeboEnv:
         subprocess.Popen(["roslaunch", "-p", port, fullpath])
         print("Gazebo launched!")
 
-        subprocess.Popen(["roslaunch","-p",port,])
-
         # Set up the ROS publishers and subscribers
         self.vel_pub = rospy.Publisher("/r1/cmd_vel", Twist, queue_size=1)
         self.set_state = rospy.Publisher(
