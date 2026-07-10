@@ -51,7 +51,7 @@ file_name = "TD3_velodyne"  # name of the file to load the policy from
 
 
 # Create the testing environment
-environment_dim = 20
+environment_dim = 40
 robot_dim = 4
 env = GazeboEnv("multi_robot_scenario.launch", environment_dim)
 time.sleep(5)

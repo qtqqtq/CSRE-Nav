@@ -35,7 +35,7 @@ def evaluate(network, epoch, eval_episodes=10):
         % (eval_episodes, epoch, avg_reward, avg_col)
     )
     print("..............................................")
-    return avg_reward
+    return avg_reward, avg_col
 
 
 class Actor(nn.Module):
@@ -80,19 +80,11 @@ class Critic(nn.Module):
 
     def forward(self, s, a):
         s1 = F.leaky_relu(self.layer_1(s))
-        self.layer_2_s(s1)
-        self.layer_2_a(a)
-        s11 = torch.mm(s1, self.layer_2_s.weight.data.t())
-        s12 = torch.mm(a, self.layer_2_a.weight.data.t())
-        s1 = F.leaky_relu(s11 + s12 + self.layer_2_a.bias.data)
+        s1 = F.leaky_relu(self.layer_2_s(s1) + self.layer_2_a(a))
         q1 = self.layer_3(s1)
 
         s2 = F.leaky_relu(self.layer_4(s))
-        self.layer_5_s(s2)
-        self.layer_5_a(a)
-        s21 = torch.mm(s2, self.layer_5_s.weight.data.t())
-        s22 = torch.mm(a, self.layer_5_a.weight.data.t())
-        s2 = F.leaky_relu(s21 + s22 + self.layer_5_a.bias.data)
+        s2 = F.leaky_relu(self.layer_5_s(s2) + self.layer_5_a(a))
         q2 = self.layer_6(s2)
         return q1, q2
 
@@ -209,9 +201,23 @@ class TD3(object):
             av_loss += loss
         self.iter_count += 1
         # Write new values for tensorboard
-        self.writer.add_scalar("loss", av_loss / iterations, self.iter_count)
-        self.writer.add_scalar("Av. Q", av_Q / iterations, self.iter_count)
-        self.writer.add_scalar("Max. Q", max_Q, self.iter_count)
+        self.writer.add_scalar("Loss/critic", av_loss / iterations, self.iter_count)
+        self.writer.add_scalar("Q/Avg", av_Q / iterations, self.iter_count)
+        self.writer.add_scalar("Q/Max", max_Q, self.iter_count)
+
+    def log_episode(self, episode_num, reward, length, goal_reached,
+                    collision, expl_noise):
+        """Log per-episode training metrics to TensorBoard."""
+        self.writer.add_scalar("Episode/reward", reward, episode_num)
+        self.writer.add_scalar("Episode/length", length, episode_num)
+        self.writer.add_scalar("Episode/goal_reached", int(goal_reached), episode_num)
+        self.writer.add_scalar("Episode/collision", int(collision), episode_num)
+        self.writer.add_scalar("Train/exploration_noise", expl_noise, episode_num)
+
+    def log_eval(self, epoch, avg_reward, avg_collision_rate):
+        """Log evaluation metrics to TensorBoard."""
+        self.writer.add_scalar("Eval/avg_reward", avg_reward, epoch)
+        self.writer.add_scalar("Eval/avg_collision_rate", avg_collision_rate, epoch)
 
     def save(self, filename, directory):
         torch.save(self.actor.state_dict(), "%s/%s_actor.pth" % (directory, filename))
@@ -258,7 +264,7 @@ if save_model and not os.path.exists("./pytorch_models"):
     os.makedirs("./pytorch_models")
 
 # Create the training environment
-environment_dim = 20
+environment_dim = 40
 robot_dim = 4
 env = GazeboEnv("multi_robot_scenario.launch", environment_dim)
 time.sleep(5)
@@ -308,13 +314,23 @@ while timestep < max_timesteps:
                 noise_clip,
                 policy_freq,
             )
+            # Log episode-level metrics
+            network.log_episode(
+                episode_num=episode_num,
+                reward=episode_reward,
+                length=episode_timesteps,
+                goal_reached=target,
+                collision=(episode_reward < -90),
+                expl_noise=expl_noise,
+            )
 
         if timesteps_since_eval >= eval_freq:
             print("Validating timestep{},episode {}".format(timestep, episode_num))
             timesteps_since_eval %= eval_freq
-            evaluations.append(
-                evaluate(network=network, epoch=epoch, eval_episodes=eval_ep)
-            )
+            avg_reward, avg_col = evaluate(
+                network=network, epoch=epoch, eval_episodes=eval_ep)
+            evaluations.append(avg_reward)
+            network.log_eval(epoch, avg_reward, avg_col)
             network.save(file_name, directory="./pytorch_models")
             np.save("./results/%s" % (file_name), evaluations)
             epoch += 1
@@ -341,7 +357,7 @@ while timestep < max_timesteps:
     if random_near_obstacle:
         if (
             np.random.uniform(0, 1) > 0.85
-            and min(state[4:-8]) < 0.6
+            and min(state[14:26]) < 0.6
             and count_rand_actions < 1
         ):
             count_rand_actions = np.random.randint(8, 15)
@@ -369,7 +385,9 @@ while timestep < max_timesteps:
     timesteps_since_eval += 1
 
 # After the training is done, evaluate the network and save it
-evaluations.append(evaluate(network=network, epoch=epoch, eval_episodes=eval_ep))
+avg_reward, avg_col = evaluate(network=network, epoch=epoch, eval_episodes=eval_ep)
+evaluations.append(avg_reward)
+network.log_eval(epoch, avg_reward, avg_col)
 if save_model:
     network.save("%s" % file_name, directory="./pytorch_models")
 np.save("./results/%s" % file_name, evaluations)

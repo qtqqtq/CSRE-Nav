@@ -13,6 +13,7 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2
 from squaternion import Quaternion
+from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import Empty
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
@@ -65,7 +66,8 @@ def check_pos(x, y):
 class GazeboEnv:
     """Superclass for all Gazebo environments."""
 
-    def __init__(self, launchfile, environment_dim):
+    def __init__(self, launchfile, environment_dim, use_cnn=False,
+                 ray_h_beams=36, ray_v_layers=21, max_ray_range=5.0):
         self.environment_dim = environment_dim
         self.odom_x = 0
         self.odom_y = 0
@@ -77,6 +79,15 @@ class GazeboEnv:
         self.lower = -5.0
         self.velodyne_data = np.ones(self.environment_dim) * 10
         self.last_odom = None
+        self.last_distance = 0.0  # for progress reward
+
+        # ---- CNN mode: cost_rays from c_space_mapper_node ----
+        self.use_cnn = use_cnn
+        self.ray_h_beams = ray_h_beams        # horizontal beams (default 36 = 10° res)
+        self.ray_v_layers = ray_v_layers      # theta layers from c-space (default 21)
+        self.max_ray_range = max_ray_range    # maximum ray range for preprocessing
+        # Buffer: initialized to max_range (no collision detected yet)
+        self.cost_rays_data = np.ones((ray_h_beams, ray_v_layers)) * max_ray_range
 
         self.set_self_state = ModelState()
         self.set_self_state.model_name = "r1"
@@ -88,10 +99,10 @@ class GazeboEnv:
         self.set_self_state.pose.orientation.z = 0.0
         self.set_self_state.pose.orientation.w = 1.0
 
-        self.gaps = [[-np.pi / 2 - 0.03, -np.pi / 2 + np.pi / self.environment_dim]]
+        self.gaps = [[-np.pi - 0.03, -np.pi + 2 * np.pi / self.environment_dim]]
         for m in range(self.environment_dim - 1):
             self.gaps.append(
-                [self.gaps[m][1], self.gaps[m][1] + np.pi / self.environment_dim]
+                [self.gaps[m][1], self.gaps[m][1] + 2 * np.pi / self.environment_dim]
             )
         self.gaps[-1][-1] += 0.03
 
@@ -102,6 +113,10 @@ class GazeboEnv:
 
         # Launch the simulation with the given launchfile name
         rospy.init_node("gym", anonymous=True)
+
+        # Ensure use_sim_time is set before any nodes start publishing TF
+        rospy.set_param("/use_sim_time", True)
+
         if launchfile.startswith("/"):
             fullpath = launchfile
         else:
@@ -111,6 +126,33 @@ class GazeboEnv:
 
         subprocess.Popen(["roslaunch", "-p", port, fullpath])
         print("Gazebo launched!")
+
+        # ---- CNN mode: launch c_space_mapper pipeline ----
+        if self.use_cnn:
+            project_root = os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)))
+            cspace_src = os.path.join(project_root, "catkin_ws", "src")
+
+            # Ensure ROS can find the c_space_mapper packages
+            ros_env = os.environ.copy()
+            if "ROS_PACKAGE_PATH" in ros_env:
+                if cspace_src not in ros_env["ROS_PACKAGE_PATH"]:
+                    ros_env["ROS_PACKAGE_PATH"] = (
+                        cspace_src + ":" + ros_env["ROS_PACKAGE_PATH"])
+            else:
+                ros_env["ROS_PACKAGE_PATH"] = cspace_src
+
+            cspace_launch = os.path.join(
+                cspace_src, "c_space_mapper", "launch", "c_space_mapper.launch")
+            if path.exists(cspace_launch):
+                subprocess.Popen(
+                    ["roslaunch", "-p", port, cspace_launch], env=ros_env)
+                print("c_space_mapper launched!")
+                # Wait for pipeline: lidar_to_occupancy → c_space_mapper
+                time.sleep(3)
+            else:
+                print("WARNING: c_space_mapper launch not found at %s"
+                      % cspace_launch)
 
         # Set up the ROS publishers and subscribers
         self.vel_pub = rospy.Publisher("/r1/cmd_vel", Twist, queue_size=1)
@@ -129,12 +171,20 @@ class GazeboEnv:
         self.odom = rospy.Subscriber(
             "/r1/odom", Odometry, self.odom_callback, queue_size=1
         )
+        if self.use_cnn:
+            self.cost_rays_sub = rospy.Subscriber(
+                "/cost_rays", Float32MultiArray,
+                self.cost_rays_callback, queue_size=1
+            )
 
-    # Read velodyne pointcloud and turn it into distance data, then select the minimum value for each angle
-    # range as state representation
+    # Read velodyne pointcloud and turn it into distance data, then select the
+    # minimum value for each angle range as state representation.
+    # The raw velodyne_data is used for collision detection only;
+    # CNN-mode uses cost_rays from the c_space_mapper pipeline instead.
     def velodyne_callback(self, v):
         data = list(pc2.read_points(v, skip_nans=False, field_names=("x", "y", "z")))
         self.velodyne_data = np.ones(self.environment_dim) * 10
+
         for i in range(len(data)):
             if data[i][2] > -0.2:
                 dot = data[i][0] * 1 + data[i][1] * 0
@@ -151,6 +201,35 @@ class GazeboEnv:
     def odom_callback(self, od_data):
         self.last_odom = od_data
 
+    # ---- CNN mode: receive 3D cost rays from c_space_mapper_node ----
+    def cost_rays_callback(self, msg):
+        """Receive cost_rays from c_space_mapper_node.
+
+        Message layout:
+          dim[0] = "beam",  size=num_beams (36), stride=nz_
+          dim[1] = "theta", size=nz_ (21),     stride=1
+
+        Each element is the distance along beam b at robot orientation θ
+        to the first collision in the 3D configuration space.
+        """
+        num_beams = msg.layout.dim[0].size
+        nz = msg.layout.dim[1].size
+        data = np.array(msg.data, dtype=np.float32)
+        if data.size == num_beams * nz:
+            self.cost_rays_data = data.reshape(num_beams, nz)
+        else:
+            rospy.logwarn("cost_rays size mismatch: %d != %d*%d",
+                          data.size, num_beams, nz)
+
+    # Preprocess cost_rays to match NavRL format:
+    #   - Clip min distance to 0.1 m (avoid divide-by-zero)
+    #   - Invert: near obstacles → high activation (cost-like representation)
+    #   - Add channel dimension: (H, V) → (1, H, V)
+    def _preprocess_cost_rays(self):
+        cr = np.maximum(self.cost_rays_data, 0.1)
+        cr = self.max_ray_range - cr
+        return cr[np.newaxis, :, :]
+
     # Perform an action and read a new state
     def step(self, action):
         target = False
@@ -165,6 +244,7 @@ class GazeboEnv:
         rospy.wait_for_service("/gazebo/unpause_physics")
         try:
             self.unpause()
+            pass
         except (rospy.ServiceException) as e:
             print("/gazebo/unpause_physics service call failed")
 
@@ -227,8 +307,19 @@ class GazeboEnv:
             done = True
 
         robot_state = [distance, theta, action[0], action[1]]
-        state = np.append(laser_state, robot_state)
-        reward = self.get_reward(target, collision, action, min_laser)
+
+        if self.use_cnn:
+            # CNN mode: cost_rays (from c_space_mapper) + kinematic state
+            cr_proc = self._preprocess_cost_rays()
+            kinematic = np.array(robot_state, dtype=np.float32)
+            # Flatten for replay buffer compatibility
+            state = np.concatenate([cr_proc.flatten(), kinematic])
+        else:
+            state = np.append(laser_state, robot_state)
+
+        progress = self.last_distance - distance
+        self.last_distance = distance
+        reward = self.get_reward(target, collision, action, min_laser, progress)
         return state, reward, done, target
 
     def reset(self):
@@ -314,7 +405,15 @@ class GazeboEnv:
             theta = np.pi - theta
 
         robot_state = [distance, theta, 0.0, 0.0]
-        state = np.append(laser_state, robot_state)
+        self.last_distance = distance   # track for progress reward
+
+        if self.use_cnn:
+            cr_proc = self._preprocess_cost_rays()
+            kinematic = np.array(robot_state, dtype=np.float32)
+            state = np.concatenate([cr_proc.flatten(), kinematic])
+        else:
+            state = np.append(laser_state, robot_state)
+
         return state
 
     def change_goal(self):
@@ -431,11 +530,14 @@ class GazeboEnv:
         return False, False, min_laser
 
     @staticmethod
-    def get_reward(target, collision, action, min_laser):
+    def get_reward(target, collision, action, min_laser, progress=0.0):
         if target:
             return 100.0
         elif collision:
             return -100.0
         else:
             r3 = lambda x: 1 - x if x < 1 else 0.0
-            return action[0] / 2 - abs(action[1]) / 2 - r3(min_laser) / 2
+            return (action[0] / 2
+                    - abs(action[1]) / 2
+                    - r3(min_laser) / 2
+                    + 10.0 * progress)  # distance progress toward goal

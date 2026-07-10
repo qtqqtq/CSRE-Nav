@@ -15,7 +15,7 @@ RUN apt remove -y python3-pip
 RUN apt-get install -y wget
 RUN wget https://bootstrap.pypa.io/pip/3.8/get-pip.py
 RUN python3 get-pip.py
-RUN pip3 install --upgrade protobuf
+RUN pip3 install --upgrade protobuf Pillow
 
 
 ENV DEBIAN_FRONTEND=noninteractive
