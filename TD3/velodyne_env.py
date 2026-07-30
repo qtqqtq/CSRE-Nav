@@ -527,32 +527,30 @@ class GazeboEnv:
         except (rospy.ServiceException) as e:
             print("/gazebo/unpause_physics service call failed")
 
-        # propagate state for TIME_DELTA seconds
+        # propagate state for TIME_DELTA seconds; extend if odom hasn't arrived
         time.sleep(TIME_DELTA)
+        if self.last_odom is None:
+            for _ in range(60):  # up to 3 more seconds
+                time.sleep(0.05)
+                if self.last_odom is not None:
+                    break
 
         rospy.wait_for_service("/gazebo/pause_physics")
         try:
-            pass
             self.pause()
         except (rospy.ServiceException) as e:
             print("/gazebo/pause_physics service call failed")
+
+        if self.last_odom is None:
+            raise RuntimeError(
+                "No odometry received in step() — "
+                "check that /r1/odom is being published")
 
         # read velodyne laser state
         done, collision, min_laser = self.observe_collision(self.velodyne_data)
         v_state = []
         v_state[:] = self.velodyne_data[:]
         laser_state = [v_state]
-
-        # Wait for the first odometry message if not yet received (avoid race after reset)
-        if self.last_odom is None:
-            waited = 0.0
-            while self.last_odom is None and waited < 2.0:
-                time.sleep(0.02)
-                waited += 0.02
-            if self.last_odom is None:
-                raise RuntimeError(
-                    "No odometry received after 2 s — "
-                    "check that /r1/odom is being published")
 
         # Calculate robot heading from odometry data
         self.odom_x = self.last_odom.pose.pose.position.x
@@ -670,18 +668,29 @@ class GazeboEnv:
         rospy.wait_for_service("/gazebo/unpause_physics")
         try:
             self.unpause()
-            pass
         except (rospy.ServiceException) as e:
             print("/gazebo/unpause_physics service call failed")
 
+        # Wait for velodyne + odometry while Gazebo is running.
+        # rospy subscriber callbacks fire in background threads.
         time.sleep(TIME_DELTA)
+        if self.last_odom is None:
+            for _ in range(100):  # up to 5 more seconds
+                time.sleep(0.05)
+                if self.last_odom is not None:
+                    break
 
         rospy.wait_for_service("/gazebo/pause_physics")
         try:
             self.pause()
-            pass
         except (rospy.ServiceException) as e:
             print("/gazebo/pause_physics service call failed")
+
+        if self.last_odom is None:
+            raise RuntimeError(
+                "No odometry received after 5 s in reset() — "
+                "check that /r1/odom is being published")
+
         v_state = []
         v_state[:] = self.velodyne_data[:]
         laser_state = [v_state]

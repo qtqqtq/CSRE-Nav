@@ -74,37 +74,101 @@ def random_action():
                      np.random.uniform(-1.0, 1.0)])
 
 
-def straight_to_goal_action(env):
+def _ros_yaw(odom):
+    """Compute yaw from a nav_msgs/Odometry message without any library.
+
+    Uses the standard quaternion→Euler formula directly.
+    ROS Quaternion: x, y, z, w (scalar-last).
+    """
+    qx = odom.pose.pose.orientation.x
+    qy = odom.pose.pose.orientation.y
+    qz = odom.pose.pose.orientation.z
+    qw = odom.pose.pose.orientation.w
+
+    # Standard conversion: yaw = atan2(2(qw*qz + qx*qy), 1 - 2(qy² + qz²))
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def straight_to_goal_action(env, _diag=None):
     """Proportional controller driving straight toward the goal.
 
-    Reads current odometry and goal position from the environment.
-    Uses proportional control for angular velocity and distance-based
-    linear velocity.  No laser feedback — purely reactive to goal pose.
+    Uses manual yaw extraction (no library dependency) and vector
+    cross/dot product for heading-error computation.
+
+    Prints diagnostic values on the first call and every 50 steps.
     """
-    from squaternion import Quaternion
+    # Track call count for diagnostics
+    if not hasattr(straight_to_goal_action, "_cnt"):
+        straight_to_goal_action._cnt = 0
+        straight_to_goal_action._prev_odom_x = None
+        straight_to_goal_action._prev_odom_y = None
+    cnt = straight_to_goal_action._cnt
+    straight_to_goal_action._cnt += 1
+    do_diag = (cnt < 5 or cnt % 50 == 0)
 
     odom = env.last_odom
     if odom is None:
         return np.array([0.0, 0.0])
 
-    dx = env.goal_x - env.odom_x
-    dy = env.goal_y - env.odom_y
-    distance = math.sqrt(dx**2 + dy**2)
+    yaw = _ros_yaw(odom)
 
-    q = Quaternion(
-        odom.pose.pose.orientation.w,
-        odom.pose.pose.orientation.x,
-        odom.pose.pose.orientation.y,
-        odom.pose.pose.orientation.z,
-    )
-    yaw = q.to_euler(degrees=False)[2]
-    goal_angle = math.atan2(dy, dx)
-    theta = math.atan2(math.sin(goal_angle - yaw), math.cos(goal_angle - yaw))
+    # Use odom message position (most recent), not env.odom_x (may be stale)
+    odom_x = odom.pose.pose.position.x
+    odom_y = odom.pose.pose.position.y
+
+    dx = env.goal_x - odom_x
+    dy = env.goal_y - odom_y
+    distance = math.sqrt(dx**2 + dy**2)
+    if distance < 0.01:
+        return np.array([0.0, 0.0])
+
+    # Unit vector toward goal
+    ux = dx / distance
+    uy = dy / distance
+
+    # Robot forward direction
+    fx = math.cos(yaw)
+    fy = math.sin(yaw)
+
+    cross = fx * uy - fy * ux
+    dot = fx * ux + fy * uy
+    heading_err = math.atan2(cross, dot)
 
     Kp = 1.5
-    angular = np.clip(theta * Kp, -1.0, 1.0)
-    linear = np.clip(distance * 0.5, 0.0, 1.0)
-    linear *= (1.0 - abs(angular) * 0.5)  # slow down when turning
+    angular = np.clip(heading_err * Kp, -1.0, 1.0)
+
+    if dot < 0:
+        linear = 0.0
+    else:
+        linear = np.clip(distance * 0.5, 0.0, 1.0)
+        linear *= (1.0 - abs(angular) * 0.5)
+
+    # Diagnostic: verify heading from position delta
+    delta_angle = None
+    prev_x = straight_to_goal_action._prev_odom_x
+    prev_y = straight_to_goal_action._prev_odom_y
+    if prev_x is not None:
+        ddx = odom_x - prev_x
+        ddy = odom_y - prev_y
+        if math.hypot(ddx, ddy) > 0.001:
+            delta_angle = math.atan2(ddy, ddx)
+    straight_to_goal_action._prev_odom_x = odom_x
+    straight_to_goal_action._prev_odom_y = odom_y
+
+    if do_diag:
+        print("  [DIAG] cnt=%d | yaw=%.3f° | goal=(%.2f,%.2f) odom=(%.2f,%.2f) | "
+              "d=%.2f | h_err=%.3f°(%.1f°) | cross=%.3f dot=%.3f | "
+              "l=%.2f a=%.2f" % (
+                  cnt, math.degrees(yaw),
+                  env.goal_x, env.goal_y, odom_x, odom_y,
+                  distance, heading_err, math.degrees(heading_err),
+                  cross, dot,
+                  linear, angular))
+        if delta_angle is not None:
+            print("  [DIAG]   delta_heading=%.3f° (from last step displacement)"
+                  % math.degrees(delta_angle))
 
     return np.array([linear, angular])
 
@@ -123,15 +187,7 @@ def decompose_reward(env, action, reward_total):
 
     odom_x = odom.pose.pose.position.x
     odom_y = odom.pose.pose.position.y
-
-    from squaternion import Quaternion
-    q = Quaternion(
-        odom.pose.pose.orientation.w,
-        odom.pose.pose.orientation.x,
-        odom.pose.pose.orientation.y,
-        odom.pose.pose.orientation.z,
-    )
-    heading_angle = q.to_euler(degrees=False)[2]
+    heading_angle = _ros_yaw(odom)
 
     distance = math.sqrt((odom_x - env.goal_x)**2 + (odom_y - env.goal_y)**2)
     min_laser = min(env.velodyne_data)
@@ -171,7 +227,10 @@ def decompose_reward(env, action, reward_total):
 # ---------------------------------------------------------------------------
 
 def run_episode_env(env, policy_fn, policy_name, max_steps=500):
-    """Run one episode.  policy_fn(env) → action."""
+    """Run for at least *max_steps* total steps, resetting on episode end.
+
+    policy_fn(env) → action.
+    """
     print("\n" + "=" * 70)
     print("Running: %s" % policy_name)
     print("=" * 70)
@@ -179,6 +238,7 @@ def run_episode_env(env, policy_fn, policy_name, max_steps=500):
     env.reset()
     total_reward = 0.0
     reward_log = []
+    episodes = 1
 
     for step_idx in range(max_steps):
         action = policy_fn(env)
@@ -197,10 +257,12 @@ def run_episode_env(env, policy_fn, policy_name, max_steps=500):
                       comps["distance"], comps["min_laser"], tag))
 
         if done:
-            print("  → Ended step %d: goal=%s collision=%s" % (
-                step_idx + 1, target, comps["collision"]))
-            break
+            print("  → Episode %d ended at step %d: goal=%s collision=%s" % (
+                episodes, step_idx + 1, target, comps["collision"]))
+            env.reset()
+            episodes += 1
 
+    print("  → Finished: %d total steps across %d episodes" % (max_steps, episodes))
     return _build_result(policy_name, reward_log, total_reward)
 
 
@@ -209,7 +271,10 @@ def run_episode_env(env, policy_fn, policy_name, max_steps=500):
 # ---------------------------------------------------------------------------
 
 def run_episode_state(env, policy, policy_name, max_steps=500):
-    """Run one episode.  policy.get_action(state) → raw tanh action."""
+    """Run for at least *max_steps* total steps, resetting on episode end.
+
+    policy.get_action(state) → raw tanh action.
+    """
     print("\n" + "=" * 70)
     print("Running: %s" % policy_name)
     print("=" * 70)
@@ -217,6 +282,7 @@ def run_episode_state(env, policy, policy_name, max_steps=500):
     state = env.reset()
     total_reward = 0.0
     reward_log = []
+    episodes = 1
 
     for step_idx in range(max_steps):
         action_raw = policy.get_action(np.array(state))
@@ -237,12 +303,14 @@ def run_episode_state(env, policy, policy_name, max_steps=500):
                       comps["distance"], comps["min_laser"], tag))
 
         if done:
-            print("  → Ended step %d: goal=%s collision=%s" % (
-                step_idx + 1, target, comps["collision"]))
-            break
+            print("  → Episode %d ended at step %d: goal=%s collision=%s" % (
+                episodes, step_idx + 1, target, comps["collision"]))
+            state = env.reset()
+            episodes += 1
+        else:
+            state = next_state
 
-        state = next_state
-
+    print("  → Finished: %d total steps across %d episodes" % (max_steps, episodes))
     return _build_result(policy_name, reward_log, total_reward)
 
 
@@ -323,6 +391,22 @@ if __name__ == "__main__":
     print("\nLaunching Gazebo environment ...")
     env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM)
     time.sleep(5)
+
+    # --- Warm-up: verify odom & laser are flowing ---
+    env.reset()
+    print("Warm-up reset done.")
+    if env.last_odom is None:
+        print("WARNING: env.last_odom is None after reset — odom not flowing!")
+    else:
+        q = env.last_odom.pose.pose.orientation
+        print("  odom pos: (%.2f, %.2f)  orient: (%.3f,%.3f,%.3f,%.3f)" % (
+            env.last_odom.pose.pose.position.x,
+            env.last_odom.pose.pose.position.y,
+            q.x, q.y, q.z, q.w))
+    print("  laser samples: %d  min=%.2f  max=%.2f" % (
+        len(env.velodyne_data),
+        np.min(env.velodyne_data), np.max(env.velodyne_data)))
+    print("  goal: (%.2f, %.2f)" % (env.goal_x, env.goal_y))
 
     # --- Load trained model ---
     policy_td3 = None
