@@ -251,10 +251,10 @@ policy_noise = 0.2  # Added noise for exploration
 noise_clip = 0.5  # Maximum clamping values of the noise
 policy_freq = 2  # Frequency of Actor network updates
 buffer_size = 1e6  # Maximum size of the buffer
-file_name = "TD3_velodyne_GDAE"  # name of the file to store the policy
+file_name = "TD3_velodyne_360"  # name of the file to store the policy
 save_model = True  # Weather to save the model or not
 load_model = True  # Weather to load a stored model
-load_model_name = "TD3_velodyne"  # name of the stored model to load
+load_model_name = "TD3_velodyne_360"  # name of the stored model to load
 random_near_obstacle = True  # To take random actions near obstacles or not
 
 # Create the network storage folders

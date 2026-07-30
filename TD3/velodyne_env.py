@@ -3,6 +3,7 @@ import os
 import random
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from os import path
 
 import numpy as np
@@ -23,44 +24,282 @@ COLLISION_DIST = 0.35
 TIME_DELTA = 0.1
 
 
-# Check if the random goal position is located on an obstacle and do not accept it if it is
-def check_pos(x, y):
-    goal_ok = True
+def _parse_sdf_pose(pose_str):
+    """Parse SDF pose string 'x y z roll pitch yaw' → (x, y, z, roll, pitch, yaw)."""
+    parts = [float(p) for p in pose_str.split()]
+    while len(parts) < 6:
+        parts.append(0.0)
+    return tuple(parts[:6])
 
-    if -3.8 > x > -6.2 and 6.2 > y > 3.8:
-        goal_ok = False
 
-    if -1.3 > x > -2.7 and 4.7 > y > -0.2:
-        goal_ok = False
+def _rotate_2d(x, y, yaw):
+    """Rotate point (x, y) by yaw radians in the XY plane."""
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return (x * c - y * s, x * s + y * c)
 
-    if -0.3 > x > -4.2 and 2.7 > y > 1.3:
-        goal_ok = False
 
-    if -0.8 > x > -4.2 and -2.3 > y > -4.2:
-        goal_ok = False
+def parse_world_obstacles(world_path, margin=0.3):
+    """Parse an SDF world file and extract axis-aligned bounding boxes of static obstacles.
 
-    if -1.3 > x > -3.7 and -0.8 > y > -2.7:
-        goal_ok = False
+    Walks every <model> → <link> → <collision> chain, resolves the full 6-DOF
+    transform into the world frame, and returns a list of *(x_min, x_max, y_min,
+    y_max)* tuples.  Models whose name contains ``cardboard_box`` are skipped
+    because they are randomized at runtime.
 
-    if 4.2 > x > 0.8 and -1.8 > y > -3.2:
-        goal_ok = False
+    Args:
+        world_path: path to the ``.world`` SDF file.
+        margin:     extra padding (metres) added to every AABB.
 
-    if 4 > x > 2.5 and 0.7 > y > -3.2:
-        goal_ok = False
+    Returns:
+        list[tuple[float, float, float, float]]  — one AABB per collision box.
+    """
+    tree = ET.parse(world_path)
+    root = tree.getroot()
+    obstacles = []
 
-    if 6.2 > x > 3.8 and -3.3 > y > -4.2:
-        goal_ok = False
+    for model in root.iter('model'):
+        name = model.get('name', '')
+        if 'cardboard_box' in name:
+            continue
 
-    if 4.2 > x > 1.3 and 3.7 > y > 1.5:
-        goal_ok = False
+        # Model-level pose (world frame)
+        model_pose_elem = model.find('pose')
+        model_pose = _parse_sdf_pose(
+            model_pose_elem.text if model_pose_elem is not None else '0 0 0 0 0 0')
+        mx, my, _, _, _, myaw = model_pose
 
-    if -3.0 > x > -7.2 and 0.5 > y > -1.5:
-        goal_ok = False
+        for link in model.iter('link'):
+            link_pose_elem = link.find('pose')
+            link_pose = _parse_sdf_pose(
+                link_pose_elem.text if link_pose_elem is not None else '0 0 0 0 0 0')
+            lx, ly, _, _, _, lyaw = link_pose
 
-    if x > 4.5 or x < -4.5 or y > 4.5 or y < -4.5:
-        goal_ok = False
+            for collision in link.iter('collision'):
+                coll_pose_elem = collision.find('pose')
+                coll_pose = _parse_sdf_pose(
+                    coll_pose_elem.text if coll_pose_elem is not None else '0 0 0 0 0 0')
+                cx, cy, _, _, _, cyaw = coll_pose
 
-    return goal_ok
+                geometry = collision.find('geometry')
+                if geometry is None:
+                    continue
+
+                # ---- Determine half-extents in collision-local XY frame ----
+                half_x, half_y = None, None  # will be set by the geometry handler
+
+                box = geometry.find('box')
+                cylinder = geometry.find('cylinder')
+                mesh = geometry.find('mesh')
+
+                if box is not None:
+                    size_elem = box.find('size')
+                    if size_elem is None:
+                        continue
+                    sx, sy, _sz = [float(v) for v in size_elem.text.split()]
+                    half_x, half_y = sx / 2.0, sy / 2.0
+                elif cylinder is not None:
+                    radius_elem = cylinder.find('radius')
+                    if radius_elem is None:
+                        continue
+                    r = float(radius_elem.text)
+                    half_x, half_y = r, r
+                elif mesh is not None:
+                    # Mesh geometry cannot be reliably reduced to an AABB;
+                    # skip it (rare — typically only small decorative models).
+                    continue
+                else:
+                    continue  # sphere, plane, etc. — ignore
+
+                if half_x is None:
+                    continue
+
+                # Compose transforms: model → link → collision → box corners
+                total_yaw = myaw + lyaw + cyaw
+
+                # World position of collision origin
+                #   p_world = R(myaw) * (R(lyaw) * [cx,cy] + [lx,ly]) + [mx,my]
+                cx_rot, cy_rot = _rotate_2d(cx, cy, lyaw)
+                wx = mx + _rotate_2d(lx + cx_rot, ly + cy_rot, myaw)[0]
+                wy = my + _rotate_2d(lx + cx_rot, ly + cy_rot, myaw)[1]
+
+                # Corners in collision-local frame, rotated to world
+                corners = [
+                    (-half_x, -half_y), (half_x, -half_y),
+                    (-half_x, half_y),  (half_x, half_y),
+                ]
+                world_corners = [_rotate_2d(cx2, cy2, total_yaw) for cx2, cy2 in corners]
+                xs = [wx + wcx for wcx, _ in world_corners]
+                ys = [wy + wcy for _, wcy in world_corners]
+
+                obstacles.append((
+                    min(xs) - margin, max(xs) + margin,
+                    min(ys) - margin, max(ys) + margin,
+                ))
+
+    return obstacles
+
+
+def _resolve_world_path(launchfile, port="11311"):
+    """Try to find the absolute path of the .world file referenced by a roslaunch file.
+
+    Walks the launch-file include chain and returns the first ``.world`` path found,
+    or **None** if the resolution fails.
+    """
+    if launchfile.startswith("/"):
+        fullpath = launchfile
+    else:
+        fullpath = os.path.join(os.path.dirname(__file__), "assets", launchfile)
+    if not path.exists(fullpath):
+        return None
+
+    try:
+        tree = ET.parse(fullpath)
+        root = tree.getroot()
+    except ET.ParseError:
+        return None
+
+    # Collect include tags
+    include_files = []
+    for include in root.iter('include'):
+        file_attr = include.get('file')
+        if file_attr:
+            include_files.append(file_attr)
+
+    # Try to resolve each include relative to ROS package paths
+    ros_package_path = os.environ.get("ROS_PACKAGE_PATH", "")
+    search_dirs = [os.path.dirname(fullpath)]
+    for p in ros_package_path.split(":"):
+        p = p.strip()
+        if p:
+            search_dirs.append(p)
+
+    for inc in include_files:
+        # inc looks like "$(find multi_robot_scenario)/launch/empty_world.launch"
+        # Extract the package-relative path
+        if inc.startswith("$(find ") and ")" in inc:
+            rest = inc[inc.index(")") + 1:]
+            pkg_end = inc.index(")")
+            pkg_name = inc[7:pkg_end].strip()
+            for d in search_dirs:
+                pkg_dir = os.path.join(d, pkg_name) if not d.endswith(pkg_name) else d
+                candidate = os.path.join(pkg_dir, rest.lstrip("/"))
+                if path.exists(candidate):
+                    # Now parse this launch file for the world_name arg
+                    world_path = _find_world_in_launch(candidate, search_dirs, pkg_name, d)
+                    if world_path:
+                        return world_path
+        elif inc.endswith(".world"):
+            for d in search_dirs:
+                candidate = os.path.join(d, inc)
+                if path.exists(candidate):
+                    return candidate
+        else:
+            # Simple relative path
+            candidate = os.path.join(os.path.dirname(fullpath), inc)
+            if path.exists(candidate):
+                world_path = _find_world_in_launch(candidate, search_dirs, "", "")
+                if world_path:
+                    return world_path
+
+    return None
+
+
+def _find_world_in_launch(launch_path, search_dirs, pkg_name, pkg_dir):
+    """Parse a launch file, find the ``world_name`` arg and resolve it to a path."""
+    try:
+        tree = ET.parse(launch_path)
+        root = tree.getroot()
+    except ET.ParseError:
+        return None
+
+    # Find default world_name arg value
+    default_world = None
+    world_name_from_arg = None
+    for arg in root.iter('arg'):
+        if arg.get('name') == 'world_name':
+            default_world = arg.get('default')
+            world_name_from_arg = arg.get('value')
+    world_name = world_name_from_arg or default_world
+
+    if world_name is None:
+        # Check if the launch file directly passes a world file name to gzserver
+        for node in root.iter('node'):
+            args = node.get('args', '')
+            if '.world' in args:
+                # Extract the world file name from args
+                parts = args.split()
+                for i, p in enumerate(parts):
+                    if p.endswith('.world'):
+                        world_name = p
+                        break
+
+    if world_name is None:
+        return None
+
+    # Resolve world_name to a full path
+    launch_dir = os.path.dirname(launch_path)
+    for d in [launch_dir, pkg_dir] + search_dirs:
+        d = d.strip()
+        if not d:
+            continue
+        candidate = os.path.join(d, world_name)
+        if path.exists(candidate):
+            return candidate
+        # Try as relative to launch dir or pkg dir
+        if pkg_name:
+            candidate = os.path.join(d, pkg_name, "launch", world_name)
+            if path.exists(candidate):
+                return candidate
+
+    return None
+
+
+# Backward-compatible check_pos: used when no world info is available.
+# Kept as a module-level function for external callers.
+def check_pos(x, y, obstacles=None, boundary=4.5):
+    """Return True if *(x, y)* is free of obstacles and within the world boundary.
+
+    Args:
+        x, y:       position to check.
+        obstacles:  list of ``(x_min, x_max, y_min, y_max)`` AABBs, or **None**
+                    to use the legacy hard-coded rectangles for TD3.world.
+        boundary:   absolute x/y limit.  Points outside ``[-boundary, boundary]``
+                    are rejected.
+    """
+    # Boundary check
+    if abs(x) > boundary or abs(y) > boundary:
+        return False
+
+    if obstacles is None:
+        # Legacy hard-coded obstacles for TD3.world (backward compatibility)
+        if -3.8 > x > -6.2 and 6.2 > y > 3.8:
+            return False
+        if -1.3 > x > -2.7 and 4.7 > y > -0.2:
+            return False
+        if -0.3 > x > -4.2 and 2.7 > y > 1.3:
+            return False
+        if -0.8 > x > -4.2 and -2.3 > y > -4.2:
+            return False
+        if -1.3 > x > -3.7 and -0.8 > y > -2.7:
+            return False
+        if 4.2 > x > 0.8 and -1.8 > y > -3.2:
+            return False
+        if 4 > x > 2.5 and 0.7 > y > -3.2:
+            return False
+        if 6.2 > x > 3.8 and -3.3 > y > -4.2:
+            return False
+        if 4.2 > x > 1.3 and 3.7 > y > 1.5:
+            return False
+        if -3.0 > x > -7.2 and 0.5 > y > -1.5:
+            return False
+        return True
+
+    # Dynamic check against parsed obstacle AABBs
+    for (x_min, x_max, y_min, y_max) in obstacles:
+        if x_min < x < x_max and y_min < y < y_max:
+            return False
+    return True
 
 
 class GazeboEnv:
@@ -69,7 +308,7 @@ class GazeboEnv:
     def __init__(self, launchfile, environment_dim, use_cnn=False,
                  ray_h_beams=36, ray_v_layers=21, max_ray_range=5.0,
                  safety_reward_weight=1.0, speed_reward_weight=1.0,
-                 port="11311"):
+                 port="11311", world_name=None):
         self.environment_dim = environment_dim
         self.odom_x = 0
         self.odom_y = 0
@@ -94,6 +333,7 @@ class GazeboEnv:
         self.max_ray_range = max_ray_range    # maximum ray range for preprocessing
         # Buffer: initialized to max_range (no collision detected yet)
         self.cost_rays_data = np.ones((ray_h_beams, ray_v_layers)) * max_ray_range
+        self.world_name = world_name
 
         self.set_self_state = ModelState()
         self.set_self_state.model_name = "r1"
@@ -131,6 +371,40 @@ class GazeboEnv:
 
         subprocess.Popen(["roslaunch", "-p", port, fullpath])
         print("Gazebo launched!")
+
+        # ---- Parse world obstacles from the SDF file ----
+        self.obstacles = None   # list of (x_min,x_max,y_min,y_max) or None
+        self.boundary = 4.5     # default world boundary
+        world_path = _resolve_world_path(launchfile, port)
+        if world_path is not None and path.exists(world_path):
+            try:
+                self.obstacles = parse_world_obstacles(world_path, margin=0.3)
+                print("Parsed %d obstacle(s) from %s" % (len(self.obstacles), world_path))
+                # Infer boundary from the innermost edge of boundary walls.
+                # Boundary walls are long (> 8 m) and thin (< 1.0 m after margin).
+                for (x_min, x_max, y_min, y_max) in self.obstacles:
+                    span_x = x_max - x_min
+                    span_y = y_max - y_min
+                    if span_x > 8 and span_y < 1.0:
+                        # North/South wall: use the inner y edge as boundary
+                        if abs(y_max) < abs(y_min):
+                            self.boundary = max(self.boundary, abs(y_max))
+                        else:
+                            self.boundary = max(self.boundary, abs(y_min))
+                    if span_y > 8 and span_x < 1.0:
+                        # East/West wall: use the inner x edge as boundary
+                        if abs(x_max) < abs(x_min):
+                            self.boundary = max(self.boundary, abs(x_max))
+                        else:
+                            self.boundary = max(self.boundary, abs(x_min))
+                # Add a small inward offset so the robot doesn't spawn right on the wall
+                self.boundary -= 0.5
+            except Exception as e:
+                print("WARNING: Failed to parse world obstacles: %s" % e)
+                self.obstacles = None
+        else:
+            print("WARNING: Could not resolve world path — "
+                  "falling back to legacy obstacle checks")
 
         # ---- CNN mode: launch c_space_mapper pipeline ----
         if self.use_cnn:
@@ -269,6 +543,17 @@ class GazeboEnv:
         v_state[:] = self.velodyne_data[:]
         laser_state = [v_state]
 
+        # Wait for the first odometry message if not yet received (avoid race after reset)
+        if self.last_odom is None:
+            waited = 0.0
+            while self.last_odom is None and waited < 2.0:
+                time.sleep(0.02)
+                waited += 0.02
+            if self.last_odom is None:
+                raise RuntimeError(
+                    "No odometry received after 2 s — "
+                    "check that /r1/odom is being published")
+
         # Calculate robot heading from odometry data
         self.odom_x = self.last_odom.pose.pose.position.x
         self.odom_y = self.last_odom.pose.pose.position.y
@@ -360,9 +645,9 @@ class GazeboEnv:
         y = 0
         position_ok = False
         while not position_ok:
-            x = np.random.uniform(-4.5, 4.5)
-            y = np.random.uniform(-4.5, 4.5)
-            position_ok = check_pos(x, y)
+            x = np.random.uniform(-self.boundary, self.boundary)
+            y = np.random.uniform(-self.boundary, self.boundary)
+            position_ok = check_pos(x, y, self.obstacles, self.boundary)
         object_state.pose.position.x = x
         object_state.pose.position.y = y
         # object_state.pose.position.z = 0.
@@ -377,8 +662,9 @@ class GazeboEnv:
 
         # set a random goal in empty space in environment
         self.change_goal()
-        # randomly scatter boxes in the environment
-        self.random_box()
+        # randomly scatter boxes in the environment (only for TD3.world)
+        if self.world_name == "TD3.world":
+            self.random_box()
         self.publish_markers([0.0, 0.0])
 
         rospy.wait_for_service("/gazebo/unpause_physics")
@@ -450,7 +736,7 @@ class GazeboEnv:
         while not goal_ok:
             self.goal_x = self.odom_x + random.uniform(self.upper, self.lower)
             self.goal_y = self.odom_y + random.uniform(self.upper, self.lower)
-            goal_ok = check_pos(self.goal_x, self.goal_y)
+            goal_ok = check_pos(self.goal_x, self.goal_y, self.obstacles, self.boundary)
 
     def random_box(self):
         # Randomly change the location of the boxes in the environment on each reset to randomize the training
@@ -464,7 +750,7 @@ class GazeboEnv:
             while not box_ok:
                 x = np.random.uniform(-6, 6)
                 y = np.random.uniform(-6, 6)
-                box_ok = check_pos(x, y)
+                box_ok = check_pos(x, y, self.obstacles, self.boundary)
                 distance_to_robot = np.linalg.norm([x - self.odom_x, y - self.odom_y])
                 distance_to_goal = np.linalg.norm([x - self.goal_x, y - self.goal_y])
                 if distance_to_robot < 1.5 or distance_to_goal < 1.5:
