@@ -67,7 +67,9 @@ class GazeboEnv:
     """Superclass for all Gazebo environments."""
 
     def __init__(self, launchfile, environment_dim, use_cnn=False,
-                 ray_h_beams=36, ray_v_layers=21, max_ray_range=5.0):
+                 ray_h_beams=36, ray_v_layers=21, max_ray_range=5.0,
+                 safety_reward_weight=1.0, speed_reward_weight=1.0,
+                 port="11311"):
         self.environment_dim = environment_dim
         self.odom_x = 0
         self.odom_y = 0
@@ -80,6 +82,10 @@ class GazeboEnv:
         self.velodyne_data = np.ones(self.environment_dim) * 10
         self.last_odom = None
         self.last_distance = 0.0  # for progress reward
+
+        # ---- Reward weights ----
+        self.safety_reward_weight = safety_reward_weight
+        self.speed_reward_weight = speed_reward_weight
 
         # ---- CNN mode: cost_rays from c_space_mapper_node ----
         self.use_cnn = use_cnn
@@ -106,7 +112,6 @@ class GazeboEnv:
             )
         self.gaps[-1][-1] += 0.03
 
-        port = "11311"
         subprocess.Popen(["roscore", "-p", port])
 
         print("Roscore launched!")
@@ -319,7 +324,22 @@ class GazeboEnv:
 
         progress = self.last_distance - distance
         self.last_distance = distance
-        reward = self.get_reward(target, collision, action, min_laser, progress)
+
+        # Build ray data for r_ss: c-space cost_rays (CNN mode) or velodyne bins
+        if self.use_cnn:
+            safety_data = self.cost_rays_data.flatten()
+        else:
+            safety_data = np.array(self.velodyne_data)
+
+        reward = self.get_reward(
+            target, collision, action, min_laser, progress,
+            heading_angle=angle,
+            goal_x=self.goal_x, goal_y=self.goal_y,
+            odom_x=self.odom_x, odom_y=self.odom_y,
+            laser_data=safety_data,
+            safety_reward_weight=self.safety_reward_weight,
+            speed_reward_weight=self.speed_reward_weight,
+        )
         return state, reward, done, target
 
     def reset(self):
@@ -364,6 +384,7 @@ class GazeboEnv:
         rospy.wait_for_service("/gazebo/unpause_physics")
         try:
             self.unpause()
+            pass
         except (rospy.ServiceException) as e:
             print("/gazebo/unpause_physics service call failed")
 
@@ -372,6 +393,7 @@ class GazeboEnv:
         rospy.wait_for_service("/gazebo/pause_physics")
         try:
             self.pause()
+            pass
         except (rospy.ServiceException) as e:
             print("/gazebo/pause_physics service call failed")
         v_state = []
@@ -530,14 +552,51 @@ class GazeboEnv:
         return False, False, min_laser
 
     @staticmethod
-    def get_reward(target, collision, action, min_laser, progress=0.0):
+    def get_reward(target, collision, action, min_laser, progress=0.0,
+                   heading_angle=0.0, goal_x=0.0, goal_y=0.0,
+                   odom_x=0.0, odom_y=0.0, laser_data=None,
+                   safety_reward_weight=1.0, speed_reward_weight=1.0):
+        """Reward with velocity-direction alignment + log-average static safety.
+
+        r_vel = unit(Pg - Pr) · Vr          (velocity toward goal)
+        r_ss  = mean(log(laser_rays))       (log-average obstacle distance)
+        r = speed_weight * r_vel + safety_weight * r_ss
+
+        Args:
+            target:                bool, goal reached.
+            collision:             bool, collision detected.
+            action:                [linear_vel, angular_vel].
+            min_laser:             min laser distance (fallback for obstacle penalty).
+            progress:              distance to goal reduction since last step (unused).
+            heading_angle:         robot yaw in world frame [rad].
+            goal_x, goal_y:        goal position in world frame.
+            odom_x, odom_y:        robot position in world frame.
+            laser_data:            ndarray of ray distances (c-space cost_rays or
+                                   velodyne bins).  If None, falls back to min_laser.
+            safety_reward_weight:  coefficient for r_ss safety reward.
+            speed_reward_weight:   coefficient for r_vel speed reward.
+
+        Reference: NavRL (Xu et al., IEEE RA-L 2025), Eqs. (8)-(9).
+        """
         if target:
             return 100.0
         elif collision:
             return -100.0
         else:
-            r3 = lambda x: 1 - x if x < 1 else 0.0
-            return (action[0] / 2
-                    - abs(action[1]) / 2
-                    - r3(min_laser) / 2
-                    + 10.0 * progress)  # distance progress toward goal
+            # ---- r_vel: velocity alignment toward goal ----
+            vx = action[0] * math.cos(heading_angle)
+            vy = action[0] * math.sin(heading_angle)
+            dx = goal_x - odom_x
+            dy = goal_y - odom_y
+            dist_to_goal = math.sqrt(dx**2 + dy**2) + 1e-8
+            r_vel = (dx / dist_to_goal) * vx + (dy / dist_to_goal) * vy
+
+            # ---- r_ss: log-average static safety over all rays ----
+            if laser_data is not None and len(laser_data) > 0:
+                clipped = np.maximum(laser_data, 0.1)  # prevent log(≤0)
+                r_ss = np.mean(np.log(clipped))
+            else:
+                r3 = lambda x: 1 - x if x < 1 else 0.0
+                r_ss = -r3(min_laser)
+
+            return speed_reward_weight * r_vel + safety_reward_weight * r_ss
