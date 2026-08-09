@@ -382,6 +382,8 @@ if __name__ == "__main__":
     MODEL_NAME = "TD3_velodyne_360"
     MODEL_DIR = "./pytorch_models"
     MAX_STEPS = 500
+    safety_reward_weight = 0.0
+    speed_reward_weight = 1.0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device: %s  |  State dim: %d  |  Action dim: %d" % (
@@ -389,7 +391,7 @@ if __name__ == "__main__":
 
     # --- Create environment ---
     print("\nLaunching Gazebo environment ...")
-    env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM)
+    env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM,safety_reward_weight=safety_reward_weight,speed_reward_weight=speed_reward_weight)
     time.sleep(5)
 
     # --- Warm-up: verify odom & laser are flowing ---

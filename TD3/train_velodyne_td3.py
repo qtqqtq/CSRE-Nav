@@ -245,7 +245,7 @@ expl_decay_steps = (
 )
 expl_min = 0.1  # Exploration noise after the decay in range [0...expl_noise]
 batch_size = 40  # Size of the mini-batch
-discount = 0.99999  # Discount factor to calculate the discounted future reward (should be close to 1)
+discount = 0.95  # Discount factor to calculate the discounted future reward (should be close to 1)
 tau = 0.005  # Soft target update variable (should be close to 0)
 policy_noise = 0.2  # Added noise for exploration
 noise_clip = 0.5  # Maximum clamping values of the noise
@@ -255,7 +255,9 @@ file_name = "TD3_velodyne_360"  # name of the file to store the policy
 save_model = True  # Weather to save the model or not
 load_model = True  # Weather to load a stored model
 load_model_name = "TD3_velodyne_360"  # name of the stored model to load
-random_near_obstacle = True  # To take random actions near obstacles or not
+random_near_obstacle = False  # To take random actions near obstacles or not
+safety_reward_weight = 0.0
+speed_reward_weight = 1.0
 
 # Create the network storage folders
 if not os.path.exists("./results"):
@@ -266,7 +268,7 @@ if save_model and not os.path.exists("./pytorch_models"):
 # Create the training environment
 environment_dim = 40
 robot_dim = 4
-env = GazeboEnv("multi_robot_scenario.launch", environment_dim)
+env = GazeboEnv("multi_robot_scenario.launch", environment_dim,safety_reward_weight=safety_reward_weight,speed_reward_weight=speed_reward_weight)
 time.sleep(5)
 torch.manual_seed(seed)
 np.random.seed(seed)
