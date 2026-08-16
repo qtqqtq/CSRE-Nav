@@ -21,7 +21,7 @@ from visualization_msgs.msg import MarkerArray
 
 GOAL_REACHED_DIST = 0.3
 COLLISION_DIST = 0.35
-TIME_DELTA = 0.1
+TIME_DELTA = 0.05
 
 
 def _parse_sdf_pose(pose_str):
@@ -61,6 +61,11 @@ def parse_world_obstacles(world_path, margin=0.3):
     for model in root.iter('model'):
         name = model.get('name', '')
         if 'cardboard_box' in name:
+            continue
+        # Skip ground/floor plates (e.g. ground_plane, asphalt_plane): they are
+        # drivable surfaces, not obstacles.  Treating their collision boxes as
+        # obstacles would mark the whole navigable floor as "inside an obstacle".
+        if 'plane' in name or 'ground' in name or 'floor' in name:
             continue
 
         # Model-level pose (world frame)
@@ -257,7 +262,7 @@ def _find_world_in_launch(launch_path, search_dirs, pkg_name, pkg_dir):
 
 # Backward-compatible check_pos: used when no world info is available.
 # Kept as a module-level function for external callers.
-def check_pos(x, y, obstacles=None, boundary=4.5):
+def check_pos(x, y, obstacles=None, boundary=4.5, bounds=None):
     """Return True if *(x, y)* is free of obstacles and within the world boundary.
 
     Args:
@@ -265,10 +270,17 @@ def check_pos(x, y, obstacles=None, boundary=4.5):
         obstacles:  list of ``(x_min, x_max, y_min, y_max)`` AABBs, or **None**
                     to use the legacy hard-coded rectangles for TD3.world.
         boundary:   absolute x/y limit.  Points outside ``[-boundary, boundary]``
-                    are rejected.
+                    are rejected (used only when ``bounds`` is None).
+        bounds:     optional ``(x_min, x_max, y_min, y_max)`` rectangle; when
+                    given, it replaces the symmetric boundary check (for worlds
+                    whose map is not centred at the origin).
     """
     # Boundary check
-    if abs(x) > boundary or abs(y) > boundary:
+    if bounds is not None:
+        x_min, x_max, y_min, y_max = bounds
+        if not (x_min <= x <= x_max and y_min <= y <= y_max):
+            return False
+    elif abs(x) > boundary or abs(y) > boundary:
         return False
 
     if obstacles is None:
@@ -374,29 +386,49 @@ class GazeboEnv:
 
         # ---- Parse world obstacles from the SDF file ----
         self.obstacles = None   # list of (x_min,x_max,y_min,y_max) or None
-        self.boundary = 4.5     # default world boundary
+        self.boundary = 4.5     # default (symmetric) world boundary
+        self.map_bounds = None  # (x_min, x_max, y_min, y_max) or None
         world_path = _resolve_world_path(launchfile, port)
         if world_path is not None and path.exists(world_path):
             try:
                 self.obstacles = parse_world_obstacles(world_path, margin=0.3)
                 print("Parsed %d obstacle(s) from %s" % (len(self.obstacles), world_path))
-                # Infer boundary from the innermost edge of boundary walls.
-                # Boundary walls are long (> 8 m) and thin (< 1.0 m after margin).
+                # Infer the navigable map bounds from the four boundary walls
+                # (long > 8 m, thin < 1.0 m after margin).  Rectangular bounds are
+                # required for worlds whose map is NOT centred at the origin
+                # (e.g. box.world, centred ~ (0.9, 2.3)) — a symmetric [-b, b]
+                # square would otherwise let the robot spawn beyond the walls.
+                v_walls = []   # vertical boundary walls: (x_center, x_min, x_max)
+                h_walls = []   # horizontal boundary walls: (y_center, y_min, y_max)
+                for (x_min, x_max, y_min, y_max) in self.obstacles:
+                    span_x = x_max - x_min
+                    span_y = y_max - y_min
+                    if span_y > 8 and span_x < 1.0:
+                        v_walls.append(((x_min + x_max) / 2.0, x_min, x_max))
+                    elif span_x > 8 and span_y < 1.0:
+                        h_walls.append(((y_min + y_max) / 2.0, y_min, y_max))
+
+                if v_walls and h_walls:
+                    left = min(v_walls, key=lambda w: w[0])
+                    right = max(v_walls, key=lambda w: w[0])
+                    bottom = min(h_walls, key=lambda w: w[0])
+                    top = max(h_walls, key=lambda w: w[0])
+                    # Inner edges (the wall side facing the map interior).
+                    self.map_bounds = (left[2], right[1], bottom[2], top[1])
+                    print("Map bounds: x=[%.2f, %.2f] y=[%.2f, %.2f]"
+                          % self.map_bounds)
+
+                # Symmetric fallback boundary (legacy callers / worlds without a
+                # clean rectangular boundary).  Use the innermost wall edge.
                 for (x_min, x_max, y_min, y_max) in self.obstacles:
                     span_x = x_max - x_min
                     span_y = y_max - y_min
                     if span_x > 8 and span_y < 1.0:
-                        # North/South wall: use the inner y edge as boundary
-                        if abs(y_max) < abs(y_min):
-                            self.boundary = max(self.boundary, abs(y_max))
-                        else:
-                            self.boundary = max(self.boundary, abs(y_min))
+                        edge = abs(y_max) if abs(y_max) < abs(y_min) else abs(y_min)
+                        self.boundary = max(self.boundary, edge)
                     if span_y > 8 and span_x < 1.0:
-                        # East/West wall: use the inner x edge as boundary
-                        if abs(x_max) < abs(x_min):
-                            self.boundary = max(self.boundary, abs(x_max))
-                        else:
-                            self.boundary = max(self.boundary, abs(x_min))
+                        edge = abs(x_max) if abs(x_max) < abs(x_min) else abs(x_min)
+                        self.boundary = max(self.boundary, edge)
                 # Add a small inward offset so the robot doesn't spawn right on the wall
                 self.boundary -= 0.5
             except Exception as e:
@@ -643,9 +675,15 @@ class GazeboEnv:
         y = 0
         position_ok = False
         while not position_ok:
-            x = np.random.uniform(-self.boundary, self.boundary)
-            y = np.random.uniform(-self.boundary, self.boundary)
-            position_ok = check_pos(x, y, self.obstacles, self.boundary)
+            if self.map_bounds is not None:
+                x_min, x_max, y_min, y_max = self.map_bounds
+                x = np.random.uniform(x_min, x_max)
+                y = np.random.uniform(y_min, y_max)
+            else:
+                x = np.random.uniform(-self.boundary, self.boundary)
+                y = np.random.uniform(-self.boundary, self.boundary)
+            position_ok = check_pos(x, y, self.obstacles, self.boundary,
+                                    self.map_bounds)
         object_state.pose.position.x = x
         object_state.pose.position.y = y
         # object_state.pose.position.z = 0.
@@ -745,7 +783,8 @@ class GazeboEnv:
         while not goal_ok:
             self.goal_x = self.odom_x + random.uniform(self.upper, self.lower)
             self.goal_y = self.odom_y + random.uniform(self.upper, self.lower)
-            goal_ok = check_pos(self.goal_x, self.goal_y, self.obstacles, self.boundary)
+            goal_ok = check_pos(self.goal_x, self.goal_y, self.obstacles,
+                                self.boundary, self.map_bounds)
 
     def random_box(self):
         # Randomly change the location of the boxes in the environment on each reset to randomize the training
@@ -768,7 +807,7 @@ class GazeboEnv:
             box_state.model_name = name
             box_state.pose.position.x = x
             box_state.pose.position.y = y
-            box_state.pose.position.z = 0.0
+            box_state.pose.position.z = 0.5
             box_state.pose.orientation.x = 0.0
             box_state.pose.orientation.y = 0.0
             box_state.pose.orientation.z = 0.0
@@ -876,7 +915,7 @@ class GazeboEnv:
         if target:
             return 100.0
         elif collision:
-            return -100.0
+            return -200.0
         else:
             # ---- r_vel: velocity alignment toward goal ----
             vx = action[0] * math.cos(heading_angle)

@@ -1,16 +1,13 @@
 """
-CNN-TD3 Training Script with NavRL-style Static Obstacle Perception.
+CNN-SAC Training Script with NavRL-style Static Obstacle Perception.
 
-This script trains a TD3 agent where the state representation uses a
+This script trains a SAC agent where the state representation uses a
 CNN feature extractor (matching NavRL's architecture) to process a 2D
 ray-grid (36 horizontal beams × 4 vertical layers) generated from the
 Velodyne VLP-16 point cloud.
 
-Key differences from train_velodyne_td3.py:
-  - State: ray_grid (1×36×4) + kinematic (4)  →  total 148-dim flat
-  - Actor:   CNN → 128 features → [features, kinematic] → MLP → action
-  - Critic:  dual CNNs → 128 features each → [features, kinematic, action] → Q
-  - The CNN mirrors NavRL's 3-conv-layer architecture
+SAC uses a stochastic policy with entropy regularization and auto-tuned
+temperature alpha, replacing the deterministic TD3 policy.
 
 Usage:
   python3 train_cnn_td3.py
@@ -21,16 +18,39 @@ import time
 
 import numpy as np
 import torch
-from numpy import inf
 from torch.utils.tensorboard import SummaryWriter
 
 from replay_buffer import ReplayBuffer
 from velodyne_env import GazeboEnv
-from cnn_network import CNNTD3
+from cnn_network import CNNSAC
+from settings import (
+    ACTION_DIM,
+    ALPHA_LR,
+    CNN_STATE_DIM,
+    DISCOUNT,
+    ENVIRONMENT_DIM,
+    EVAL_EP,
+    EVAL_FREQ,
+    KINEMATIC_DIM,
+    LR,
+    MAX_ACTION,
+    MAX_STEPS,
+    MAX_TIMESTEPS,
+    MODEL_DIR,
+    RAY_GRID_FLAT_DIM,
+    RAY_H_BEAMS,
+    RAY_V_LAYERS,
+    RESULTS_DIR,
+    SAFETY_REWARD_WEIGHT,
+    SEED,
+    SPEED_REWARD_WEIGHT,
+    TAU,
+    device,
+)
 
 
 def evaluate(network, env, epoch, eval_episodes=10):
-    """Evaluate the CNN-TD3 agent. Returns (avg_reward, avg_collision_rate)."""
+    """Evaluate the CNN-SAC agent. Returns (avg_reward, avg_collision_rate)."""
     avg_reward = 0.0
     col = 0
     for _ in range(eval_episodes):
@@ -43,7 +63,7 @@ def evaluate(network, env, epoch, eval_episodes=10):
             kinematic = state[RAY_GRID_FLAT_DIM:]
             ray_grid = ray_grid_flat.reshape(1, RAY_H_BEAMS, RAY_V_LAYERS)
 
-            action = network.get_action(ray_grid, kinematic)
+            action = network.get_action(ray_grid, kinematic, deterministic=True)
             a_in = [(action[0] + 1) / 2, action[1]]
             state, reward, done, _ = env.step(a_in)
             avg_reward += reward
@@ -62,67 +82,38 @@ def evaluate(network, env, epoch, eval_episodes=10):
 
 
 # ============================================================================
-# Hyper-parameters (same as original TD3)
+# Hyper-parameters (SAC)
 # ============================================================================
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-seed = 0
-eval_freq = 5e3
+# Script-specific parameters (shared values come from settings.py)
 init_step = 2e3
-max_ep = 500
-eval_ep = 3
-max_timesteps = 5e6
-expl_noise = 1
-expl_decay_steps = 500000
-expl_min = 0.1
-batch_size = 40
-discount = 0.99999
-tau = 0.005
-policy_noise = 0.2
-noise_clip = 0.5
-policy_freq = 2
+batch_size = 256
 buffer_size = 250000  # 250K samples (reduced from 1M for CNN GPU memory)
-file_name = "TD3_CNN_velodyne_1"
+file_name = "SAC_CNN_velodyne_3"
 save_model = True
-load_model = True
-load_model_name = "TD3_CNN_velodyne"
+load_model = False  # SAC has different architecture from TD3
+load_model_name = "SAC_CNN_velodyne_2"
 random_near_obstacle = True
 
 # ---- Reward weight coefficients ----
-#   safety_reward_weight: scales the log-average static safety term (r_ss)
-#   speed_reward_weight:  scales the velocity-direction alignment term (r_vel)
+#   SAFETY_REWARD_WEIGHT: scales the log-average static safety term (r_ss)
+#   SPEED_REWARD_WEIGHT:  scales the velocity-direction alignment term (r_vel)
 #   Higher safety weight → more conservative, obstacle-avoiding behavior
 #   Higher speed weight   → more aggressive goal-seeking behavior
-SAFETY_REWARD_WEIGHT = 1.0
-SPEED_REWARD_WEIGHT = 1.0
-
-# ============================================================================
-# Ray-grid dimensions (from c_space_mapper config)
-#   36 horizontal beams × nz_ theta orientations (nz_ = ⌈2π/a⌉ + 1, a=0.314 → 21)
-# ============================================================================
-
-RAY_H_BEAMS = 36
-RAY_V_LAYERS = 21    # theta orientations from c-space mapper (= nz_)
-RAY_GRID_FLAT_DIM = RAY_H_BEAMS * RAY_V_LAYERS  # 756
-KINEMATIC_DIM = 4
-STATE_DIM = RAY_GRID_FLAT_DIM + KINEMATIC_DIM    # 760
-ACTION_DIM = 2
-MAX_ACTION = 1
+# (reward weights and ray-grid dimensions are defined in settings.py)
 
 # ============================================================================
 # Setup
 # ============================================================================
 
-if not os.path.exists("./results"):
-    os.makedirs("./results")
-if save_model and not os.path.exists("./pytorch_models"):
-    os.makedirs("./pytorch_models")
-
-environment_dim = 40  # kept for backward compat with env (40-bin for 360° LiDAR)
+if not os.path.exists(RESULTS_DIR):
+    os.makedirs(RESULTS_DIR)
+if save_model and not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR)
 
 env = GazeboEnv(
     "multi_robot_scenario.launch",
-    environment_dim,
+    ENVIRONMENT_DIM,
     use_cnn=True,
     ray_h_beams=RAY_H_BEAMS,
     ray_v_layers=RAY_V_LAYERS,
@@ -132,28 +123,29 @@ env = GazeboEnv(
 )
 time.sleep(5)
 
-torch.manual_seed(seed)
-np.random.seed(seed)
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
-# Create the CNN-TD3 network
-network = CNNTD3(
+# Create the CNN-SAC network
+network = CNNSAC(
     kinematic_dim=KINEMATIC_DIM,
     action_dim=ACTION_DIM,
     max_action=MAX_ACTION,
     h_beams=RAY_H_BEAMS,
     v_layers=RAY_V_LAYERS,
     cnn_feature_dim=128,
-    lr=1e-4,
+    lr=LR,
+    alpha_lr=ALPHA_LR,
     device=device,
     safety_reward_weight=SAFETY_REWARD_WEIGHT,
     speed_reward_weight=SPEED_REWARD_WEIGHT,
 )
 
-replay_buffer = ReplayBuffer(buffer_size, seed)
+replay_buffer = ReplayBuffer(buffer_size, SEED)
 
 if load_model:
     try:
-        network.load(load_model_name, "./pytorch_models")
+        network.load(load_model_name, MODEL_DIR)
         print("Loaded stored model: %s" % load_model_name)
     except Exception:
         print(
@@ -176,11 +168,11 @@ epoch = 1
 count_rand_actions = 0
 random_action = []
 
-print("Starting CNN-TD3 training on device: %s" % device)
+print("Starting CNN-SAC training on device: %s" % device)
 print("State dim: %d (ray_grid: %d + kinematic: %d)" %
-      (STATE_DIM, RAY_GRID_FLAT_DIM, KINEMATIC_DIM))
+      (CNN_STATE_DIM, RAY_GRID_FLAT_DIM, KINEMATIC_DIM))
 
-while timestep < max_timesteps:
+while timestep < MAX_TIMESTEPS:
 
     # --- Episode termination ---
     if done:
@@ -189,11 +181,8 @@ while timestep < max_timesteps:
                 replay_buffer,
                 episode_timesteps,
                 batch_size,
-                discount,
-                tau,
-                policy_noise,
-                noise_clip,
-                policy_freq,
+                DISCOUNT,
+                TAU,
             )
             torch.cuda.empty_cache()
             # Log episode-level metrics
@@ -203,19 +192,19 @@ while timestep < max_timesteps:
                 length=episode_timesteps,
                 goal_reached=target,
                 collision=(episode_reward < -90),
-                expl_noise=expl_noise,
+                expl_noise=0.0,
             )
 
-        if timesteps_since_eval >= eval_freq:
+        if timesteps_since_eval >= EVAL_FREQ:
             print("Validating timestep %i, episode %i" % (timestep, episode_num))
-            timesteps_since_eval %= eval_freq
+            timesteps_since_eval %= EVAL_FREQ
             avg_reward, avg_col = evaluate(
                 network=network, env=env, epoch=epoch,
-                eval_episodes=eval_ep)
+                eval_episodes=EVAL_EP)
             evaluations.append(avg_reward)
             network.log_eval(epoch, avg_reward, avg_col)
-            network.save(file_name, directory="./pytorch_models")
-            np.save("./results/%s" % file_name, evaluations)
+            network.save(file_name, directory=MODEL_DIR)
+            np.save("%s/%s" % (RESULTS_DIR, file_name), evaluations)
             epoch += 1
 
         state = env.reset()
@@ -230,19 +219,12 @@ while timestep < max_timesteps:
         cost_rays_proc = init_rg_flat.reshape(1, RAY_H_BEAMS, RAY_V_LAYERS)
         network.log_cost_rays(timestep, cost_rays_proc, env.cost_rays_data)
 
-    # --- Exploration noise ---
-    if expl_noise > expl_min:
-        expl_noise = expl_noise - ((1 - expl_min) / expl_decay_steps)
-
     # Unpack state into ray_grid + kinematic for action inference
     ray_grid_flat = state[:RAY_GRID_FLAT_DIM]
     kinematic = state[RAY_GRID_FLAT_DIM:]
     ray_grid = ray_grid_flat.reshape(1, RAY_H_BEAMS, RAY_V_LAYERS)
 
     action = network.get_action(ray_grid, kinematic)
-    action = (action + np.random.normal(0, expl_noise, size=action.shape)).clip(
-        -MAX_ACTION, MAX_ACTION
-    )
 
     # --- Random near-obstacle exploration ---
     if random_near_obstacle:
@@ -262,8 +244,8 @@ while timestep < max_timesteps:
     # Step the environment
     a_in = [(action[0] + 1) / 2, action[1]]
     next_state, reward, done, target = env.step(a_in)
-    done_bool = 0 if episode_timesteps + 1 == max_ep else int(done)
-    done = 1 if episode_timesteps + 1 == max_ep else int(done)
+    done_bool = 0 if episode_timesteps + 1 == MAX_STEPS else int(done)
+    done = 1 if episode_timesteps + 1 == MAX_STEPS else int(done)
     episode_reward += reward
 
     # Store transition
@@ -286,10 +268,10 @@ while timestep < max_timesteps:
 # ============================================================================
 
 avg_reward, avg_col = evaluate(network=network, env=env, epoch=epoch,
-                                eval_episodes=eval_ep)
+                                eval_episodes=EVAL_EP)
 evaluations.append(avg_reward)
 network.log_eval(epoch, avg_reward, avg_col)
 if save_model:
-    network.save("%s" % file_name, directory="./pytorch_models")
-np.save("./results/%s" % file_name, evaluations)
-print("Training complete. Model saved to ./pytorch_models/%s" % file_name)
+    network.save("%s" % file_name, directory=MODEL_DIR)
+np.save("%s/%s" % (RESULTS_DIR, file_name), evaluations)
+print("Training complete. Model saved to %s/%s" % (MODEL_DIR, file_name))

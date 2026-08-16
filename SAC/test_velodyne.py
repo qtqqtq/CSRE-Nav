@@ -6,64 +6,73 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from velodyne_env import GazeboEnv
+from settings import (
+    ACTION_DIM,
+    ENVIRONMENT_DIM,
+    LOG_STD_MAX,
+    LOG_STD_MIN,
+    MAX_STEPS,
+    MODEL_DIR,
+    ROBOT_DIM,
+    SEED,
+    STATE_DIM,
+    device,
+)
 
-class Actor(nn.Module):
+
+class SACActor(nn.Module):
+    """Stochastic Actor for SAC — only mean action used during testing."""
+
     def __init__(self, state_dim, action_dim):
-        super(Actor, self).__init__()
+        super(SACActor, self).__init__()
 
         self.layer_1 = nn.Linear(state_dim, 400)
         torch.nn.init.kaiming_uniform_(self.layer_1.weight, nonlinearity="leaky_relu")
         self.layer_2 = nn.Linear(400, 300)
         torch.nn.init.kaiming_uniform_(self.layer_2.weight, nonlinearity="leaky_relu")
-        self.layer_3 = nn.Linear(300, action_dim)
-        self.tanh = nn.Tanh()
+        self.layer_3 = nn.Linear(300, action_dim * 2)
+        torch.nn.init.kaiming_uniform_(self.layer_3.weight, nonlinearity="leaky_relu")
 
     def forward(self, s):
-        s = F.leaky_relu(self.layer_1(s))
-        s = F.leaky_relu(self.layer_2(s))
-        a = self.tanh(self.layer_3(s))
-        return a
+        out = self.layer_3(F.leaky_relu(self.layer_2(F.leaky_relu(self.layer_1(s)))))
+        mean, log_std = out.chunk(2, dim=-1)
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        return mean, log_std
+
+    def get_mean_action(self, s):
+        mean, _ = self.forward(s)
+        return torch.tanh(mean)
 
 
-# TD3 network
-class TD3(object):
+# SAC policy wrapper (testing only — deterministic eval)
+class SACPolicy(object):
     def __init__(self, state_dim, action_dim):
-        # Initialize the Actor network
-        self.actor = Actor(state_dim, action_dim).to(device)
+        self.actor = SACActor(state_dim, action_dim).to(device)
 
     def get_action(self, state):
-        # Function to get the action from the actor
         state = torch.Tensor(state.reshape(1, -1)).to(device)
-        return self.actor(state).cpu().data.numpy().flatten()
+        return self.actor.get_mean_action(state).cpu().data.numpy().flatten()
 
     def load(self, filename, directory):
-        # Function to load network parameters
         self.actor.load_state_dict(
             torch.load("%s/%s_actor.pth" % (directory, filename))
         )
 
 
-# Set the parameters for the implementation
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # cuda or cpu
-seed = 0  # Random seed number
-max_ep = 500  # maximum number of steps per episode
-file_name = "TD3_velodyne"  # name of the file to load the policy from
+# Script-specific: name of the file to load the policy from
+file_name = "SAC_velodyne_360"
 
 
 # Create the testing environment
-environment_dim = 20
-robot_dim = 4
-env = GazeboEnv("multi_robot_scenario.launch", environment_dim)
+env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM)
 time.sleep(5)
-torch.manual_seed(seed)
-np.random.seed(seed)
-state_dim = environment_dim + robot_dim
-action_dim = 2
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 # Create the network
-network = TD3(state_dim, action_dim)
+network = SACPolicy(STATE_DIM, ACTION_DIM)
 try:
-    network.load(file_name, "./pytorch_models")
+    network.load(file_name, MODEL_DIR)
 except:
     raise ValueError("Could not load the stored model parameters")
 
@@ -78,7 +87,7 @@ while True:
     # Update action to fall in range [0,1] for linear velocity and [-1,1] for angular velocity
     a_in = [(action[0] + 1) / 2, action[1]]
     next_state, reward, done, target = env.step(a_in)
-    done = 1 if episode_timesteps + 1 == max_ep else int(done)
+    done = 1 if episode_timesteps + 1 == MAX_STEPS else int(done)
 
     # On termination of episode
     if done:

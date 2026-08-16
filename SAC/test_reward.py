@@ -25,6 +25,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from velodyne_env import GazeboEnv
+from settings import (
+    ACTION_DIM,
+    ENVIRONMENT_DIM,
+    MAX_STEPS,
+    MODEL_DIR,
+    ROBOT_DIM,
+    SAFETY_REWARD_WEIGHT,
+    SPEED_REWARD_WEIGHT,
+    STATE_DIM,
+)
 
 # ---------------------------------------------------------------------------
 # Network definitions (must match train_velodyne_td3.py exactly)
@@ -375,15 +385,7 @@ def print_summary(results):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    ENVIRONMENT_DIM = 40
-    ROBOT_DIM = 4
-    STATE_DIM = ENVIRONMENT_DIM + ROBOT_DIM  # 44
-    ACTION_DIM = 2
-    MODEL_NAME = "TD3_velodyne_360"
-    MODEL_DIR = "./pytorch_models"
-    MAX_STEPS = 500
-    safety_reward_weight = 0.0
-    speed_reward_weight = 1.0
+    MODEL_NAME = "TD3_velodyne_360"  # script-specific model to load
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device: %s  |  State dim: %d  |  Action dim: %d" % (
@@ -391,7 +393,7 @@ if __name__ == "__main__":
 
     # --- Create environment ---
     print("\nLaunching Gazebo environment ...")
-    env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM,safety_reward_weight=safety_reward_weight,speed_reward_weight=speed_reward_weight)
+    env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM,safety_reward_weight=SAFETY_REWARD_WEIGHT,speed_reward_weight=SPEED_REWARD_WEIGHT)
     time.sleep(5)
 
     # --- Warm-up: verify odom & laser are flowing ---
@@ -429,11 +431,7 @@ if __name__ == "__main__":
     results.append(run_episode_env(env, lambda e: random_action(),
                                    "Random Actions", MAX_STEPS))
 
-    # --- Scenario 2: Straight-to-goal ---
-    results.append(run_episode_env(env, lambda e: straight_to_goal_action(e),
-                                   "Straight-to-Goal", MAX_STEPS))
-
-    # --- Scenario 3: Trained TD3 model ---
+    # --- Scenario 2: Trained TD3 model ---
     if policy_td3 is not None:
         results.append(run_episode_state(env, policy_td3,
                                          "TD3 (%s)" % MODEL_NAME, MAX_STEPS))

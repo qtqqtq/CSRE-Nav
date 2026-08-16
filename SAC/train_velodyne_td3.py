@@ -10,6 +10,29 @@ from torch.utils.tensorboard import SummaryWriter
 
 from replay_buffer import ReplayBuffer
 from velodyne_env import GazeboEnv
+from settings import (
+    ACTION_DIM,
+    ALPHA_LR,
+    DISCOUNT,
+    ENVIRONMENT_DIM,
+    EVAL_EP,
+    EVAL_FREQ,
+    LOG_STD_MAX,
+    LOG_STD_MIN,
+    LR,
+    MAX_ACTION,
+    MAX_STEPS,
+    MAX_TIMESTEPS,
+    MODEL_DIR,
+    RESULTS_DIR,
+    ROBOT_DIM,
+    SAFETY_REWARD_WEIGHT,
+    SEED,
+    SPEED_REWARD_WEIGHT,
+    STATE_DIM,
+    TAU,
+    device,
+)
 
 
 def evaluate(network, epoch, eval_episodes=10):
@@ -38,22 +61,38 @@ def evaluate(network, epoch, eval_episodes=10):
     return avg_reward, avg_col
 
 
-class Actor(nn.Module):
+class SACActor(nn.Module):
+    """Stochastic Actor for SAC: MLP(400→300→action_dim*2) → (mean, log_std)."""
+
     def __init__(self, state_dim, action_dim):
-        super(Actor, self).__init__()
+        super(SACActor, self).__init__()
 
         self.layer_1 = nn.Linear(state_dim, 400)
         torch.nn.init.kaiming_uniform_(self.layer_1.weight, nonlinearity="leaky_relu")
         self.layer_2 = nn.Linear(400, 300)
         torch.nn.init.kaiming_uniform_(self.layer_2.weight, nonlinearity="leaky_relu")
-        self.layer_3 = nn.Linear(300, action_dim)
-        self.tanh = nn.Tanh()
+        self.layer_3 = nn.Linear(300, action_dim * 2)
+        torch.nn.init.kaiming_uniform_(self.layer_3.weight, nonlinearity="leaky_relu")
 
     def forward(self, s):
-        s = F.leaky_relu(self.layer_1(s))
-        s = F.leaky_relu(self.layer_2(s))
-        a = self.tanh(self.layer_3(s))
-        return a
+        out = self.layer_3(F.leaky_relu(self.layer_2(F.leaky_relu(self.layer_1(s)))))
+        mean, log_std = out.chunk(2, dim=-1)
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        return mean, log_std
+
+    def sample(self, s):
+        mean, log_std = self.forward(s)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        x_t = normal.rsample()
+        action = torch.tanh(x_t)
+        log_prob = normal.log_prob(x_t) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+        return action, log_prob
+
+    def get_mean_action(self, s):
+        mean, _ = self.forward(s)
+        return torch.tanh(mean)
 
 
 class Critic(nn.Module):
@@ -89,45 +128,48 @@ class Critic(nn.Module):
         return q1, q2
 
 
-# TD3 network
-class TD3(object):
-    def __init__(self, state_dim, action_dim, max_action,lr=1e-4):
-        # Initialize the Actor network
-        self.actor = Actor(state_dim, action_dim).to(device)
-        self.actor_target = Actor(state_dim, action_dim).to(device)
-        self.actor_target.load_state_dict(self.actor.state_dict())
+# SAC network
+class SAC(object):
+    """Soft Actor-Critic with auto-tuned temperature alpha."""
+
+    def __init__(self, state_dim, action_dim, max_action, lr=1e-4, alpha_lr=3e-4):
+        # Actor (stochastic) — no actor_target in SAC
+        self.actor = SACActor(state_dim, action_dim).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
 
-        # Initialize the Critic networks
+        # Critic (twin Q, same structure as TD3)
         self.critic = Critic(state_dim, action_dim).to(device)
         self.critic_target = Critic(state_dim, action_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters())
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
+
+        # Auto-tune temperature alpha
+        self.target_entropy = -action_dim
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.alpha = self.log_alpha.exp()
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
 
         self.max_action = max_action
         self.writer = SummaryWriter()
         self.iter_count = 0
 
-    def get_action(self, state):
-        # Function to get the action from the actor
+    def get_action(self, state, deterministic=False):
+        """Get action from the actor (deterministic for eval, stochastic for train)."""
         state = torch.Tensor(state.reshape(1, -1)).to(device)
-        return self.actor(state).cpu().data.numpy().flatten()
+        if deterministic:
+            return self.actor.get_mean_action(state).cpu().data.numpy().flatten()
+        else:
+            action, _ = self.actor.sample(state)
+            return action.cpu().data.numpy().flatten()
 
     # training cycle
-    def train(
-        self,
-        replay_buffer,
-        iterations,
-        batch_size=100,
-        discount=1,
-        tau=0.005,
-        policy_noise=0.2,  # discount=0.99
-        noise_clip=0.5,
-        policy_freq=2,
-    ):
+    def train(self, replay_buffer, iterations, batch_size=100, discount=1, tau=0.005):
         av_Q = 0
         max_Q = -inf
-        av_loss = 0
+        av_critic_loss = 0
+        av_actor_loss = 0
+        av_alpha_loss = 0
+        av_entropy = 0
         for it in range(iterations):
             # sample a batch from the replay buffer
             (
@@ -143,65 +185,59 @@ class TD3(object):
             reward = torch.Tensor(batch_rewards).to(device)
             done = torch.Tensor(batch_dones).to(device)
 
-            # Obtain the estimated action from the next state by using the actor-target
-            next_action = self.actor_target(next_state)
+            # ---- Critic update ----
+            with torch.no_grad():
+                next_action, next_log_prob = self.actor.sample(next_state)
+                target_Q1, target_Q2 = self.critic_target(next_state, next_action)
+                min_target_Q = torch.min(target_Q1, target_Q2)
+                # Soft Bellman backup with entropy bonus
+                soft_target = min_target_Q - self.alpha * next_log_prob
+                av_Q += torch.mean(soft_target)
+                max_Q = max(max_Q, torch.max(soft_target))
+                td_target = reward + ((1 - done) * discount * soft_target)
 
-            # Add noise to the action
-            noise = torch.Tensor(batch_actions).data.normal_(0, policy_noise).to(device)
-            noise = noise.clamp(-noise_clip, noise_clip)
-            next_action = (next_action + noise).clamp(-self.max_action, self.max_action)
-
-            # Calculate the Q values from the critic-target network for the next state-action pair
-            target_Q1, target_Q2 = self.critic_target(next_state, next_action)
-
-            # Select the minimal Q value from the 2 calculated values
-            target_Q = torch.min(target_Q1, target_Q2)
-            av_Q += torch.mean(target_Q)
-            max_Q = max(max_Q, torch.max(target_Q))
-            # Calculate the final Q value from the target network parameters by using Bellman equation
-            target_Q = reward + ((1 - done) * discount * target_Q).detach()
-
-            # Get the Q values of the basis networks with the current parameters
             current_Q1, current_Q2 = self.critic(state, action)
-
-            # Calculate the loss between the current Q value and the target Q value
-            loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
-
-            # Perform the gradient descent
+            critic_loss = F.mse_loss(current_Q1, td_target) + F.mse_loss(current_Q2, td_target)
             self.critic_optimizer.zero_grad()
-            loss.backward()
+            critic_loss.backward()
             self.critic_optimizer.step()
 
-            if it % policy_freq == 0:
-                # Maximize the actor output value by performing gradient descent on negative Q values
-                # (essentially perform gradient ascent)
-                actor_grad, _ = self.critic(state, self.actor(state))
-                actor_grad = -actor_grad.mean()
-                self.actor_optimizer.zero_grad()
-                actor_grad.backward()
-                self.actor_optimizer.step()
+            # ---- Actor update (every step, reparameterized) ----
+            new_action, log_prob = self.actor.sample(state)
+            q1_new, q2_new = self.critic(state, new_action)
+            min_q_new = torch.min(q1_new, q2_new)
+            actor_loss = (self.alpha.detach() * log_prob - min_q_new).mean()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
 
-                # Use soft update to update the actor-target network parameters by
-                # infusing small amount of current parameters
-                for param, target_param in zip(
-                    self.actor.parameters(), self.actor_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        tau * param.data + (1 - tau) * target_param.data
-                    )
-                # Use soft update to update the critic-target network parameters by infusing
-                # small amount of current parameters
-                for param, target_param in zip(
-                    self.critic.parameters(), self.critic_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        tau * param.data + (1 - tau) * target_param.data
-                    )
+            # ---- Alpha update (auto-tune temperature) ----
+            alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            self.alpha = self.log_alpha.exp()
 
-            av_loss += loss
+            # ---- Soft update critic target only ----
+            for param, target_param in zip(
+                self.critic.parameters(), self.critic_target.parameters()
+            ):
+                target_param.data.copy_(
+                    tau * param.data + (1 - tau) * target_param.data
+                )
+
+            av_critic_loss += critic_loss.item()
+            av_actor_loss += actor_loss.item()
+            av_alpha_loss += alpha_loss.item()
+            av_entropy += -log_prob.mean().item()
+
         self.iter_count += 1
         # Write new values for tensorboard
-        self.writer.add_scalar("Loss/critic", av_loss / iterations, self.iter_count)
+        self.writer.add_scalar("Loss/critic", av_critic_loss / iterations, self.iter_count)
+        self.writer.add_scalar("Loss/actor", av_actor_loss / iterations, self.iter_count)
+        self.writer.add_scalar("Loss/alpha", av_alpha_loss / iterations, self.iter_count)
+        self.writer.add_scalar("Train/alpha", self.alpha.item(), self.iter_count)
+        self.writer.add_scalar("Train/entropy", av_entropy / iterations, self.iter_count)
         self.writer.add_scalar("Q/Avg", av_Q / iterations, self.iter_count)
         self.writer.add_scalar("Q/Max", max_Q, self.iter_count)
 
@@ -212,7 +248,7 @@ class TD3(object):
         self.writer.add_scalar("Episode/length", length, episode_num)
         self.writer.add_scalar("Episode/goal_reached", int(goal_reached), episode_num)
         self.writer.add_scalar("Episode/collision", int(collision), episode_num)
-        self.writer.add_scalar("Train/exploration_noise", expl_noise, episode_num)
+        self.writer.add_scalar("Episode/alpha", self.alpha.item(), episode_num)
 
     def log_eval(self, epoch, avg_reward, avg_collision_rate):
         """Log evaluation metrics to TensorBoard."""
@@ -232,57 +268,34 @@ class TD3(object):
         )
 
 
-# Set the parameters for the implementation
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # cuda or cpu
-seed = 0  # Random seed number
-eval_freq = 5e3  # After how many steps to perform the evaluation
-max_ep = 500  # maximum number of steps per episode
-eval_ep = 3  # number of episodes for evaluation
-max_timesteps = 5e6  # Maximum number of steps to perform
-expl_noise = 1  # Initial exploration noise starting value in range [expl_min ... 1]
-expl_decay_steps = (
-    500000  # Number of steps over which the initial exploration noise will decay over
-)
-expl_min = 0.1  # Exploration noise after the decay in range [0...expl_noise]
+# Set the script-specific parameters (shared values come from settings.py)
 batch_size = 40  # Size of the mini-batch
-discount = 0.95  # Discount factor to calculate the discounted future reward (should be close to 1)
-tau = 0.005  # Soft target update variable (should be close to 0)
-policy_noise = 0.2  # Added noise for exploration
-noise_clip = 0.5  # Maximum clamping values of the noise
-policy_freq = 2  # Frequency of Actor network updates
 buffer_size = 1e6  # Maximum size of the buffer
-file_name = "TD3_velodyne_360"  # name of the file to store the policy
+file_name = "SAC_velodyne_360"  # name of the file to store the policy
 save_model = True  # Weather to save the model or not
-load_model = True  # Weather to load a stored model
-load_model_name = "TD3_velodyne_360"  # name of the stored model to load
+load_model = False  # Weather to load a stored model (SAC has different arch from TD3)
+load_model_name = "SAC_velodyne_360"  # name of the stored model to load
 random_near_obstacle = False  # To take random actions near obstacles or not
-safety_reward_weight = 0.0
-speed_reward_weight = 1.0
 
 # Create the network storage folders
-if not os.path.exists("./results"):
-    os.makedirs("./results")
-if save_model and not os.path.exists("./pytorch_models"):
-    os.makedirs("./pytorch_models")
+if not os.path.exists(RESULTS_DIR):
+    os.makedirs(RESULTS_DIR)
+if save_model and not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR)
 
 # Create the training environment
-environment_dim = 40
-robot_dim = 4
-env = GazeboEnv("multi_robot_scenario.launch", environment_dim,safety_reward_weight=safety_reward_weight,speed_reward_weight=speed_reward_weight)
+env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM,safety_reward_weight=SAFETY_REWARD_WEIGHT,speed_reward_weight=SPEED_REWARD_WEIGHT)
 time.sleep(5)
-torch.manual_seed(seed)
-np.random.seed(seed)
-state_dim = environment_dim + robot_dim
-action_dim = 2
-max_action = 1
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 # Create the network
-network = TD3(state_dim, action_dim, max_action)
+network = SAC(STATE_DIM, ACTION_DIM, MAX_ACTION, lr=LR, alpha_lr=ALPHA_LR)
 # Create a replay buffer
-replay_buffer = ReplayBuffer(buffer_size, seed)
+replay_buffer = ReplayBuffer(buffer_size, SEED)
 if load_model:
     try:
-        network.load(load_model_name, "./pytorch_models")
+        network.load(load_model_name, MODEL_DIR)
     except:
         print(
             "Could not load the stored model parameters, initializing training with random parameters"
@@ -301,7 +314,7 @@ count_rand_actions = 0
 random_action = []
 
 # Begin the training loop
-while timestep < max_timesteps:
+while timestep < MAX_TIMESTEPS:
 
     # On termination of episode
     if done:
@@ -310,11 +323,8 @@ while timestep < max_timesteps:
                 replay_buffer,
                 episode_timesteps,
                 batch_size,
-                discount,
-                tau,
-                policy_noise,
-                noise_clip,
-                policy_freq,
+                DISCOUNT,
+                TAU,
             )
             # Log episode-level metrics
             network.log_episode(
@@ -323,18 +333,18 @@ while timestep < max_timesteps:
                 length=episode_timesteps,
                 goal_reached=target,
                 collision=(episode_reward < -90),
-                expl_noise=expl_noise,
+                expl_noise=0.0,
             )
 
-        if timesteps_since_eval >= eval_freq:
+        if timesteps_since_eval >= EVAL_FREQ:
             print("Validating timestep{},episode {}".format(timestep, episode_num))
-            timesteps_since_eval %= eval_freq
+            timesteps_since_eval %= EVAL_FREQ
             avg_reward, avg_col = evaluate(
-                network=network, epoch=epoch, eval_episodes=eval_ep)
+                network=network, epoch=epoch, eval_episodes=EVAL_EP)
             evaluations.append(avg_reward)
             network.log_eval(epoch, avg_reward, avg_col)
-            network.save(file_name, directory="./pytorch_models")
-            np.save("./results/%s" % (file_name), evaluations)
+            network.save(file_name, directory=MODEL_DIR)
+            np.save("%s/%s" % (RESULTS_DIR, file_name), evaluations)
             epoch += 1
 
         state = env.reset()
@@ -344,14 +354,7 @@ while timestep < max_timesteps:
         episode_timesteps = 0
         episode_num += 1
 
-    # add some exploration noise
-    if expl_noise > expl_min:
-        expl_noise = expl_noise - ((1 - expl_min) / expl_decay_steps)
-
     action = network.get_action(np.array(state))
-    action = (action + np.random.normal(0, expl_noise, size=action_dim)).clip(
-        -max_action, max_action
-    )
 
     # If the robot is facing an obstacle, randomly force it to take a consistent random action.
     # This is done to increase exploration in situations near obstacles.
@@ -373,8 +376,8 @@ while timestep < max_timesteps:
     # Update action to fall in range [0,1] for linear velocity and [-1,1] for angular velocity
     a_in = [(action[0] + 1) / 2, action[1]]
     next_state, reward, done, target = env.step(a_in)
-    done_bool = 0 if episode_timesteps + 1 == max_ep else int(done)
-    done = 1 if episode_timesteps + 1 == max_ep else int(done)
+    done_bool = 0 if episode_timesteps + 1 == MAX_STEPS else int(done)
+    done = 1 if episode_timesteps + 1 == MAX_STEPS else int(done)
     episode_reward += reward
 
     # Save the tuple in replay buffer
@@ -387,9 +390,9 @@ while timestep < max_timesteps:
     timesteps_since_eval += 1
 
 # After the training is done, evaluate the network and save it
-avg_reward, avg_col = evaluate(network=network, epoch=epoch, eval_episodes=eval_ep)
+avg_reward, avg_col = evaluate(network=network, epoch=epoch, eval_episodes=EVAL_EP)
 evaluations.append(avg_reward)
 network.log_eval(epoch, avg_reward, avg_col)
 if save_model:
-    network.save("%s" % file_name, directory="./pytorch_models")
-np.save("./results/%s" % file_name, evaluations)
+    network.save("%s" % file_name, directory=MODEL_DIR)
+np.save("%s/%s" % (RESULTS_DIR, file_name), evaluations)

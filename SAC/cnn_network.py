@@ -15,6 +15,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+from settings import LOG_STD_MIN, LOG_STD_MAX
+
 
 # ---------------------------------------------------------------------------
 # CNN Backbone — Static Obstacle Feature Extractor
@@ -26,8 +28,8 @@ class StaticObstacleCNN(nn.Module):
 
     Architecture (mirrors NavRL):
       Conv2d(C→4,  kernel=[5,3], pad=[2,1]) → ELU
-      Conv2d(4→16, kernel=[5,3], stride=[2,1], pad=[2,1]) → ELU
-      Conv2d(16→16,kernel=[5,3], stride=[2,2], pad=[2,1]) → ELU
+      Conv2d(4→16, kernel=[5,3], stride=[1,1], pad=[2,1]) → ELU
+      Conv2d(16→16,kernel=[5,3], stride=[1,2], pad=[2,1]) → ELU
       Flatten → Linear(→feature_dim) → ELU → LayerNorm
 
     Input shape:  (B, in_channels, H_beams, V_layers)
@@ -38,8 +40,8 @@ class StaticObstacleCNN(nn.Module):
         super().__init__()
 
         self.conv1 = nn.Conv2d(in_channels, 4, kernel_size=[5, 3], padding=[2, 1])
-        self.conv2 = nn.Conv2d(4, 16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1])
-        self.conv3 = nn.Conv2d(16, 16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1])
+        self.conv2 = nn.Conv2d(4, 16, kernel_size=[5, 3], stride=[1, 1], padding=[2, 1])
+        self.conv3 = nn.Conv2d(16, 16, kernel_size=[5, 3], stride=[1, 2], padding=[2, 1])
 
         # Compute flattened size by running a dummy forward
         dummy = torch.zeros(1, in_channels, h_beams, v_layers)
@@ -126,6 +128,76 @@ class CNNActor(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# CNN-based SAC Actor (stochastic policy)
+# ---------------------------------------------------------------------------
+
+class CNNSACActor(nn.Module):
+    """
+    Stochastic Actor for SAC: CNN ray-grid features + kinematic state → (mean, log_std).
+
+    Pipeline:
+      ray_grid (B,1,H,V) → StaticObstacleCNN → (B, feature_dim)
+      concat with kinematic (B, kin_dim)
+      → MLP [400 → 300 → action_dim*2] → (mean, log_std)
+    """
+
+    def __init__(self, kinematic_dim=4, action_dim=2,
+                 h_beams=36, v_layers=4, cnn_feature_dim=128):
+        super().__init__()
+
+        self.cnn = StaticObstacleCNN(
+            in_channels=1, h_beams=h_beams, v_layers=v_layers,
+            feature_dim=cnn_feature_dim
+        )
+
+        input_dim = cnn_feature_dim + kinematic_dim
+        self.layer_1 = nn.Linear(input_dim, 400)
+        nn.init.kaiming_uniform_(self.layer_1.weight, nonlinearity='leaky_relu')
+        self.layer_2 = nn.Linear(400, 300)
+        nn.init.kaiming_uniform_(self.layer_2.weight, nonlinearity='leaky_relu')
+        self.layer_3 = nn.Linear(300, action_dim * 2)
+        nn.init.kaiming_uniform_(self.layer_3.weight, nonlinearity='leaky_relu')
+
+    def forward(self, ray_grid, kinematic):
+        """
+        Returns:
+            mean:      (B, action_dim)
+            log_std:   (B, action_dim)  clamped to [LOG_STD_MIN, LOG_STD_MAX]
+        """
+        features = self.cnn(ray_grid)
+        x = torch.cat([features, kinematic], dim=-1)
+        x = F.leaky_relu(self.layer_1(x))
+        x = F.leaky_relu(self.layer_2(x))
+        out = self.layer_3(x)
+        mean, log_std = out.chunk(2, dim=-1)
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        return mean, log_std
+
+    def sample(self, ray_grid, kinematic):
+        """
+        Reparameterization trick with tanh squashing.
+
+        Returns:
+            action:    (B, action_dim) in [-1, 1]
+            log_prob:  (B, 1)  sum of log-probabilities with tanh correction
+        """
+        mean, log_std = self.forward(ray_grid, kinematic)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        x_t = normal.rsample()                       # reparameterization
+        action = torch.tanh(x_t)
+        # log_prob with tanh squashing correction (sum over action dims)
+        log_prob = normal.log_prob(x_t) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+        return action, log_prob
+
+    def get_mean_action(self, ray_grid, kinematic):
+        """Deterministic action for evaluation (tanh of mean)."""
+        mean, _ = self.forward(ray_grid, kinematic)
+        return torch.tanh(mean)
+
+
+# ---------------------------------------------------------------------------
 # CNN-based Twin Critic
 # ---------------------------------------------------------------------------
 
@@ -195,12 +267,15 @@ class CNNCritic(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# CNN-TD3 — complete algorithm wrapper
+# CNN-SAC — Soft Actor-Critic algorithm wrapper
 # ---------------------------------------------------------------------------
 
-class CNNTD3(object):
+class CNNSAC(object):
     """
-    TD3 algorithm using CNN-based Actor and Twin Critic.
+    SAC algorithm using CNN-based stochastic Actor and Twin Critic.
+
+    Reuses CNNCritic as-is (SAC uses the same twin-Q structure as TD3).
+    Only the Actor is stochastic and the train() method differs.
 
     State representation:
       ray_grid  (1, H, V)  — preprocessed ray-grid from point cloud / cost rays
@@ -211,7 +286,7 @@ class CNNTD3(object):
 
     def __init__(self, kinematic_dim=4, action_dim=2, max_action=1,
                  h_beams=36, v_layers=4, cnn_feature_dim=128,
-                 lr=1e-4, device='cpu',
+                 lr=1e-4, alpha_lr=3e-4, device='cpu',
                  safety_reward_weight=1.0, speed_reward_weight=1.0):
         self.device = device
         self.max_action = max_action
@@ -222,17 +297,13 @@ class CNNTD3(object):
         self.safety_reward_weight = safety_reward_weight
         self.speed_reward_weight = speed_reward_weight
 
-        # Actor
-        self.actor = CNNActor(
+        # Actor (stochastic) — no actor_target in SAC
+        self.actor = CNNSACActor(
             kinematic_dim, action_dim, h_beams, v_layers, cnn_feature_dim
         ).to(device)
-        self.actor_target = CNNActor(
-            kinematic_dim, action_dim, h_beams, v_layers, cnn_feature_dim
-        ).to(device)
-        self.actor_target.load_state_dict(self.actor.state_dict())
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
 
-        # Critic
+        # Critic (reuses CNNCritic as-is)
         self.critic = CNNCritic(
             kinematic_dim, action_dim, h_beams, v_layers, cnn_feature_dim
         ).to(device)
@@ -240,18 +311,25 @@ class CNNTD3(object):
             kinematic_dim, action_dim, h_beams, v_layers, cnn_feature_dim
         ).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters())
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
+
+        # Auto-tune temperature alpha
+        self.target_entropy = -action_dim
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.alpha = self.log_alpha.exp()
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
 
         self.writer = SummaryWriter()
         self.iter_count = 0
 
-    def get_action(self, ray_grid, kinematic):
+    def get_action(self, ray_grid, kinematic, deterministic=False):
         """
         Get action from the actor.
 
         Args:
             ray_grid:  numpy (1, H, V) or (H, V)
             kinematic: numpy (kinematic_dim,)
+            deterministic: if True, return mean action; else sample stochastically
         Returns:
             action: numpy (action_dim,) in [-1, 1]
         """
@@ -262,7 +340,11 @@ class CNNTD3(object):
             rg = rg.unsqueeze(0)   # (1,H,V) → (1,1,H,V)
         kn = torch.Tensor(kinematic.reshape(1, -1)).to(self.device)
         with torch.no_grad():
-            return self.actor(rg, kn).cpu().data.numpy().flatten()
+            if deterministic:
+                return self.actor.get_mean_action(rg, kn).cpu().data.numpy().flatten()
+            else:
+                action, _ = self.actor.sample(rg, kn)
+                return action.cpu().data.numpy().flatten()
 
     def _unpack_batch(self, batch_states):
         """
@@ -283,18 +365,24 @@ class CNNTD3(object):
         )
 
     def train(self, replay_buffer, iterations, batch_size=100,
-              discount=1, tau=0.005, policy_noise=0.2, noise_clip=0.5,
-              policy_freq=2):
+              discount=1, tau=0.005):
         """
-        One training pass over `iterations` mini-batches.
-        Same interface as the original TD3.train().
+        One SAC training pass over `iterations` mini-batches.
+
+        SAC algorithm:
+          1. Soft Bellman backup: target = r + γ*(min_Q_target - α*log_prob)
+          2. Critic loss: MSE(Q - target)
+          3. Actor loss: mean(α*log_prob - min_Q)
+          4. Alpha loss: -(log_α * (log_prob + target_entropy))
+          5. Soft update critic target
         """
         from numpy import inf
         av_Q = 0
         max_Q = -inf
         av_critic_loss = 0
         av_actor_loss = 0
-        actor_update_count = 0
+        av_alpha_loss = 0
+        av_entropy = 0
 
         for it in range(iterations):
             # Sample a batch from replay buffer
@@ -307,62 +395,61 @@ class CNNTD3(object):
             reward = torch.Tensor(batch_rewards).to(self.device)
             done = torch.Tensor(batch_dones).to(self.device)
 
-            # Target action with noise
-            next_action = self.actor_target(next_state_rg, next_state_kin)
-            noise = torch.Tensor(batch_actions).data.normal_(0, policy_noise).to(self.device)
-            noise = noise.clamp(-noise_clip, noise_clip)
-            next_action = (next_action + noise).clamp(-self.max_action, self.max_action)
+            # ---- Critic update ----
+            with torch.no_grad():
+                next_action, next_log_prob = self.actor.sample(next_state_rg, next_state_kin)
+                target_Q1, target_Q2 = self.critic_target(
+                    next_state_rg, next_state_kin, next_action
+                )
+                min_target_Q = torch.min(target_Q1, target_Q2)
+                # Soft Bellman backup: subtract entropy bonus
+                soft_target = min_target_Q - self.alpha * next_log_prob
+                av_Q += torch.mean(soft_target)
+                max_Q = max(max_Q, torch.max(soft_target))
+                td_target = reward + ((1 - done) * discount * soft_target)
 
-            # Target Q values
-            target_Q1, target_Q2 = self.critic_target(
-                next_state_rg, next_state_kin, next_action
-            )
-            target_Q = torch.min(target_Q1, target_Q2)
-            av_Q += torch.mean(target_Q)
-            max_Q = max(max_Q, torch.max(target_Q))
-            target_Q = reward + ((1 - done) * discount * target_Q).detach()
-
-            # Current Q values
             current_Q1, current_Q2 = self.critic(state_rg, state_kin, action)
-
-            # Critic loss
-            critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+            critic_loss = F.mse_loss(current_Q1, td_target) + F.mse_loss(current_Q2, td_target)
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
             self.critic_optimizer.step()
 
-            # Actor update (delayed)
-            if it % policy_freq == 0:
-                actor_loss, _ = self.critic(
-                    state_rg, state_kin, self.actor(state_rg, state_kin)
+            # ---- Actor update (every step, reparameterized) ----
+            new_action, log_prob = self.actor.sample(state_rg, state_kin)
+            q1_new, q2_new = self.critic(state_rg, state_kin, new_action)
+            min_q_new = torch.min(q1_new, q2_new)
+            actor_loss = (self.alpha.detach() * log_prob - min_q_new).mean()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            # ---- Alpha update (auto-tune temperature) ----
+            alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            self.alpha = self.log_alpha.exp()
+
+            # ---- Soft update critic target only (no actor target in SAC) ----
+            for param, target_param in zip(
+                self.critic.parameters(), self.critic_target.parameters()
+            ):
+                target_param.data.copy_(
+                    tau * param.data + (1 - tau) * target_param.data
                 )
-                actor_loss = -actor_loss.mean()
-                self.actor_optimizer.zero_grad()
-                actor_loss.backward()
-                self.actor_optimizer.step()
-
-                # Soft update target networks
-                for param, target_param in zip(
-                    self.actor.parameters(), self.actor_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        tau * param.data + (1 - tau) * target_param.data
-                    )
-                for param, target_param in zip(
-                    self.critic.parameters(), self.critic_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        tau * param.data + (1 - tau) * target_param.data
-                    )
-
-                av_actor_loss += actor_loss.item()
-                actor_update_count += 1
 
             av_critic_loss += critic_loss.item()
+            av_actor_loss += actor_loss.item()
+            av_alpha_loss += alpha_loss.item()
+            av_entropy += -log_prob.mean().item()
 
         self.iter_count += 1
+        # Write new values for tensorboard
         self.writer.add_scalar("Loss/critic", av_critic_loss / iterations, self.iter_count)
-        self.writer.add_scalar("Loss/actor", av_actor_loss / max(actor_update_count, 1), self.iter_count)
+        self.writer.add_scalar("Loss/actor", av_actor_loss / iterations, self.iter_count)
+        self.writer.add_scalar("Loss/alpha", av_alpha_loss / iterations, self.iter_count)
+        self.writer.add_scalar("Train/alpha", self.alpha.item(), self.iter_count)
+        self.writer.add_scalar("Train/entropy", av_entropy / iterations, self.iter_count)
         self.writer.add_scalar("Q/Avg", av_Q / iterations, self.iter_count)
         self.writer.add_scalar("Q/Max", max_Q, self.iter_count)
 
@@ -373,7 +460,7 @@ class CNNTD3(object):
         self.writer.add_scalar("Episode/length", length, episode_num)
         self.writer.add_scalar("Episode/goal_reached", int(goal_reached), episode_num)
         self.writer.add_scalar("Episode/collision", int(collision), episode_num)
-        self.writer.add_scalar("Train/exploration_noise", expl_noise, episode_num)
+        self.writer.add_scalar("Episode/alpha", self.alpha.item(), episode_num)
 
     def log_eval(self, epoch, avg_reward, avg_collision_rate):
         """Log evaluation metrics to TensorBoard."""
