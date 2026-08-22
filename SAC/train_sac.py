@@ -9,30 +9,8 @@ from numpy import inf
 from torch.utils.tensorboard import SummaryWriter
 
 from replay_buffer import ReplayBuffer
-from velodyne_env import GazeboEnv
-from settings import (
-    ACTION_DIM,
-    ALPHA_LR,
-    DISCOUNT,
-    ENVIRONMENT_DIM,
-    EVAL_EP,
-    EVAL_FREQ,
-    LOG_STD_MAX,
-    LOG_STD_MIN,
-    LR,
-    MAX_ACTION,
-    MAX_STEPS,
-    MAX_TIMESTEPS,
-    MODEL_DIR,
-    RESULTS_DIR,
-    ROBOT_DIM,
-    SAFETY_REWARD_WEIGHT,
-    SEED,
-    SPEED_REWARD_WEIGHT,
-    STATE_DIM,
-    TAU,
-    device,
-)
+from laser_env import GazeboEnv
+import settings
 
 
 def evaluate(network, epoch, eval_episodes=10):
@@ -77,7 +55,7 @@ class SACActor(nn.Module):
     def forward(self, s):
         out = self.layer_3(F.leaky_relu(self.layer_2(F.leaky_relu(self.layer_1(s)))))
         mean, log_std = out.chunk(2, dim=-1)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_std = torch.clamp(log_std, settings.LOG_STD_MIN, settings.LOG_STD_MAX)
         return mean, log_std
 
     def sample(self, s):
@@ -134,18 +112,18 @@ class SAC(object):
 
     def __init__(self, state_dim, action_dim, max_action, lr=1e-4, alpha_lr=3e-4):
         # Actor (stochastic) — no actor_target in SAC
-        self.actor = SACActor(state_dim, action_dim).to(device)
+        self.actor = SACActor(state_dim, action_dim).to(settings.device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
 
         # Critic (twin Q, same structure as TD3)
-        self.critic = Critic(state_dim, action_dim).to(device)
-        self.critic_target = Critic(state_dim, action_dim).to(device)
+        self.critic = Critic(state_dim, action_dim).to(settings.device)
+        self.critic_target = Critic(state_dim, action_dim).to(settings.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
 
         # Auto-tune temperature alpha
         self.target_entropy = -action_dim
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=settings.device)
         self.alpha = self.log_alpha.exp()
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
 
@@ -155,7 +133,7 @@ class SAC(object):
 
     def get_action(self, state, deterministic=False):
         """Get action from the actor (deterministic for eval, stochastic for train)."""
-        state = torch.Tensor(state.reshape(1, -1)).to(device)
+        state = torch.Tensor(state.reshape(1, -1)).to(settings.device)
         if deterministic:
             return self.actor.get_mean_action(state).cpu().data.numpy().flatten()
         else:
@@ -170,6 +148,9 @@ class SAC(object):
         av_actor_loss = 0
         av_alpha_loss = 0
         av_entropy = 0
+        q_soft_targets = []
+        q_current1 = []
+        q_current2 = []
         for it in range(iterations):
             # sample a batch from the replay buffer
             (
@@ -179,11 +160,11 @@ class SAC(object):
                 batch_dones,
                 batch_next_states,
             ) = replay_buffer.sample_batch(batch_size)
-            state = torch.Tensor(batch_states).to(device)
-            next_state = torch.Tensor(batch_next_states).to(device)
-            action = torch.Tensor(batch_actions).to(device)
-            reward = torch.Tensor(batch_rewards).to(device)
-            done = torch.Tensor(batch_dones).to(device)
+            state = torch.Tensor(batch_states).to(settings.device)
+            next_state = torch.Tensor(batch_next_states).to(settings.device)
+            action = torch.Tensor(batch_actions).to(settings.device)
+            reward = torch.Tensor(batch_rewards).to(settings.device)
+            done = torch.Tensor(batch_dones).to(settings.device)
 
             # ---- Critic update ----
             with torch.no_grad():
@@ -195,8 +176,11 @@ class SAC(object):
                 av_Q += torch.mean(soft_target)
                 max_Q = max(max_Q, torch.max(soft_target))
                 td_target = reward + ((1 - done) * discount * soft_target)
+                q_soft_targets.append(soft_target.detach().cpu().numpy())
 
             current_Q1, current_Q2 = self.critic(state, action)
+            q_current1.append(current_Q1.detach().cpu().numpy())
+            q_current2.append(current_Q2.detach().cpu().numpy())
             critic_loss = F.mse_loss(current_Q1, td_target) + F.mse_loss(current_Q2, td_target)
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
@@ -240,6 +224,11 @@ class SAC(object):
         self.writer.add_scalar("Train/entropy", av_entropy / iterations, self.iter_count)
         self.writer.add_scalar("Q/Avg", av_Q / iterations, self.iter_count)
         self.writer.add_scalar("Q/Max", max_Q, self.iter_count)
+        # Q-value distribution histograms over the training pass
+        if q_soft_targets:
+            self.writer.add_histogram("Q/dist/soft_target", np.concatenate(q_soft_targets), self.iter_count)
+            self.writer.add_histogram("Q/dist/current_Q1", np.concatenate(q_current1), self.iter_count)
+            self.writer.add_histogram("Q/dist/current_Q2", np.concatenate(q_current2), self.iter_count)
 
     def log_episode(self, episode_num, reward, length, goal_reached,
                     collision, expl_noise):
@@ -271,31 +260,31 @@ class SAC(object):
 # Set the script-specific parameters (shared values come from settings.py)
 batch_size = 40  # Size of the mini-batch
 buffer_size = 1e6  # Maximum size of the buffer
-file_name = "SAC_velodyne_360"  # name of the file to store the policy
+file_name = "SAC_laser_1"  # name of the file to store the policy
 save_model = True  # Weather to save the model or not
 load_model = False  # Weather to load a stored model (SAC has different arch from TD3)
-load_model_name = "SAC_velodyne_360"  # name of the stored model to load
+load_model_name = "SAC_laser"  # name of the stored model to load
 random_near_obstacle = False  # To take random actions near obstacles or not
 
 # Create the network storage folders
-if not os.path.exists(RESULTS_DIR):
-    os.makedirs(RESULTS_DIR)
-if save_model and not os.path.exists(MODEL_DIR):
-    os.makedirs(MODEL_DIR)
+if not os.path.exists(settings.RESULTS_DIR):
+    os.makedirs(settings.RESULTS_DIR)
+if save_model and not os.path.exists(settings.MODEL_DIR):
+    os.makedirs(settings.MODEL_DIR)
 
 # Create the training environment
-env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM,safety_reward_weight=SAFETY_REWARD_WEIGHT,speed_reward_weight=SPEED_REWARD_WEIGHT)
+env = GazeboEnv("multi_robot_scenario.launch", settings.ENVIRONMENT_DIM,safety_reward_weight=settings.SAFETY_REWARD_WEIGHT,speed_reward_weight=settings.SPEED_REWARD_WEIGHT)
 time.sleep(5)
-torch.manual_seed(SEED)
-np.random.seed(SEED)
+torch.manual_seed(settings.SEED)
+np.random.seed(settings.SEED)
 
 # Create the network
-network = SAC(STATE_DIM, ACTION_DIM, MAX_ACTION, lr=LR, alpha_lr=ALPHA_LR)
+network = SAC(settings.STATE_DIM, settings.ACTION_DIM, settings.MAX_ACTION, lr=settings.LR, alpha_lr=settings.ALPHA_LR)
 # Create a replay buffer
-replay_buffer = ReplayBuffer(buffer_size, SEED)
+replay_buffer = ReplayBuffer(buffer_size, settings.SEED)
 if load_model:
     try:
-        network.load(load_model_name, MODEL_DIR)
+        network.load(load_model_name, settings.MODEL_DIR)
     except:
         print(
             "Could not load the stored model parameters, initializing training with random parameters"
@@ -314,17 +303,19 @@ count_rand_actions = 0
 random_action = []
 
 # Begin the training loop
-while timestep < MAX_TIMESTEPS:
+while timestep < settings.MAX_TIMESTEPS:
 
     # On termination of episode
     if done:
-        if timestep != 0:
+        # Warm-up: only collect experience into the replay buffer until
+        # settings.WARMUP_STEPS total steps have been seen (no gradient updates).
+        if timestep >= settings.WARMUP_STEPS:
             network.train(
                 replay_buffer,
                 episode_timesteps,
                 batch_size,
-                DISCOUNT,
-                TAU,
+                settings.DISCOUNT,
+                settings.TAU,
             )
             # Log episode-level metrics
             network.log_episode(
@@ -336,15 +327,15 @@ while timestep < MAX_TIMESTEPS:
                 expl_noise=0.0,
             )
 
-        if timesteps_since_eval >= EVAL_FREQ:
+        if timesteps_since_eval >= settings.EVAL_FREQ:
             print("Validating timestep{},episode {}".format(timestep, episode_num))
-            timesteps_since_eval %= EVAL_FREQ
+            timesteps_since_eval %= settings.EVAL_FREQ
             avg_reward, avg_col = evaluate(
-                network=network, epoch=epoch, eval_episodes=EVAL_EP)
+                network=network, epoch=epoch, eval_episodes=settings.EVAL_EP)
             evaluations.append(avg_reward)
             network.log_eval(epoch, avg_reward, avg_col)
-            network.save(file_name, directory=MODEL_DIR)
-            np.save("%s/%s" % (RESULTS_DIR, file_name), evaluations)
+            network.save(file_name, directory=settings.MODEL_DIR)
+            np.save("%s/%s" % (settings.RESULTS_DIR, file_name), evaluations)
             epoch += 1
 
         state = env.reset()
@@ -376,8 +367,8 @@ while timestep < MAX_TIMESTEPS:
     # Update action to fall in range [0,1] for linear velocity and [-1,1] for angular velocity
     a_in = [(action[0] + 1) / 2, action[1]]
     next_state, reward, done, target = env.step(a_in)
-    done_bool = 0 if episode_timesteps + 1 == MAX_STEPS else int(done)
-    done = 1 if episode_timesteps + 1 == MAX_STEPS else int(done)
+    done_bool = 0 if episode_timesteps + 1 == settings.MAX_STEPS else int(done)
+    done = 1 if episode_timesteps + 1 == settings.MAX_STEPS else int(done)
     episode_reward += reward
 
     # Save the tuple in replay buffer
@@ -390,9 +381,9 @@ while timestep < MAX_TIMESTEPS:
     timesteps_since_eval += 1
 
 # After the training is done, evaluate the network and save it
-avg_reward, avg_col = evaluate(network=network, epoch=epoch, eval_episodes=EVAL_EP)
+avg_reward, avg_col = evaluate(network=network, epoch=epoch, eval_episodes=settings.EVAL_EP)
 evaluations.append(avg_reward)
 network.log_eval(epoch, avg_reward, avg_col)
 if save_model:
-    network.save("%s" % file_name, directory=MODEL_DIR)
-np.save("%s/%s" % (RESULTS_DIR, file_name), evaluations)
+    network.save("%s" % file_name, directory=settings.MODEL_DIR)
+np.save("%s/%s" % (settings.RESULTS_DIR, file_name), evaluations)

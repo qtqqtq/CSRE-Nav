@@ -24,20 +24,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from velodyne_env import GazeboEnv
-from settings import (
-    ACTION_DIM,
-    ENVIRONMENT_DIM,
-    MAX_STEPS,
-    MODEL_DIR,
-    ROBOT_DIM,
-    SAFETY_REWARD_WEIGHT,
-    SPEED_REWARD_WEIGHT,
-    STATE_DIM,
-)
+from laser_env import GazeboEnv
+import settings
 
 # ---------------------------------------------------------------------------
-# Network definitions (must match train_velodyne_td3.py exactly)
+# Network definitions — legacy deterministic TD3 Actor (loads the old
+# TD3_velodyne_360 checkpoint — removed from pytorch_models; the TD3
+# scenario below is skipped. NOT the SAC actor from train_sac.py).
 # ---------------------------------------------------------------------------
 
 class Actor(nn.Module):
@@ -188,48 +181,18 @@ def straight_to_goal_action(env, _diag=None):
 # ---------------------------------------------------------------------------
 
 def decompose_reward(env, action, reward_total):
-    """Re-compute reward components from env state for logging."""
-    from velodyne_env import GOAL_REACHED_DIST, COLLISION_DIST
+    """Return reward components computed by the env's own get_reward.
 
-    odom = env.last_odom
-    if odom is None:
+    Reads env.last_reward_info so any change to get_reward (e.g. new safety
+    shaping) is reflected automatically instead of being re-implemented here.
+    """
+    info = getattr(env, "last_reward_info", None)
+    if info is None:
         return {"total": reward_total}
 
-    odom_x = odom.pose.pose.position.x
-    odom_y = odom.pose.pose.position.y
-    heading_angle = _ros_yaw(odom)
-
-    distance = math.sqrt((odom_x - env.goal_x)**2 + (odom_y - env.goal_y)**2)
-    min_laser = min(env.velodyne_data)
-    target = distance < GOAL_REACHED_DIST
-    collision = min_laser < COLLISION_DIST
-
-    # r_vel: velocity alignment toward goal
-    vx = action[0] * math.cos(heading_angle)
-    vy = action[0] * math.sin(heading_angle)
-    dx_g = env.goal_x - odom_x
-    dy_g = env.goal_y - odom_y
-    dist_to_goal = math.sqrt(dx_g**2 + dy_g**2) + 1e-8
-    r_vel = (dx_g / dist_to_goal) * vx + (dy_g / dist_to_goal) * vy
-
-    # r_ss: log-average static safety
-    clipped = np.maximum(np.array(env.velodyne_data), 0.1)
-    r_ss = np.mean(np.log(clipped))
-
-    return {
-        "total": reward_total,
-        "r_vel": r_vel,
-        "r_ss": r_ss,
-        "distance": distance,
-        "min_laser": min_laser,
-        "target": target,
-        "collision": collision,
-        "goal_x": env.goal_x,
-        "goal_y": env.goal_y,
-        "odom_x": odom_x,
-        "odom_y": odom_y,
-        "heading": heading_angle,
-    }
+    out = dict(info)
+    out["total"] = reward_total
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -385,15 +348,15 @@ def print_summary(results):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    MODEL_NAME = "TD3_velodyne_360"  # script-specific model to load
+    MODEL_NAME = "TD3_velodyne_360"  # legacy TD3 model (removed from pytorch_models); scenario skipped
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device: %s  |  State dim: %d  |  Action dim: %d" % (
-        device, STATE_DIM, ACTION_DIM))
+        device, settings.STATE_DIM, settings.ACTION_DIM))
 
     # --- Create environment ---
     print("\nLaunching Gazebo environment ...")
-    env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM,safety_reward_weight=SAFETY_REWARD_WEIGHT,speed_reward_weight=SPEED_REWARD_WEIGHT)
+    env = GazeboEnv("multi_robot_scenario.launch", settings.ENVIRONMENT_DIM,safety_reward_weight=settings.SAFETY_REWARD_WEIGHT,speed_reward_weight=settings.SPEED_REWARD_WEIGHT)
     time.sleep(5)
 
     # --- Warm-up: verify odom & laser are flowing ---
@@ -408,17 +371,17 @@ if __name__ == "__main__":
             env.last_odom.pose.pose.position.y,
             q.x, q.y, q.z, q.w))
     print("  laser samples: %d  min=%.2f  max=%.2f" % (
-        len(env.velodyne_data),
-        np.min(env.velodyne_data), np.max(env.velodyne_data)))
+        len(env.laser_data),
+        np.min(env.laser_data), np.max(env.laser_data)))
     print("  goal: (%.2f, %.2f)" % (env.goal_x, env.goal_y))
 
     # --- Load trained model ---
     policy_td3 = None
-    model_path = os.path.join(MODEL_DIR, "%s_actor.pth" % MODEL_NAME)
+    model_path = os.path.join(settings.MODEL_DIR, "%s_actor.pth" % MODEL_NAME)
     if os.path.exists(model_path):
-        policy_td3 = TD3Policy(STATE_DIM, ACTION_DIM, device)
+        policy_td3 = TD3Policy(settings.STATE_DIM, settings.ACTION_DIM, device)
         try:
-            policy_td3.load(MODEL_NAME, MODEL_DIR)
+            policy_td3.load(MODEL_NAME, settings.MODEL_DIR)
         except Exception as e:
             print("  WARNING: Failed to load model: %s" % e)
             policy_td3 = None
@@ -429,12 +392,12 @@ if __name__ == "__main__":
 
     # --- Scenario 1: Random actions ---
     results.append(run_episode_env(env, lambda e: random_action(),
-                                   "Random Actions", MAX_STEPS))
+                                   "Random Actions", settings.MAX_STEPS))
 
     # --- Scenario 2: Trained TD3 model ---
     if policy_td3 is not None:
         results.append(run_episode_state(env, policy_td3,
-                                         "TD3 (%s)" % MODEL_NAME, MAX_STEPS))
+                                         "TD3 (%s)" % MODEL_NAME, settings.MAX_STEPS))
 
     # --- Summary ---
     print_summary(results)

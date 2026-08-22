@@ -5,19 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from velodyne_env import GazeboEnv
-from settings import (
-    ACTION_DIM,
-    ENVIRONMENT_DIM,
-    LOG_STD_MAX,
-    LOG_STD_MIN,
-    MAX_STEPS,
-    MODEL_DIR,
-    ROBOT_DIM,
-    SEED,
-    STATE_DIM,
-    device,
-)
+from laser_env import GazeboEnv
+import settings
 
 
 class SACActor(nn.Module):
@@ -36,7 +25,7 @@ class SACActor(nn.Module):
     def forward(self, s):
         out = self.layer_3(F.leaky_relu(self.layer_2(F.leaky_relu(self.layer_1(s)))))
         mean, log_std = out.chunk(2, dim=-1)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_std = torch.clamp(log_std, settings.LOG_STD_MIN, settings.LOG_STD_MAX)
         return mean, log_std
 
     def get_mean_action(self, s):
@@ -47,10 +36,10 @@ class SACActor(nn.Module):
 # SAC policy wrapper (testing only — deterministic eval)
 class SACPolicy(object):
     def __init__(self, state_dim, action_dim):
-        self.actor = SACActor(state_dim, action_dim).to(device)
+        self.actor = SACActor(state_dim, action_dim).to(settings.device)
 
     def get_action(self, state):
-        state = torch.Tensor(state.reshape(1, -1)).to(device)
+        state = torch.Tensor(state.reshape(1, -1)).to(settings.device)
         return self.actor.get_mean_action(state).cpu().data.numpy().flatten()
 
     def load(self, filename, directory):
@@ -60,19 +49,19 @@ class SACPolicy(object):
 
 
 # Script-specific: name of the file to load the policy from
-file_name = "SAC_velodyne_360"
+file_name = "SAC_laser"
 
 
 # Create the testing environment
-env = GazeboEnv("multi_robot_scenario.launch", ENVIRONMENT_DIM)
+env = GazeboEnv("multi_robot_scenario.launch", settings.ENVIRONMENT_DIM)
 time.sleep(5)
-torch.manual_seed(SEED)
-np.random.seed(SEED)
+torch.manual_seed(settings.SEED)
+np.random.seed(settings.SEED)
 
 # Create the network
-network = SACPolicy(STATE_DIM, ACTION_DIM)
+network = SACPolicy(settings.STATE_DIM, settings.ACTION_DIM)
 try:
-    network.load(file_name, MODEL_DIR)
+    network.load(file_name, settings.MODEL_DIR)
 except:
     raise ValueError("Could not load the stored model parameters")
 
@@ -87,7 +76,7 @@ while True:
     # Update action to fall in range [0,1] for linear velocity and [-1,1] for angular velocity
     a_in = [(action[0] + 1) / 2, action[1]]
     next_state, reward, done, target = env.step(a_in)
-    done = 1 if episode_timesteps + 1 == MAX_STEPS else int(done)
+    done = 1 if episode_timesteps + 1 == settings.MAX_STEPS else int(done)
 
     # On termination of episode
     if done:

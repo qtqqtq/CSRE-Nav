@@ -383,6 +383,9 @@ class CNNSAC(object):
         av_actor_loss = 0
         av_alpha_loss = 0
         av_entropy = 0
+        q_soft_targets = []
+        q_current1 = []
+        q_current2 = []
 
         for it in range(iterations):
             # Sample a batch from replay buffer
@@ -407,8 +410,11 @@ class CNNSAC(object):
                 av_Q += torch.mean(soft_target)
                 max_Q = max(max_Q, torch.max(soft_target))
                 td_target = reward + ((1 - done) * discount * soft_target)
+                q_soft_targets.append(soft_target.detach().cpu().numpy())
 
             current_Q1, current_Q2 = self.critic(state_rg, state_kin, action)
+            q_current1.append(current_Q1.detach().cpu().numpy())
+            q_current2.append(current_Q2.detach().cpu().numpy())
             critic_loss = F.mse_loss(current_Q1, td_target) + F.mse_loss(current_Q2, td_target)
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
@@ -452,6 +458,11 @@ class CNNSAC(object):
         self.writer.add_scalar("Train/entropy", av_entropy / iterations, self.iter_count)
         self.writer.add_scalar("Q/Avg", av_Q / iterations, self.iter_count)
         self.writer.add_scalar("Q/Max", max_Q, self.iter_count)
+        # Q-value distribution histograms over the training pass
+        if q_soft_targets:
+            self.writer.add_histogram("Q/dist/soft_target", np.concatenate(q_soft_targets), self.iter_count)
+            self.writer.add_histogram("Q/dist/current_Q1", np.concatenate(q_current1), self.iter_count)
+            self.writer.add_histogram("Q/dist/current_Q2", np.concatenate(q_current2), self.iter_count)
 
     def log_episode(self, episode_num, reward, length, goal_reached,
                     collision, expl_noise):

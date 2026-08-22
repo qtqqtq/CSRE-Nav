@@ -8,11 +8,10 @@ from os import path
 
 import numpy as np
 import rospy
-import sensor_msgs.point_cloud2 as pc2
 from gazebo_msgs.msg import ModelState
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import LaserScan
 from squaternion import Quaternion
 from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import Empty
@@ -21,6 +20,7 @@ from visualization_msgs.msg import MarkerArray
 
 GOAL_REACHED_DIST = 0.3
 COLLISION_DIST = 0.35
+GOAL_CLEARANCE = 0.5  # minimum distance a generated goal must keep from obstacle AABBs
 TIME_DELTA = 0.05
 
 
@@ -262,7 +262,7 @@ def _find_world_in_launch(launch_path, search_dirs, pkg_name, pkg_dir):
 
 # Backward-compatible check_pos: used when no world info is available.
 # Kept as a module-level function for external callers.
-def check_pos(x, y, obstacles=None, boundary=4.5, bounds=None):
+def check_pos(x, y, obstacles=None, boundary=4.5, bounds=None, margin=0.0):
     """Return True if *(x, y)* is free of obstacles and within the world boundary.
 
     Args:
@@ -274,6 +274,10 @@ def check_pos(x, y, obstacles=None, boundary=4.5, bounds=None):
         bounds:     optional ``(x_min, x_max, y_min, y_max)`` rectangle; when
                     given, it replaces the symmetric boundary check (for worlds
                     whose map is not centred at the origin).
+        margin:     extra clearance (m) kept between the point and each obstacle
+                    AABB.  Used for goal placement so goals never land right on
+                    an obstacle edge.  Only applies to the dynamic ``obstacles``
+                    branch (not the legacy hard-coded rectangles).
     """
     # Boundary check
     if bounds is not None:
@@ -309,7 +313,7 @@ def check_pos(x, y, obstacles=None, boundary=4.5, bounds=None):
 
     # Dynamic check against parsed obstacle AABBs
     for (x_min, x_max, y_min, y_max) in obstacles:
-        if x_min < x < x_max and y_min < y < y_max:
+        if (x_min - margin) < x < (x_max + margin) and (y_min - margin) < y < (y_max + margin):
             return False
     return True
 
@@ -318,7 +322,7 @@ class GazeboEnv:
     """Superclass for all Gazebo environments."""
 
     def __init__(self, launchfile, environment_dim, use_cnn=False,
-                 ray_h_beams=36, ray_v_layers=21, max_ray_range=5.0,
+                 ray_h_beams=36, ray_v_layers=10, max_ray_range=5.0,
                  safety_reward_weight=1.0, speed_reward_weight=1.0,
                  port="11311", world_name=None):
         self.environment_dim = environment_dim
@@ -330,18 +334,21 @@ class GazeboEnv:
 
         self.upper = 5.0
         self.lower = -5.0
-        self.velodyne_data = np.ones(self.environment_dim) * 10
+        self.laser_data = np.ones(self.environment_dim) * 10
         self.last_odom = None
         self.last_distance = 0.0  # for progress reward
 
         # ---- Reward weights ----
         self.safety_reward_weight = safety_reward_weight
         self.speed_reward_weight = speed_reward_weight
+        # Reward components from the most recent step (single source of truth
+        # for logging; populated by step(), read by test_reward.decompose_reward).
+        self.last_reward_info = None
 
         # ---- CNN mode: cost_rays from c_space_mapper_node ----
         self.use_cnn = use_cnn
         self.ray_h_beams = ray_h_beams        # horizontal beams (default 36 = 10° res)
-        self.ray_v_layers = ray_v_layers      # theta layers from c-space (default 21)
+        self.ray_v_layers = ray_v_layers      # theta layers from c-space (default 10)
         self.max_ray_range = max_ray_range    # maximum ray range for preprocessing
         # Buffer: initialized to max_range (no collision detected yet)
         self.cost_rays_data = np.ones((ray_h_beams, ray_v_layers)) * max_ray_range
@@ -476,8 +483,8 @@ class GazeboEnv:
         self.publisher = rospy.Publisher("goal_point", MarkerArray, queue_size=3)
         self.publisher2 = rospy.Publisher("linear_velocity", MarkerArray, queue_size=1)
         self.publisher3 = rospy.Publisher("angular_velocity", MarkerArray, queue_size=1)
-        self.velodyne = rospy.Subscriber(
-            "/velodyne_points", PointCloud2, self.velodyne_callback, queue_size=1
+        self.laser = rospy.Subscriber(
+            "/r1/front_laser/scan", LaserScan, self.laser_callback, queue_size=1
         )
         self.odom = rospy.Subscriber(
             "/r1/odom", Odometry, self.odom_callback, queue_size=1
@@ -488,26 +495,21 @@ class GazeboEnv:
                 self.cost_rays_callback, queue_size=1
             )
 
-    # Read velodyne pointcloud and turn it into distance data, then select the
+    # Read the 2D laser scan and turn it into distance data, then select the
     # minimum value for each angle range as state representation.
-    # The raw velodyne_data is used for collision detection only;
+    # The raw laser_data is used for collision detection only;
     # CNN-mode uses cost_rays from the c_space_mapper pipeline instead.
-    def velodyne_callback(self, v):
-        data = list(pc2.read_points(v, skip_nans=False, field_names=("x", "y", "z")))
-        self.velodyne_data = np.ones(self.environment_dim) * 10
+    def laser_callback(self, msg):
+        self.laser_data = np.ones(self.environment_dim) * 10
 
-        for i in range(len(data)):
-            if data[i][2] > -0.2:
-                dot = data[i][0] * 1 + data[i][1] * 0
-                mag1 = math.sqrt(math.pow(data[i][0], 2) + math.pow(data[i][1], 2))
-                mag2 = math.sqrt(math.pow(1, 2) + math.pow(0, 2))
-                beta = math.acos(dot / (mag1 * mag2)) * np.sign(data[i][1])
-                dist = math.sqrt(data[i][0] ** 2 + data[i][1] ** 2 + data[i][2] ** 2)
-
+        angle = msg.angle_min
+        for r in msg.ranges:
+            if math.isfinite(r) and msg.range_min <= r <= msg.range_max:
                 for j in range(len(self.gaps)):
-                    if self.gaps[j][0] <= beta < self.gaps[j][1]:
-                        self.velodyne_data[j] = min(self.velodyne_data[j], dist)
+                    if self.gaps[j][0] <= angle < self.gaps[j][1]:
+                        self.laser_data[j] = min(self.laser_data[j], r)
                         break
+            angle += msg.angle_increment
 
     def odom_callback(self, od_data):
         self.last_odom = od_data
@@ -518,7 +520,7 @@ class GazeboEnv:
 
         Message layout:
           dim[0] = "beam",  size=num_beams (36), stride=nz_
-          dim[1] = "theta", size=nz_ (21),     stride=1
+          dim[1] = "theta", size=nz_ (10),     stride=1
 
         Each element is the distance along beam b at robot orientation θ
         to the first collision in the 3D configuration space.
@@ -578,10 +580,10 @@ class GazeboEnv:
                 "No odometry received in step() — "
                 "check that /r1/odom is being published")
 
-        # read velodyne laser state
-        done, collision, min_laser = self.observe_collision(self.velodyne_data)
+        # read laser state
+        done, collision, min_laser = self.observe_collision(self.laser_data)
         v_state = []
-        v_state[:] = self.velodyne_data[:]
+        v_state[:] = self.laser_data[:]
         laser_state = [v_state]
 
         # Calculate robot heading from odometry data
@@ -640,13 +642,13 @@ class GazeboEnv:
         progress = self.last_distance - distance
         self.last_distance = distance
 
-        # Build ray data for r_ss: c-space cost_rays (CNN mode) or velodyne bins
+        # Build ray data for r_ss: c-space cost_rays (CNN mode) or laser bins
         if self.use_cnn:
             safety_data = self.cost_rays_data.flatten()
         else:
-            safety_data = np.array(self.velodyne_data)
+            safety_data = np.array(self.laser_data)
 
-        reward = self.get_reward(
+        reward, reward_info = self.get_reward(
             target, collision, action, min_laser, progress,
             heading_angle=angle,
             goal_x=self.goal_x, goal_y=self.goal_y,
@@ -655,6 +657,8 @@ class GazeboEnv:
             safety_reward_weight=self.safety_reward_weight,
             speed_reward_weight=self.speed_reward_weight,
         )
+        reward_info["reward"] = reward
+        self.last_reward_info = reward_info
         return state, reward, done, target
 
     def reset(self):
@@ -709,7 +713,7 @@ class GazeboEnv:
         except (rospy.ServiceException) as e:
             print("/gazebo/unpause_physics service call failed")
 
-        # Wait for velodyne + odometry while Gazebo is running.
+        # Wait for laser + odometry while Gazebo is running.
         # rospy subscriber callbacks fire in background threads.
         time.sleep(TIME_DELTA)
         if self.last_odom is None:
@@ -730,7 +734,7 @@ class GazeboEnv:
                 "check that /r1/odom is being published")
 
         v_state = []
-        v_state[:] = self.velodyne_data[:]
+        v_state[:] = self.laser_data[:]
         laser_state = [v_state]
 
         distance = np.linalg.norm(
@@ -784,7 +788,8 @@ class GazeboEnv:
             self.goal_x = self.odom_x + random.uniform(self.upper, self.lower)
             self.goal_y = self.odom_y + random.uniform(self.upper, self.lower)
             goal_ok = check_pos(self.goal_x, self.goal_y, self.obstacles,
-                                self.boundary, self.map_bounds)
+                                self.boundary, self.map_bounds,
+                                margin=GOAL_CLEARANCE)
 
     def random_box(self):
         # Randomly change the location of the boxes in the environment on each reset to randomize the training
@@ -906,16 +911,25 @@ class GazeboEnv:
             goal_x, goal_y:        goal position in world frame.
             odom_x, odom_y:        robot position in world frame.
             laser_data:            ndarray of ray distances (c-space cost_rays or
-                                   velodyne bins).  If None, falls back to min_laser.
+                                   laser bins).  If None, falls back to min_laser.
             safety_reward_weight:  coefficient for r_ss safety reward.
             speed_reward_weight:   coefficient for r_vel speed reward.
 
         Reference: NavRL (Xu et al., IEEE RA-L 2025), Eqs. (8)-(9).
         """
+        info = {
+            "target": target,
+            "collision": collision,
+            "distance": math.sqrt((goal_x - odom_x)**2 + (goal_y - odom_y)**2),
+            "min_laser": min_laser,
+            "r_vel": 0.0,
+            "r_ss": 0.0,
+        }
+
         if target:
-            return 100.0
+            return 100.0, info
         elif collision:
-            return -200.0
+            return -100.0, info
         else:
             # ---- r_vel: velocity alignment toward goal ----
             vx = action[0] * math.cos(heading_angle)
@@ -924,6 +938,7 @@ class GazeboEnv:
             dy = goal_y - odom_y
             dist_to_goal = math.sqrt(dx**2 + dy**2) + 1e-8
             r_vel = (dx / dist_to_goal) * vx + (dy / dist_to_goal) * vy
+            r_vel -= 0.2
 
             # ---- r_ss: log-average static safety over all rays ----
             if laser_data is not None and len(laser_data) > 0:
@@ -932,5 +947,9 @@ class GazeboEnv:
             else:
                 r3 = lambda x: 1 - x if x < 1 else 0.0
                 r_ss = -r3(min_laser)
+            r_ss -= 1
+            r_ss = min(0,r_ss)
 
-            return speed_reward_weight * r_vel + safety_reward_weight * r_ss
+            info["r_vel"] = r_vel
+            info["r_ss"] = r_ss
+            return speed_reward_weight * r_vel + safety_reward_weight * r_ss, info
