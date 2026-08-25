@@ -483,8 +483,10 @@ def draw_planned_path(env, poses):
         pygame.draw.circle(canvas, (255, 0, 255), p, 4)
     for (x, y, t) in poses:
         a = _gd(x, y)
-        b = _gd(x + 12 * math.cos(t), y - 12 * math.sin(t))
-        pygame.draw.line(canvas, (255, 170, 255), a, b, width=1)
+        # 目标位形的 θ 可能为 None（朝向任意），此时不画朝向短线
+        if t is not None:
+            b = _gd(x + 12 * math.cos(t), y - 12 * math.sin(t))
+            pygame.draw.line(canvas, (255, 170, 255), a, b, width=1)
 
 
 # ---------------------------------------------------------------------------
