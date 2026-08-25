@@ -32,6 +32,7 @@ into open space, making plans near-useless.  `footprint` remains configurable.
 """
 from __future__ import annotations
 
+import colorsys
 import heapq
 import math
 from collections import deque
@@ -462,10 +463,28 @@ class GraphPlanner:
         return out
 
 
-def draw_planned_path(env, poses):
-    """Draw the planned waypoint polyline (magenta) onto `env.canvas`.
+_FONT = None
 
-    Waypoint dots + per-waypoint heading ticks.  No-op when not rendered.
+
+def _heading_font():
+    """Cached small bold font for the per-waypoint theta labels."""
+    global _FONT
+    if _FONT is None:
+        import pygame
+        pygame.font.init()
+        _FONT = pygame.font.SysFont("dejavusans", 13, bold=True)
+    return _FONT
+
+
+def draw_planned_path(env, poses):
+    """Draw the planned path onto `env.canvas`, color-coded by heading theta.
+
+    Each segment is colored by the theta of its start waypoint, so *movement*
+    segments (theta stays constant) render as uniform-color runs, while in-place
+    *rotation* steps show an abrupt hue jump -- the theta profile of the path is
+    visible at a glance.  Every waypoint also gets a heading arrow (shaft +
+    filled arrowhead) and a degree label in the same hue; the goal's theta may be
+    None (orientation free) -> no arrow / label there.  No-op when not rendered.
     """
     import pygame
     canvas = getattr(env, "canvas", None)
@@ -476,17 +495,46 @@ def draw_planned_path(env, poses):
         g = env._world_2_grid(torch.tensor([float(x), float(y)]))
         return (int(g[0]), int(g[1]))
 
-    pts = [_gd(x, y) for (x, y, _) in poses]
-    for a, b in zip(pts[:-1], pts[1:]):
-        pygame.draw.line(canvas, (255, 0, 255), a, b, width=4)
-    for p in pts[1:-1]:
-        pygame.draw.circle(canvas, (255, 0, 255), p, 4)
+    def _hue(t):
+        """theta [0, 2pi) -> HSV hue wheel color (vivid, readable on white)."""
+        h = (t % (2 * math.pi)) / (2 * math.pi)
+        r, g, b = colorsys.hsv_to_rgb(h, 0.85, 1.0)
+        return (int(r * 255), int(g * 255), int(b * 255))
+
+    # 1) segments colored by the theta of their start waypoint
+    for (x1, y1, t1), (x2, y2, _) in zip(poses[:-1], poses[1:]):
+        if t1 is None:
+            continue
+        pygame.draw.line(canvas, _hue(t1), _gd(x1, y1), _gd(x2, y2), width=4)
+
+    # 2) waypoint dots (white so they read on any hue / map background)
+    for p in (_gd(x, y) for (x, y, _) in poses[1:-1]):
+        pygame.draw.circle(canvas, (255, 255, 255), p, 3)
+
+    # 3) heading arrows: shaft from the center + filled arrowhead, hue = theta
     for (x, y, t) in poses:
+        if t is None:
+            continue
         a = _gd(x, y)
-        # 目标位形的 θ 可能为 None（朝向任意），此时不画朝向短线
-        if t is not None:
-            b = _gd(x + 12 * math.cos(t), y - 12 * math.sin(t))
-            pygame.draw.line(canvas, (255, 170, 255), a, b, width=1)
+        ux, uy = math.cos(t), -math.sin(t)          # pygame y-down
+        nx, ny = -uy, ux                            # perpendicular
+        tip = (a[0] + 18 * ux, a[1] + 18 * uy)
+        b1 = (a[0] + 10 * ux + 4 * nx, a[1] + 10 * uy + 4 * ny)
+        b2 = (a[0] + 10 * ux - 4 * nx, a[1] + 10 * uy - 4 * ny)
+        col = _hue(t)
+        pygame.draw.line(canvas, col, a, (a[0] + 12 * ux, a[1] + 12 * uy), width=2)
+        pygame.draw.polygon(canvas, col, [tip, b1, b2])
+
+    # 4) degree label next to each waypoint (white shadow + black text: readable
+    #    on any hue / obstacle / open-space background)
+    font = _heading_font()
+    for (x, y, t) in poses:
+        if t is None:
+            continue
+        g = _gd(x, y)
+        txt = "%d°" % round(math.degrees(t % (2 * math.pi)))
+        canvas.blit(font.render(txt, True, (255, 255, 255)), (g[0] + 7, g[1] - 13))
+        canvas.blit(font.render(txt, True, (15, 15, 15)), (g[0] + 6, g[1] - 14))
 
 
 # ---------------------------------------------------------------------------
