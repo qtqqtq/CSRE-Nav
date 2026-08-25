@@ -41,16 +41,14 @@ CNN_STATE_DIM = RAY_GRID_FLAT_DIM + KINEMATIC_DIM  # 364 (CNN state)
 # ---------------------------------------------------------------------------
 # Robot footprint (c-space dilation polygon, metres)
 # ---------------------------------------------------------------------------
-def circular_footprint(radius, n=16):
-    """Regular n-gon approximating a circle of `radius` (metres)."""
-    return [
-        [radius * math.cos(2 * math.pi * i / n),
-         radius * math.sin(2 * math.pi * i / n)]
-        for i in range(n)
-    ]
+def rectangular_footprint(length, width):
+    """Axis-aligned rectangle footprint (long axis along +x = forward), metres."""
+    hl, hw = length / 2.0, width / 2.0
+    return [[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]]
 
-ROBOT_FOOTPRINT_RADIUS = 0.14   # m (= Sparrow collision_trsd = car_radius 9cm + 5cm)
-ROBOT_FOOTPRINT = circular_footprint(ROBOT_FOOTPRINT_RADIUS, n=16)
+ROBOT_FOOTPRINT_LENGTH = 1.20   # m, 沿 +x(前进)
+ROBOT_FOOTPRINT_WIDTH = 0.14    # m, 沿 +y(横向)
+ROBOT_FOOTPRINT = rectangular_footprint(ROBOT_FOOTPRINT_LENGTH, ROBOT_FOOTPRINT_WIDTH)
 
 # ---------------------------------------------------------------------------
 # SAC policy bounds
@@ -80,6 +78,39 @@ MAX_TIMESTEPS = 5e6   # total training steps
 # ---------------------------------------------------------------------------
 SAFETY_REWARD_WEIGHT = 0.0
 SPEED_REWARD_WEIGHT = 0.0
+
+# ---------------------------------------------------------------------------
+# Sparrow c-space environment (sparrow_cspace_env / train_sparrow_cnn_sac)
+# ---------------------------------------------------------------------------
+SPARROW_N_ENVS = 32          # vectorized environments per training step
+SPARROW_N_OBSTACLES = 15     # obstacles per environment
+SPARROW_DYNAMIC_OBS = False  # whether to spawn moving obstacles (c-space env: off)
+SPARROW_LD_ACC = 8           # lidar DDA step size (cm); larger = faster but coarser scan
+
+# Stuck auto-reset: boxed-in detection via the theta=0 cost-ray layer
+SPARROW_STUCK_RESET = True
+SPARROW_STUCK_THRESHOLD = 0.5   # < 0 disables stuck reset (training default);
+                                 # interactive play_cspace uses 0.5
+
+# Live rendering of one parallel environment (pygame window)
+SPARROW_RENDER = False           # True -> render env SPARROW_RENDER_ENV while training
+SPARROW_RENDER_ENV = 0           # which env to render (0 .. SPARROW_N_ENVS-1)
+SPARROW_RENDER_SPEED = 'real'    # 'slow'=30FPS / 'fast'=max / 'real'=sim-speed
+
+# ---------------------------------------------------------------------------
+# Global planner (GraphPlanner) -- 单机器人，位形空间中的图上规划
+# ---------------------------------------------------------------------------
+# footprint 用 28x28 cm 方（≈碰撞圆 collision_trsd=14cm），而非观测用的 1.2m 大
+# 足迹（否则会挡住 > 一半地图）。见 global_planner.py 模块 docstring。
+GLOBAL_PLAN_ENABLED = False      # 训练时是否启用全局路径航点引导
+PLANNER_FOOTPRINT = [[0.14, 0.14], [0.14, -0.14], [-0.14, -0.14], [-0.14, 0.14]]
+PLANNER_G_MIN = 0.1              # c-space 空间分辨率 (m)，与观测管线一致
+PLANNER_NZ = 10                  # θ 层数，与观测管线一致
+PLANNER_STRIDE_IJ = 2            # 顶点 (i,j) 采样步长 (格)
+PLANNER_STRIDE_K = 1             # 顶点 θ 层采样步长 (层)
+PLANNER_CONNECT_DIST_CM = 60     # 顶点连接半径 (cm)
+PLANNER_WP_REACH_CM = 60         # 距当前航点多近则前进到下一航点 (> target_area 防提前获胜)
+PLANNER_MIN_WP_SPACING_CM = 40   # 航点最小间距 (> target_area 防提前获胜)
 
 # ---------------------------------------------------------------------------
 # Paths

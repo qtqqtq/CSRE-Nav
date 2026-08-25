@@ -20,28 +20,35 @@ import os
 import time
 
 import numpy as np
+import pygame
 import torch
 
 from replay_buffer import ReplayBuffer
 from sparrow_cspace_env import SparrowCspaceEnv
 from cnn_network import CNNSAC
+from render_utils import draw_hud, draw_cost_rays, draw_cspace_projection
 import settings
 
 
 # ---------------------------------------------------------------------------
 # Hyper-parameters
 # ---------------------------------------------------------------------------
-N_ENVS = 32                 # number of vectorized environments (GPU batch)
-N_OBSTACLES = 15            # obstacles per env (matches ColorDynamic's default)
+N_ENVS = settings.SPARROW_N_ENVS              # number of vectorized environments (GPU batch)
+N_OBSTACLES = settings.SPARROW_N_OBSTACLES    # obstacles per env (matches ColorDynamic's default)
 batch_size = 256
 buffer_size = 250000
-file_name = "SAC_sparrow_cspace"
+file_name = "SAC_sparrow_cspace_2"
 save_model = True
 load_model = True
-load_model_name = "SAC_sparrow_cspace"
+load_model_name = "SAC_sparrow_cspace_1"
 
 train_every = 5             # env-steps between training calls
 gradient_steps = 5          # gradient steps per training call (1:1 with steps)
+
+# 可视化：像 play_cspace 一样实时渲染其中一个并行环境（打开 pygame 窗口）
+RENDER = settings.SPARROW_RENDER              # True 时打开渲染窗口
+RENDER_ENV = settings.SPARROW_RENDER_ENV      # 渲染第几个环境（0 .. N_ENVS-1）
+RENDER_SPEED = settings.SPARROW_RENDER_SPEED  # 'slow'=30FPS / 'fast'=最快 / 'real'=仿真速度
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +72,11 @@ def evaluate(network, env, eval_steps=500):
         total_reward += reward.sum().item()
         num_done += done.sum().item()
         num_collision += env.collide_vec.sum().item()
+    total_steps = eval_steps * env.N
     avg_reward = total_reward / max(num_done, 1)
+    # collide_vec 现在是「卡死(stuck)重置事件」掩码，是 done 的子集（每步每个
+    # 环境最多触发一次），因此 num_collision <= num_done，碰撞率 = 以碰撞(卡死)
+    # 结束的 episode 占比，天然落在 [0,1]。
     collision_rate = num_collision / max(num_done, 1)
     return avg_reward, collision_rate
 
@@ -86,9 +97,19 @@ env = SparrowCspaceEnv(
     O=N_OBSTACLES,
     dvc=settings.device,
     action_type="Continuous",
-    render_mode=None,
+    stuck_reset=settings.SPARROW_STUCK_RESET,
+    stuck_threshold=settings.SPARROW_STUCK_THRESHOLD,
+    ld_acc=settings.SPARROW_LD_ACC,
+    global_plan=settings.GLOBAL_PLAN_ENABLED,
+    render_mode="human" if RENDER else None,
+    render_speed=RENDER_SPEED,
+    ri=RENDER_ENV,
     max_ep_steps=settings.MAX_STEPS,
 )
+
+if RENDER:
+    pygame.font.init()
+    font = pygame.font.Font(None, 26)
 
 network = CNNSAC(
     kinematic_dim=settings.KINEMATIC_DIM,
@@ -133,6 +154,7 @@ env_steps = 0              # number of env.step() calls
 epoch = 1
 evaluations = []
 t_start = time.time()
+quit_requested = False
 
 while total_steps < settings.MAX_TIMESTEPS:
     # split flat state into ray-grid + kinematic
@@ -178,6 +200,21 @@ while total_steps < settings.MAX_TIMESTEPS:
     total_steps += N_ENVS
     env_steps += 1
 
+    # 可视化：渲染第 RENDER_ENV 号环境（base 帧已在 env.step 内部绘制，
+    # 这里叠加 cost rays / c-space 投影 / HUD 后统一 flush 一次）
+    if RENDER:
+        draw_cost_rays(env, font)
+        draw_cspace_projection(env, font)
+        draw_hud(env, font, float(reward[RENDER_ENV].item()),
+                 float(ep_rewards[RENDER_ENV].item()))
+        pygame.display.update()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                quit_requested = True
+        if quit_requested:
+            print("Render window closed by user; stopping training.")
+            break
+
     # training (after warmup), batched every `train_every` env-steps
     if total_steps >= settings.WARMUP_STEPS and env_steps % train_every == 0:
         network.train(replay_buffer, gradient_steps, batch_size,
@@ -209,3 +246,5 @@ if save_model:
     network.save(file_name, directory=settings.MODEL_DIR)
 np.save("%s/%s" % (settings.RESULTS_DIR, file_name), evaluations)
 print("Training complete. Model saved to %s/%s" % (settings.MODEL_DIR, file_name))
+if RENDER:
+    env.close()

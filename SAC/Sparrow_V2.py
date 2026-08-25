@@ -51,13 +51,14 @@ default_cfg = dict(
     RdOR=True,  # whether to generate obstacles with random radius between [10, Obs_R]
     Obs_R=14,  # maximal obstacle radius, cm
     Obs_V=25,  # maximal obstacle velocity, cm/s
-    generate_rate=0.2,  # per-region probability of spawning a static obstacle
+    generate_rate=0.5,  # per-region probability of spawning a static obstacle
     ang_vel_penalty=0.3,  # penalty weight on |angular velocity| (discourage spinning in place)
     MapObs=None, # None /or/ the name of .png file, e.g. None / 'map.png'
     ld_a_range=360, # max scanning angle of lidar (degree)
     ld_d_range=100, # max scanning distance of lidar (cm)
     ld_num=36, # number of lidar streams in each world
     ld_GN=3, # how many lidar streams are grouped(down-sampling) for each group
+    ld_acc=3, # lidar scan accuracy / DDA step size (cm); larger = faster but coarser
     ri=0, # render index: the index of world that to be rendered
     basic_ctrl_interval=0.1, # control interval (s), 0.1 means 10 Hz control frequency
     ctrl_delay=0, # control delay, in basic_ctrl_interval, 0 means no control delay
@@ -143,7 +144,7 @@ class Sparrow():
 
 
         '''Lidar initialization'''
-        self.ld_acc = 3  # lidar scan accuracy (cm). Reducing accuracy can accelerate simulation;
+        # ld_acc is now a default_cfg parameter (see above); no hardcode here.
         self.ld_scan_result = torch.zeros((self.N, self.ld_num), device=self.dvc)  # used to hold lidar scan result, (N, ld_num)
         self.ld_result_grouped = torch.zeros((self.N, self.grouped_ld_num), device=self.dvc) # the grouped lidar scan result, (N, grouped_ld_num)
         self.ld_angle_interval = torch.arange(self.ld_num, device=self.dvc) * (self.ld_a_range/180) * torch.pi / (self.ld_num) - (self.ld_a_range/360) * torch.pi #(ld_num, )
@@ -274,6 +275,9 @@ class Sparrow():
                     pygame.draw.line(self.Static_obs_canvas, (1, 1, 1), cdnts[0,i,j], cdnts[1,i,j], width=2*self.Obs_R)
 
         obs_np = pygame.surfarray.array3d(self.Static_obs_canvas)[:, :, 0]
+        # 完整障碍位图（含边界线）持久化，供全局规划器构建 c-space 使用；
+        # 之后 obs_np 被原地改成轮廓线（obs_np -= b_obs_np），所以在这里先保存一份真值。
+        self.world_occ_full = obs_np > 0   # (window_size, window_size) bool, 1cm, 每帧 reset 重新生成
         b_obs_np = ndimage.binary_erosion(obs_np, self.b_kernel).astype(obs_np.dtype)  # 腐蚀障碍物图像
         obs_np -= b_obs_np  # 减去腐蚀图像，提取轮廓线
         x_, y_ = np.where(obs_np == 1)  # 障碍物栅格的x,y坐标
@@ -533,7 +537,7 @@ class Sparrow():
         self.exceed_vec = self.d2target_now > self.D # (N,)
         self.win_vec = self.d2target_now < self.target_area # (N,)
         self.collide_vec = (self.ld_result_grouped < self.collision_trsd).any(dim=-1)  # (N,)
-        self.dw_vec = self.exceed_vec + self.win_vec + self.collide_vec # terminated signal (N,)
+        self.dw_vec = self.exceed_vec + self.win_vec #+ self.collide_vec # terminated signal (N,)
         self.done_vec = self.tr_vec + self.dw_vec # (N,), used for AutoReset
 
         xy_in_target = self.car_state[:, 0:2] - self.target_point # 小车在以target为原点的坐标系下的坐标, (N,2), 注意这里是无噪声的
@@ -683,6 +687,46 @@ class Sparrow():
         The ogm can be rendered via 'plt.imshow(self.ogm)' """
         return self.ogm # (window_size, window_size, 3)
 
+    def _draw_robot(self):
+        """Draw the robot body + heading line onto `self.canvas`.
+
+        Overridable so subclasses (e.g. `SparrowCspaceEnv`) can render the
+        observation footprint polygon instead of Sparrow's collision circle.
+        """
+        # draw robot on canvas
+        pygame.draw.circle(
+            self.canvas,
+            (200, 128, 250),
+            self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
+            self.car_radius,
+        )
+        # draw robot orientation on canvas
+        head = self.car_state[self.ri,0:2].cpu() + self.car_radius * torch.tensor([torch.cos(self.car_state[self.ri,2]), -torch.sin(self.car_state[self.ri,2])])
+        pygame.draw.line(
+            self.canvas,
+            (0, 255, 255),
+            self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
+            self._world_2_grid(head).numpy(),
+            width=2
+        )
+
+    def _draw_lidar_rays(self):
+        """Draw the lidar scan rays onto `self.canvas`.
+
+        Overridable: `SparrowCspaceEnv` replaces this with the NavRL c-space cost
+        rays (farthest reach over all theta layers) instead of the raw lidar scan.
+        """
+        ld_result = self.ld_scan_result[self.ri].cpu().clone()  # (ld_num,), on cpu
+        ld_real_sta_gd = self._world_2_grid(self.car_state[self.ri, 0:2]).cpu().numpy()  # (2,)
+        ld_real_end_gd = self._world_2_grid(
+            self.car_state[self.ri, 0:2].cpu()
+            + ld_result.unsqueeze(-1) * self.ld_vectors_wd[self.ri].cpu()
+        ).numpy()  # (ld_num, 2)
+        for i in range(self.ld_num):
+            e = 255 * ld_result[i] / self.ld_d_range
+            pygame.draw.aaline(self.canvas, (255 - e, 0, e),
+                               ld_real_sta_gd, ld_real_end_gd[i])
+
     def _render_frame(self):
         if self.window is None and self.render_mode == "human":
             pygame.init()
@@ -712,16 +756,11 @@ class Sparrow():
 
 
         # draw target area
-        pygame.draw.circle(self.canvas, (100, 225, 100), self.target_point[0].cpu().numpy(), self.target_area, 2)
+        pygame.draw.circle(self.canvas, (100, 225, 100), self.target_point[self.ri].cpu().numpy(), self.target_area, 2)
 
 
-        # draw lidar rays on canvas
-        ld_result = self.ld_scan_result[self.ri].cpu().clone() # (ld_num, ), on cpu
-        ld_real_sta_gd = self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy() #(2,)
-        ld_real_end_gd = self._world_2_grid(self.car_state[self.ri,0:2].cpu() + ld_result.unsqueeze(-1) * self.ld_vectors_wd[self.ri].cpu()).numpy() #(ld_num,2)
-        for i in range(self.ld_num):
-            e = 255*ld_result[i]/self.ld_d_range
-            pygame.draw.aaline(self.canvas, (255-e, 0, e), ld_real_sta_gd, ld_real_end_gd[i])
+        # draw sensor rays (lidar by default; c-space cost rays for SparrowCspaceEnv)
+        self._draw_lidar_rays()
 
         # draw collision threshold on canvas
         pygame.draw.circle(
@@ -731,27 +770,14 @@ class Sparrow():
             self.collision_trsd,
         )
 
-        # draw robot on canvas
-        pygame.draw.circle(
-            self.canvas,
-            (200, 128, 250),
-            self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
-            self.car_radius,
-        )
-        # draw robot orientation on canvas
-        head = self.car_state[self.ri,0:2].cpu() + self.car_radius * torch.tensor([torch.cos(self.car_state[self.ri,2]), -torch.sin(self.car_state[self.ri,2])])
-        pygame.draw.line(
-            self.canvas,
-            (0, 255, 255),
-            self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
-            self._world_2_grid(head).numpy(),
-            width=2
-        )
+        # draw robot body + orientation (circle by default; footprint polygon for c-space envs)
+        self._draw_robot()
 
         # The following line copies our drawings from `canvas` to the visible window
         self.window.blit(self.canvas, self.canvas.get_rect())
         pygame.event.pump()
-        pygame.display.update()
+        if not getattr(self, "manual_flip", False):
+            pygame.display.update()
 
         if self.render_speed == 'real':
             self.clock.tick(int(1 / self.render_rate))
@@ -845,7 +871,7 @@ class Sparrow_PlayGround(Sparrow):
         """只计算是否到达，是否碰撞"""
         self.win_vec = self.d2target_now < self.target_area # (N,)
         self.collide_vec = (self.ld_result_grouped < self.collision_trsd).any(dim=-1)  # (N,)
-        self.dw_vec = self.win_vec + self.collide_vec # terminated signal (N,)
+        self.dw_vec = self.win_vec #+ self.collide_vec # terminated signal (N,)
 
     def step(self,current_a):
         """
@@ -944,13 +970,8 @@ class Sparrow_PlayGround(Sparrow):
         self.ogm = np.transpose(np.array(pygame.surfarray.pixels3d(self.canvas)), axes=(1, 0, 2))  # occupied grid maps
 
 
-        # draw lidar rays on canvas
-        ld_result = self.ld_scan_result[self.ri].cpu().clone() # (ld_num, ), on cpu
-        ld_real_sta_gd = self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy() #(2,)
-        ld_real_end_gd = self._world_2_grid(self.car_state[self.ri,0:2].cpu() + ld_result.unsqueeze(-1) * self.ld_vectors_wd[self.ri].cpu()).numpy() #(ld_num,2)
-        for i in range(self.ld_num):
-            e = 255*ld_result[i]/self.ld_d_range
-            pygame.draw.aaline(self.canvas, (255-e, 0, e), ld_real_sta_gd, ld_real_end_gd[i])
+        # draw sensor rays (lidar by default; c-space cost rays for SparrowCspaceEnv)
+        self._draw_lidar_rays()
 
         # draw collision threshold on canvas
         pygame.draw.circle(
@@ -960,23 +981,8 @@ class Sparrow_PlayGround(Sparrow):
             self.collision_trsd,
         )
 
-        # draw robot on canvas
-        pygame.draw.circle(
-            self.canvas,
-            (200, 128, 250),
-            self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
-            self.car_radius,
-        )
-
-        # draw robot orientation on canvas
-        head = self.car_state[self.ri,0:2].cpu() + self.car_radius * torch.tensor([torch.cos(self.car_state[self.ri,2]), -torch.sin(self.car_state[self.ri,2])])
-        pygame.draw.line(
-            self.canvas,
-            (0, 255, 255),
-            self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
-            self._world_2_grid(head).numpy(),
-            width=2
-        )
+        # draw robot body + orientation (circle by default; footprint polygon for c-space envs)
+        self._draw_robot()
 
         # draw global path
         if self.global_path:
@@ -995,7 +1001,8 @@ class Sparrow_PlayGround(Sparrow):
         # The following line copies our drawings from `canvas` to the visible window
         self.window.blit(self.canvas, self.canvas.get_rect())
         pygame.event.pump()
-        pygame.display.update()
+        if not getattr(self, "manual_flip", False):
+            pygame.display.update()
 
         if self.render_speed == 'real':
             self.clock.tick(int(1 / self.render_rate))
@@ -1011,10 +1018,15 @@ class Sparrow_PlayGround(Sparrow):
         ev = pygame.event.get()
         for event in ev:
             if event.type == pygame.MOUSEBUTTONDOWN:
-                xy = np.array(pygame.mouse.get_pos())
-                distance = np.linalg.norm(xy - self.waypoints[-1])
-                if distance > self.D:
-                    print("Distance exceeds maximal local planning threshold!")
-                else:
-                    self.global_path.append(xy)
-                    self.waypoints.append(xy)
+                self._handle_click(np.array(pygame.mouse.get_pos()))
+
+    def _handle_click(self, xy):
+        '''Handle a mouse click in the playground window.
+        默认行为：直接把点击点追加为航点（若在最大局部规划阈值内）。
+        子类（如 SparrowCspacePlayground）可覆写为「点击 → 全局规划 → 整条路径入队」。'''
+        distance = np.linalg.norm(xy - self.waypoints[-1])
+        if distance > self.D:
+            print("Distance exceeds maximal local planning threshold!")
+        else:
+            self.global_path.append(xy)
+            self.waypoints.append(xy)
