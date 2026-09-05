@@ -270,6 +270,13 @@ class CNNCritic(nn.Module):
 # CNN-SAC — Soft Actor-Critic algorithm wrapper
 # ---------------------------------------------------------------------------
 
+# 训练多少轮之后才惰性创建 TensorBoard SummaryWriter（runs/ 目录）。writer 的创建
+# 以 train() 被调用为门槛：只在真正进入训练、且训练轮数 iter_count 超过该阈值时才写
+# runs/。纯推理构造 CNNSAC（play_cspace / test_cnn，只 load + actor 前向，从不调
+# train()）因此绝不会产生 runs/ 目录。iter_count 每调用一次 train() 自增 1。
+TENSORBOARD_MIN_ITERS = 5
+
+
 class CNNSAC(object):
     """
     SAC algorithm using CNN-based stochastic Actor and Twin Critic.
@@ -282,12 +289,16 @@ class CNNSAC(object):
       kinematic (4,)        — [distance_to_goal, heading_error, lin_vel, ang_vel]
 
     In the replay buffer these are stored as a flat concatenated array.
+
+    TensorBoard: the SummaryWriter is created lazily on the first log/train call
+    once train() has run >= tensorboard_min_iters times (see _ensure_writer).
     """
 
     def __init__(self, kinematic_dim=4, action_dim=2, max_action=1,
                  h_beams=36, v_layers=4, cnn_feature_dim=128,
                  lr=1e-4, alpha_lr=3e-4, device='cpu',
-                 safety_reward_weight=1.0, speed_reward_weight=1.0):
+                 safety_reward_weight=1.0, speed_reward_weight=1.0,
+                 tensorboard_min_iters=None):
         self.device = device
         self.max_action = max_action
         self.h_beams = h_beams
@@ -319,8 +330,25 @@ class CNNSAC(object):
         self.alpha = self.log_alpha.exp()
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
 
-        self.writer = SummaryWriter()
+        # TensorBoard writer is None until train() has been called
+        # tensorboard_min_iters times (then _ensure_writer creates it lazily),
+        # so inference-only CNNSAC instances never write a runs/ directory.
+        self.writer = None
+        self.tensorboard_min_iters = (TENSORBOARD_MIN_ITERS
+                                      if tensorboard_min_iters is None
+                                      else tensorboard_min_iters)
         self.iter_count = 0
+
+    def _ensure_writer(self):
+        """Lazily create the TensorBoard SummaryWriter (runs/ dir).
+
+        Only fires when the network is genuinely being trained (train() ran at
+        least self.tensorboard_min_iters times). play_cspace / test_cnn load a
+        model and only run actor inference — they never call train(), so their
+        CNNSAC keeps writer=None and no runs/ directory is ever created.
+        """
+        if self.writer is None and self.iter_count >= self.tensorboard_min_iters:
+            self.writer = SummaryWriter()
 
     def get_action(self, ray_grid, kinematic, deterministic=False):
         """
@@ -450,7 +478,11 @@ class CNNSAC(object):
             av_entropy += -log_prob.mean().item()
 
         self.iter_count += 1
-        # Write new values for tensorboard
+        # Write new values for tensorboard (writer only exists once training is
+        # genuinely underway past the minimum pass count — see _ensure_writer).
+        self._ensure_writer()
+        if self.writer is None:
+            return
         self.writer.add_scalar("Loss/critic", av_critic_loss / iterations, self.iter_count)
         self.writer.add_scalar("Loss/actor", av_actor_loss / iterations, self.iter_count)
         self.writer.add_scalar("Loss/alpha", av_alpha_loss / iterations, self.iter_count)
@@ -466,7 +498,14 @@ class CNNSAC(object):
 
     def log_episode(self, episode_num, reward, length, goal_reached,
                     collision, expl_noise):
-        """Log per-episode training metrics to TensorBoard."""
+        """Log per-episode training metrics to TensorBoard.
+
+        No-op before the writer exists (i.e. before training passed the
+        tensorboard_min_iters threshold), so warmup episodes are not logged.
+        """
+        self._ensure_writer()
+        if self.writer is None:
+            return
         self.writer.add_scalar("Episode/reward", reward, episode_num)
         self.writer.add_scalar("Episode/length", length, episode_num)
         self.writer.add_scalar("Episode/goal_reached", int(goal_reached), episode_num)
@@ -474,7 +513,10 @@ class CNNSAC(object):
         self.writer.add_scalar("Episode/alpha", self.alpha.item(), episode_num)
 
     def log_eval(self, epoch, avg_reward, avg_collision_rate):
-        """Log evaluation metrics to TensorBoard."""
+        """Log evaluation metrics to TensorBoard (no-op before writer exists)."""
+        self._ensure_writer()
+        if self.writer is None:
+            return
         self.writer.add_scalar("Eval/avg_reward", avg_reward, epoch)
         self.writer.add_scalar("Eval/avg_collision_rate", avg_collision_rate, epoch)
 
@@ -482,7 +524,11 @@ class CNNSAC(object):
         """Visualize cost_rays input as TensorBoard figure (matplotlib-based).
 
         Avoids PIL.Image compatibility issues in older containers.
+        No-op before the writer exists (training past the min-iter threshold).
         """
+        self._ensure_writer()
+        if self.writer is None:
+            return
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
