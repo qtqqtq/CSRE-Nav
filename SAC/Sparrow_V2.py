@@ -53,10 +53,10 @@ default_cfg = dict(
     Obs_V=25,  # maximal obstacle velocity, cm/s
     generate_rate=0.5,  # per-region probability of spawning a static obstacle
     ang_vel_penalty=0.3,  # penalty weight on |angular velocity| (discourage spinning in place)
-    reverse_penalty=0.3,  # penalty on an explicit reverse command (a0<=-0.1); 修"原地前后抖动"的后退半拍。
-                         # 配合 ALLOW_REVERSE=True 时倒车不再免费；稳定前进时该项为 0。
-    action_rate_penalty=0.2,  # penalty on |a_t - a_{t-1}|_1 (clamped [0,1]); 指令高频翻转=前后抖动的直接来源。
-                              # 连续动作每步保持同向时 Δa≈0，该项不罚。
+    stall_penalty=0.6,    # |实际线速度| < stall_threshold 时的惩罚(满额=静止, 线性过渡)。
+                          # 原地逗留与"前后抖动"(高频正负指令经 K 滤波后 |v| 起不来)都由该项收口；
+                          # 匀速前进/倒车(低通后 |v| 足够大) R_stall=0，不罚。倒车方向正误交给 R_distance。
+    stall_threshold=0.2,  # 线速度死区阈值, 以 v_linear_max(=50 cm/s) 的比例计(0.2 = 10 cm/s)
     MapObs=None, # None /or/ the name of .png file, e.g. None / 'map.png'
     ld_a_range=360, # max scanning angle of lidar (degree)
     ld_d_range=100, # max scanning distance of lidar (cm)
@@ -189,7 +189,6 @@ class Sparrow():
         self.step_counter_vec = torch.zeros(self.N, dtype=torch.long, device=self.dvc) # 用于truncate
         self.car_state = torch.zeros((self.N, 5), device=self.dvc, dtype=torch.float32)
         self.reward_vec = torch.zeros(self.N, device=self.dvc) # vectorized reward signal
-        self.prev_a = None # 上一步指令的拷贝(N,2)，用于 Δa 指令突变惩罚；reset() 的 _reward_function 会赋初值
         self.dw_vec = torch.zeros(self.N, dtype=torch.bool, device=self.dvc) # vectorized terminated signal
         self.tr_vec = torch.zeros(self.N, dtype=torch.bool, device=self.dvc)  # vectorized truncated signal
         self.done_vec = torch.zeros(self.N, dtype=torch.bool, device=self.dvc)  # vectorized done signal
@@ -598,35 +597,34 @@ class Sparrow():
         R_orientation = (0.25-alpha.abs().clamp(0,0.25))/0.25  # (-0.25~0~0.25) -> (0,1,0), 朝着目标点时奖励最大,  (N,)
         if self.action_type == 'Discrete':
             R_forward = (current_a==2) # 鼓励使用前进动作(提升移动速度、防止原地滞留) (N,) = 0 or 1
-            R_retreat_slowdown = (current_a==5) + (current_a==6) # 惩罚后退和减速
+            R_stall = torch.zeros(self.N, device=self.dvc)   # 离散分支保持原奖励不变
             R_angular = torch.zeros(self.N, device=self.dvc) # 离散动作不按角速度惩罚
-            R_action_rate = torch.zeros(self.N, device=self.dvc) # 离散动作不按Δa惩罚
-            reverse_pen, action_rate_pen = 0., 0. # 离散分支保持原奖励不变
         else:
-            # R_forward = (current_a[:,0] > 0.5)
-            R_forward = current_a[:,0].clip(0., 1.) # 向前的线速度越大，奖励越高
-            R_retreat_slowdown = (current_a[:,0] <= -0.1) # 只在"明确倒车"时惩罚(老代码<=0.1连停车也罚,故被0权重禁用)
-            R_action_rate = torch.zeros(self.N, device=self.dvc)
-            if self.prev_a is not None:
-                # Δa = |a_t - a_{t-1}|_1 ∈[0,4]，clamp 到[0,1]。原地前后抖动=指令高频正负翻转，Δa 大，直接扣分；
-                # 稳定朝同一方向给油则 Δa≈0，不罚。鼓励策略"commit"到一个方向而不是原地扇动指令。
-                R_action_rate = (current_a - self.prev_a).abs().sum(dim=-1).clamp_(0., 1.)
+            R_forward = torch.zeros(self.N, device=self.dvc) # 连续分支不再按"向前指令"发奖励
+            if self.stall_threshold > 0:
+                # 实际线速度(经 K 低通滤波后, cm/s)归一化绝对值 ∈[0,1]
+                vhat = (self.car_state[:, 3] / self.v_linear_max).abs()
+                # |v| < stall_threshold 时给惩罚: 静止罚满(stall_penalty), 越接近阈值罚得越少,
+                # >= 阈值不罚。原地逗留与"前后抖动"(高频正负指令在 K 滤波下 |v| 起不来)都被收口;
+                # 匀速前进/倒车 |v| 足够大 -> R_stall=0。倒车方向正误由 R_distance 判断。
+                R_stall = (self.stall_penalty
+                           * (self.stall_threshold - vhat).clamp(min=0.0)
+                           / self.stall_threshold)
+            else:
+                R_stall = torch.zeros(self.N, device=self.dvc)   # threshold=0 -> 关闭该项
             R_angular = current_a[:,1].abs() # |角速度指令| ∈ [0,1]，惩罚原地转圈
-            reverse_pen, action_rate_pen = self.reverse_penalty, self.action_rate_penalty
         self.reward_vec = (0.5 * R_distance + R_forward
-                           - reverse_pen * R_retreat_slowdown
-                           - action_rate_pen * R_action_rate
+                           - R_stall
                            - self.ang_vel_penalty * R_angular
-                           - 0.5)  # -0.5为了防止agent太猥琐，到处逗留
-        # self.reward_vec = (0.5 * R_distance + R_orientation * R_forward - 0.5 * R_retreat_slowdown - 0.25) / 1.25 # Normalized reward, maybe better
+                           - 0.5)  # -0.5 常数, 防止agent太猥琐到处逗留
+        # 注: 移除 R_forward(+1 上限) 与 reverse/Δa 惩罚后, 连续分支非终态稠密奖励上限约
+        # 0.5*R_distance - 0.5 (<=0), 正收益主要来自 win(+200)。想要更正向的引导, 可调低
+        # 上面的 -0.5 常数或提高 R_distance 权重 0.5。
+        # 旧归一化式(参考, 未启用): (0.5*R_distance + R_orientation*R_forward - 0.5*R_retreat_slowdown - 0.25)/1.25
 
         self.reward_vec[self.win_vec] = self.AWARD
         self.reward_vec[self.exceed_vec] = self.PUNISH
         self.reward_vec[self.collide_vec] = self.PUNISH
-
-        # 记录本步指令，供下个时刻的 Δa 抖动惩罚使用（在 done/reset 重写 reward 之后仍更新，
-        # 这样每次 reset() 的 _reward_function(init_pre_action=0) 会把缓冲清零）
-        self.prev_a = current_a.clone()
 
     def _Normalize(self, observation) -> torch.tensor:
         '''Normalize the raw observations (N,abs_state_dim) to relative observations (N,abs_state_dim-1)'''
