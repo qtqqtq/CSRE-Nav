@@ -114,6 +114,14 @@ class Sparrow():
 
         '''Map initialization'''
         self.obs_canvas_torch = torch.ones((self.window_size, self.window_size), dtype=torch.int64) # 用于将障碍物坐标转化为2D栅格图
+
+        # 占用图像缓冲：把 静态轮廓 ∪ 地图填充 栅格化为一张 1cm 分辨率 bool 图，
+        # 供 _ld_scan_vec 的 DDA 命中检测直接查表（替代 O(N*ld_num*B) 的全障碍物集合比对）。
+        # base_occ_flat 常驻 dvc，只允许 .copy_() 原地更新（不能重新绑定），否则 torch.compile 包装会失效。
+        self.w2 = self.window_size * self.window_size          # 编码值上界 window_size²
+        self.base_occ_flat = torch.zeros(self.w2, dtype=torch.bool, device=self.dvc)  # (w2,) bool, C序平坦 idx = x*window_size+y
+        self.static_contour_mask = None    # (window,window) np.bool, _static_obstacle_init 里每次 reset 重建
+        self.map_filled_mask = None        # (window,window) np.bool, _map_obstacle_init 里建一次（地图静态）
         self.target_area = 30  # # enter the central circle (radius=target_area) will be considered win.
         self.R_map = int(self.window_size/2)
         self.target_point = torch.tensor([[self.R_map,self.R_map]]).repeat(self.N,1).to(self.dvc) # (N,2)
@@ -209,6 +217,28 @@ class Sparrow():
             Input: torch.tensor; Output: torch.tensor; Shape: Any shape '''
         return coordinate_wd.floor().int()
 
+    def _build_occ_image(self):
+        '''把 静态轮廓 ∪ 地图填充 栅格化为一张 1cm bool 占用图，供 _ld_scan_vec 查表。
+
+        约束: 栅格化用的像素集合必须与 vec_static_bound_code(+vec_map_bound_code)
+        逐像素一致，才能保证 DDA 命中检测 bit-exact。两种掩码形状均为
+        (window_size, window_size)，C序 reshape(-1) 的平坦下标恰好等于现在的
+        编码公式 x*window_size+y（轴0为x、轴1为y、且行宽==window_size）。
+        注意用的是*轮廓*static_contour_mask / *填充*map_filled_mask（地图本来就
+        按整块 np.where(map_np==0) 编码），不是全局规划器用的填充位图 world_occ_full。
+        base_occ_flat 只原地 .copy_()，保持张量身份稳定（torch.compile 安全）。
+        '''
+        assert self.static_contour_mask is not None, "_build_occ_image() 须在 _static_obstacle_init 之后调用"
+        assert self.static_contour_mask.shape == (self.window_size, self.window_size), \
+            f"static_contour_mask 形状 {self.static_contour_mask.shape} != ({self.window_size},{self.window_size})"
+        occ = self.static_contour_mask
+        if self.MapObs:
+            assert self.map_filled_mask is not None and \
+                self.map_filled_mask.shape == (self.window_size, self.window_size), "map_filled_mask 缺失或形状不符"
+            occ = occ | self.map_filled_mask
+        flat = occ.reshape(-1)  # C序: flat idx = x*window_size + y, 与代码公式一致
+        self.base_occ_flat.copy_(torch.as_tensor(flat, dtype=torch.bool, device=self.dvc))
+
     def _Domain_Randomization(self):
         # 1) randomize the control interval; ctrl_interval.shape: (N,1)
         self.ctrl_interval = self.ctrl_interval_base + self._random_noise(0.01, (self.N,1), self.dvc)# control interval, in second
@@ -236,6 +266,7 @@ class Sparrow():
         '''
         map_pyg = pygame.image.load(self.MapObs) # 不能用plt.imread读, 有bug
         map_np = pygame.surfarray.array3d(map_pyg)[:, :, 0]
+        self.map_filled_mask = map_np == 0  # 障碍栅格真值掩码(整块填充, 非轮廓), 供 _build_occ_image 栅格化
         x_, y_ = np.where(map_np == 0)  # 障碍物栅格的x,y坐标
         '''注意: 静态障碍物无需对P补齐'''
         even_obs_P = torch.tensor(np.stack((x_, y_), axis=1))  # 障碍物栅格点, (O*P, 2), on cpu
@@ -280,7 +311,8 @@ class Sparrow():
         self.world_occ_full = obs_np > 0   # (window_size, window_size) bool, 1cm, 每帧 reset 重新生成
         b_obs_np = ndimage.binary_erosion(obs_np, self.b_kernel).astype(obs_np.dtype)  # 腐蚀障碍物图像
         obs_np -= b_obs_np  # 减去腐蚀图像，提取轮廓线
-        x_, y_ = np.where(obs_np == 1)  # 障碍物栅格的x,y坐标
+        self.static_contour_mask = obs_np == 1  # 轮廓真值掩码, 供 _build_occ_image 栅格化(勿用填充位图 world_occ_full)
+        x_, y_ = np.where(self.static_contour_mask)  # 障碍物栅格的x,y坐标
         '''注意: 静态障碍物无需对P补齐'''
         even_obs_P = torch.tensor(np.stack((x_, y_), axis=1))  # 障碍物栅格点, (O*P, 2), on cpu
         '''将Env0的障碍物并行N份；然后重塑维度，方便后续扫描'''
@@ -289,6 +321,9 @@ class Sparrow():
 
         '''对静态障碍物的x,y坐标进行编码，方便后续扫描'''
         self.vec_static_bound_code = (self.vec_static_obs_P_shaped[:,:,0,0]*self.window_size +self.vec_static_obs_P_shaped[:,:,1,0]).unsqueeze(1) # (N,1,O*P)
+
+        # 把 静态轮廓 ∪ 地图填充 栅格化为占用图像，供 _ld_scan_vec 查表命中检测
+        self._build_occ_image()
 
     def _dynamic_obstacle_init(self):
         '''Init the bound points of the dynamic obstacles:
@@ -493,22 +528,26 @@ class Sparrow():
         V_reverse = torch.stack([Vx_reverse, Vy_reverse], dim=2).unsqueeze(2)
         self.Obs_V_tensor[V_reverse] *= -1
 
-    def _ld_not_in_bound_vec(self):
-        '''Check whether ld_end_code is not in bound_code in a vectorized way => goon'''
-        # 将ld_end_gd中的每个元素与bound_gd相减
-        pre_goon = self.ld_end_code[:, :, None] - self.vec_bound_code # (N,ld_num,1)-(N,1,O1*P1+O2*P2)
-
-        # 判断是否存在零值，存在即A中的元素在B中存在
-        return ~torch.any(pre_goon == 0, dim=2) # goon
-
     def _ld_scan_vec(self):
-        '''Get the scan result (in vectorized worlds) of lidars. '''
+        '''Get the scan result (in vectorized worlds) of lidars.
+        命中检测改为占用图像查表: 每步 O(N*ld_num) 的 bool gather, 替代原来的
+        O(N*ld_num*B) 全障碍物边界集合比对(B=静态轮廓+地图填充+动态, ~38k)。
+        静态/地图像素由 _build_occ_image 栅格化为 base_occ_flat(每集 reset 重建,
+        集内不变); 动态障碍物按 env 每步移动, 仍用集合比对(训练配置 O=0 时整支关闭)。
+        推进/累加/补偿/分组与原实现逐行一致 => 与 verify_ld_scan.py 归档的旧实现 bit-exact。'''
         # 扫描前首先同步雷达与小车位置:
         self.ld_angle = self.ld_angle_interval + self.car_state[:,2,None]# 雷达-小车方向同步, (N, ld_num) + (N, 1) = (N, ld_num)
         self.ld_vectors_wd = torch.stack((torch.cos(self.ld_angle), -torch.sin(self.ld_angle)), dim=2)  # 雷达射线方向, (N,ld_num,2), 注意在unified_cs中是-sin
         self.ld_end_wd = self.car_state[:,None,0:2] + self.car_radius * self.ld_vectors_wd  # 扫描过程中，雷达射线末端世界坐标(初始化于小车轮廓), (N,1,2)+(N,ld_num,2)=(N,ld_num,2)
         self.ld_end_gd = self._world_2_grid(self.ld_end_wd)  # 扫描过程中，雷达射线末端栅格坐标, (N,ld_num,2)
         self.ld_end_code = self.ld_end_gd[:,:,0]*self.window_size + self.ld_end_gd[:,:,1]# 扫描过程中，雷达射线末端栅格坐标的编码值, (N,ld_num)
+
+        # 动态障碍物每env独立、每步移动: 提取其边界编码集合 (N, O*P)。训练配置 O=0 => has_dyn=False, 整支关闭。
+        if self.O > 0 and self.P > 0:
+            has_dyn = True
+            dyn_code = (self.vec_dynamic_obs_P_shaped[:,:,0,0]*self.window_size + self.vec_dynamic_obs_P_shaped[:,:,1,0])  # (N, O*P)
+        else:
+            has_dyn = False
 
         # 扫描初始化
         self.ld_scan_result.fill_(0)  # 结果归零, (N, ld_num)
@@ -517,7 +556,12 @@ class Sparrow():
         # 并行式烟花式扫描(PS:当射线穿过地图边界后，会对称地进行扫描。比如穿过上边界，射线会从下边界再射出。这可以模拟地图之外的障碍物。)
         for i in range( int((self.ld_d_range-self.car_radius)/self.ld_acc) + 2 ): # 多扫2次，让最大值超过self.ld_d_range，便于clamp
             # 更新雷达末端位置
-            goon = self._ld_not_in_bound_vec() # 计算哪些ld_end_code不在bound_code里, 即还没有扫到障碍 #(N, ld_num)
+            code = self.ld_end_code                          # 当前端点编码, (N,ld_num), dtype与原来一致
+            in_win = (code >= 0) & (code < self.w2)          # 越界端点不可能是障碍物集合成员 => 保持"自由/继续扫"
+            hit = self.base_occ_flat[code.clamp(0, self.w2 - 1).long()]  # 1D图按2D索引 gather -> (N,ld_num) bool, 静态∪地图命中
+            if has_dyn:                                       # 动态障碍物命中(仅当存在), 集合比对保持与旧实现一致
+                hit = hit | (code[:, :, None] == dyn_code[:, None, :]).any(dim=-1)
+            goon = ~(in_win & hit)                            # 与旧实现的 goon 语义一致: 扫到障碍即停
             self.ld_end_wd += (goon[:,:,None] * increment)  # 更新雷达末端世界坐标,每次射 ld_acc cm #(N, ld_num,1)*(N,ld_num,2)=(N,ld_num,2)
             self.ld_end_gd = self._world_2_grid(self.ld_end_wd)# 更新雷达末端栅格坐标（必须更新，下一轮会调用）, (N,ld_num,2)
             self.ld_end_code = self.ld_end_gd[:, :, 0] * self.window_size + self.ld_end_gd[:, :, 1]# 更新雷达末端栅格坐标编码值, (N,ld_num)
@@ -556,7 +600,7 @@ class Sparrow():
             R_forward = current_a[:,0].clip(0., 1.) # 向前的线速度越大，奖励越高
             R_retreat_slowdown = (current_a[:,0] <= 0.1)
             R_angular = current_a[:,1].abs() # |角速度指令| ∈ [0,1]，惩罚原地转圈
-        self.reward_vec = 0.5 * R_distance + R_forward - 0.5 * R_retreat_slowdown - self.ang_vel_penalty * R_angular - 0.5  # -0.5为了防止agent太猥琐，到处逗留
+        self.reward_vec = 0.5 * R_distance + R_forward - 0.0 * R_retreat_slowdown - self.ang_vel_penalty * R_angular - 0.5  # -0.5为了防止agent太猥琐，到处逗留
         # self.reward_vec = (0.5 * R_distance + R_orientation * R_forward - 0.5 * R_retreat_slowdown - 0.25) / 1.25 # Normalized reward, maybe better
 
         self.reward_vec[self.win_vec] = self.AWARD
