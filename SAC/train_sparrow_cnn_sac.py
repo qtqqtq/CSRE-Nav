@@ -8,8 +8,10 @@ batched on the GPU.
 
 State / action conventions are identical to `train_cnn_sac.py`:
     - state  : (N, 364) = flatten(preprocessed cost_rays) + [dist, heading, v_lin, v_ang]
-    - action : actor outputs tanh(-1,1); env receives a_in = [(a0+1)/2, a1]
-               (linear velocity in [0,1], angular in [-1,1])
+    - action : actor outputs tanh(-1,1); env receives
+               a_in = settings.map_continuous_action(action)
+               (linear a0 in [-1,1] when settings.ALLOW_REVERSE else [0,1];
+                angular a1 in [-1,1])
     - reward : Sparrow's native reward (+200 win / -200 collide / -200 exceed,
                plus goal-seeking shaping)
 
@@ -37,13 +39,22 @@ N_ENVS = settings.SPARROW_N_ENVS              # number of vectorized environment
 N_OBSTACLES = settings.SPARROW_N_OBSTACLES    # obstacles per env (matches ColorDynamic's default)
 batch_size = 256
 buffer_size = 250000
-file_name = "SAC_sparrow_cspace_2"
+file_name = "SAC_sparrow_cspace_3"
 save_model = True
-load_model = True
-load_model_name = "SAC_sparrow_cspace_1"
+load_model = False
+load_model_name = "SAC_sparrow_cspace_2"
 
 train_every = 5             # env-steps between training calls
 gradient_steps = 5          # gradient steps per training call (1:1 with steps)
+
+# ---- 评估节奏（调低评估在墙钟里的占比）----
+# settings.EVAL_FREQ=5000 因步进是 N_ENVS=32 一跳、5000 不能被 32 整除，实际上只在
+# 20000(=625*32) 的整数倍才触发评估 —— 这里显式对齐，日志/存档节奏不变（仍是每
+# 20000 计入步一次）。每次评估跑的 env.step() 次数从 500 降到 EVAL_STEPS，
+# 评估 env.step 占总 env.step 的比例约从 44% 降到 24%（两次评估间采样 625 次 env.step）。
+# 调小评估次数/调大间隔会更快，但 avg_reward / collision_rate 统计会变少、变糙。
+EVAL_EVERY_STEPS = 20000    # 两次评估之间的计入步间隔（必须能被 N_ENVS 整除才会命中）
+EVAL_STEPS = 200            # 每次评估跑的 env.step() 次数（N_ENVS 个 env 并行，即评估 N*EVAL_STEPS 条轨迹）
 
 # 可视化：像 play_cspace 一样实时渲染其中一个并行环境（打开 pygame 窗口）
 RENDER = settings.SPARROW_RENDER              # True 时打开渲染窗口
@@ -54,7 +65,7 @@ RENDER_SPEED = settings.SPARROW_RENDER_SPEED  # 'slow'=30FPS / 'fast'=最快 / '
 # ---------------------------------------------------------------------------
 # Evaluation (deterministic, vectorized)
 # ---------------------------------------------------------------------------
-def evaluate(network, env, eval_steps=500):
+def evaluate(network, env, eval_steps=EVAL_STEPS):
     """Return (avg_reward, collision_rate) over a vectorized deterministic run."""
     state, _ = env.reset()
     total_reward = 0.0
@@ -66,7 +77,7 @@ def evaluate(network, env, eval_steps=500):
         kin = state[:, settings.RAY_GRID_FLAT_DIM:]
         with torch.no_grad():
             action = network.actor.get_mean_action(rg, kin)      # (N,2) in [-1,1]
-        a_in = torch.stack([(action[:, 0] + 1) / 2, action[:, 1]], dim=1)
+        a_in = settings.map_continuous_action(action)
         state, reward, dw, tr, _ = env.step(a_in)
         done = dw | tr
         total_reward += reward.sum().item()
@@ -165,7 +176,7 @@ while total_steps < settings.MAX_TIMESTEPS:
     # sample stochastic action (SAC reparameterized), tanh(-1,1)
     with torch.no_grad():
         action, _ = network.actor.sample(rg, kin)              # (N,2)
-    a_in = torch.stack([(action[:, 0] + 1) / 2, action[:, 1]], dim=1)
+    a_in = settings.map_continuous_action(action)
 
     next_state, reward, dw, tr, _ = env.step(a_in)
     done = dw | tr
@@ -223,7 +234,7 @@ while total_steps < settings.MAX_TIMESTEPS:
             torch.cuda.empty_cache()
 
     # periodic evaluation + save
-    if total_steps % settings.EVAL_FREQ == 0:
+    if total_steps % EVAL_EVERY_STEPS == 0:
         avg_reward, avg_col = evaluate(network, env)
         evaluations.append(avg_reward)
         network.log_eval(epoch, avg_reward, avg_col)
