@@ -10,8 +10,9 @@ Usage (inside the container, with a display / GPU):
     python3 play_cspace.py --ModelName SAC_sparrow_cspace --dvc cuda
     python3 play_cspace.py --ModelName SAC_sparrow_cspace --dvc cuda --global_plan
 
-The model consumes the 364-dim c-space state (360 cost rays + 4 kinematic), so
-it must have been trained on `SparrowCspaceEnv` (e.g. `SAC_sparrow_cspace`).
+The model consumes the (RAY_H_BEAMS×RAY_V_LAYERS + 4)-dim c-space state
+(currently 36×30 + 4 = 1084 cost-ray grid + kinematic), so it must have been
+trained on `SparrowCspaceEnv` (e.g. `SAC_sparrow_cspace`).
 
 With `--global_plan`, clicking the map plans a global path in the c-space graph
 (`GraphPlanner`) from the robot to the clicked point and enqueues its waypoints;
@@ -28,16 +29,15 @@ import pygame
 import torch
 
 import settings
-from Sparrow_V2 import str2bool, Sparrow
-from sparrow_cspace_env import SparrowCspacePlayground
+from Sparrow_V2 import str2bool, Sparrow, SparrowCspacePlayground
 from cnn_network import CNNSAC
-from render_utils import draw_hud, draw_cost_rays, draw_cspace_projection
+from render_utils import draw_hud, draw_cost_rays, draw_cspace_projection, draw_lidar_ogm
 
 
 parser = argparse.ArgumentParser()
 
 # ---- Model / agent ----
-parser.add_argument('--ModelName', type=str, default='SAC_sparrow_cspace_1',
+parser.add_argument('--ModelName', type=str, default='dense_sample_cspace_0',
                     help='model basename in pytorch_models (e.g. SAC_sparrow_cspace)')
 parser.add_argument('--ModelDir', type=str, default=settings.MODEL_DIR,
                     help='directory holding *_actor.pth / *_critic.pth')
@@ -69,7 +69,7 @@ parser.add_argument('--ld_GN', type=int, default=3,
 # ---- Stuck auto-reset (cost rays ~0 in every direction) ----
 parser.add_argument('--stuck_reset', type=str2bool, default=settings.SPARROW_STUCK_RESET,
                     help='auto-reset the episode when the robot is boxed in')
-parser.add_argument('--stuck_threshold', type=float, default=0.5,
+parser.add_argument('--stuck_threshold', type=float, default=0.1,
                     help='cost-ray distance (m) below which a beam counts as jammed '
                          '(play default 0.5; training default is settings.SPARROW_STUCK_THRESHOLD)')
 
@@ -114,7 +114,7 @@ def main():
         max_action=settings.MAX_ACTION,
         h_beams=settings.RAY_H_BEAMS,
         v_layers=settings.RAY_V_LAYERS,
-        cnn_feature_dim=128,
+        cnn_feature_dim=64,
         lr=settings.LR,
         device=opt.dvc,
     )
@@ -145,8 +145,8 @@ def main():
             else:
                 action, _ = network.actor.sample(rg, kin)
 
-        # same action convention as training: linear in [0,1], angular in [-1,1]
-        a_in = torch.stack([(action[:, 0] + 1) / 2, action[:, 1]], dim=1)
+        # same action convention as training: linear a0 in [-1,1] if ALLOW_REVERSE
+        a_in = settings.map_continuous_action(action)
         s, r, dw, tr, info = env.step(a_in)
 
         # PlayGround 的 reward 恒为 0；用训练用的完整奖励函数实时重算并显示
@@ -155,6 +155,7 @@ def main():
         ep_reward += reward_val
         draw_cost_rays(env, font)
         draw_cspace_projection(env, font)
+        draw_lidar_ogm(env, font)
         draw_hud(env, font, reward_val, ep_reward)
         pygame.display.update()   # 每帧在所有叠加层绘制完成后只 flush 一次，避免闪动
         if bool(dw.item()):   # win / collide / stuck -> 一个 episode 结束，累计奖励清零

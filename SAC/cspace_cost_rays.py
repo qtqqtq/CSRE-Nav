@@ -22,6 +22,13 @@ Defaults are taken from `catkin_ws/src/c_space_mapper/config/mapper_node.yaml`:
     cost_ray_max_range = 5.0 m
     cost_ray_num_beams = 36, h_res = 10 deg
 
+NOTE: `DEFAULT_CFG` below keeps those ROS/C++ reference values (used only by
+`--bench` / `verify_cost_rays.py`).  The live Sparrow env does NOT use it: it
+passes its own cfg derived from `settings.CSPACE_*` — g_min=0.1 m,
+a=2*pi/CSPACE_NZ≈0.209 rad, nz=CSPACE_NZ=30, footprint 1.2x0.14 m,
+max_range=3.0 m.  To change the observation geometry, edit `settings.CSPACE_*`
+(single source of truth), not this dict.
+
 Coordinate convention (documented for reproducibility):
   * Robot-centric. The robot sits at the *center* of a `(2R+1) x (2R+1)` grid,
     `R = ceil(max_range / g_min) + 2`, world origin = robot centre.
@@ -42,6 +49,8 @@ Pure-Python + PyTorch (numpy only for the one-time footprint-mask build).
 from __future__ import annotations
 
 import math
+import sys
+import time
 
 import numpy as np
 import torch
@@ -124,8 +133,8 @@ def make_footprint_masks(g_min, a, nz, footprint, subsample=3):
         rot = footprint @ np.array([[c, s], [-s, c]])   # (V, 2)
         for mi in range(m):
             for mj in range(m):
-                cx = offsets[mi]
-                cy = offsets[mj]
+                cx = offsets[mi]   # +x = forward
+                cy = offsets[mj]   # +y = left
                 hit = False
                 for sx in sub:
                     for sy in sub:
@@ -134,7 +143,9 @@ def make_footprint_masks(g_min, a, nz, footprint, subsample=3):
                             break
                     if hit:
                         break
-                masks[k, mj, mi] = 1.0 if hit else 0.0
+                # store as (forward, left) so dim0/dim1 line up with the
+                # occupancy grid's (nx=forward, ny=left) in build_cspace.
+                masks[k, mi, mj] = 1.0 if hit else 0.0
     return masks
 
 
@@ -279,9 +290,132 @@ def preprocess_cost_rays(cost_rays, max_range=5.0):
 
 
 # ---------------------------------------------------------------------------
-# Self-test (run inside the container: `python cspace_cost_rays.py`)
+# Computation-time test (`python cspace_cost_rays.py --bench`)
+# ---------------------------------------------------------------------------
+def _measure(fn, *args, repeat=20, warmup=3, sync=False, **kwargs):
+    """Wall-clock seconds per call of `fn(*args, **kwargs)`.
+
+    Returns `(min, mean, std)` over `repeat` timed calls after `warmup` runs.
+    The minimum is reported downstream — it is the best proxy for steady-state
+    latency (one outlier interrupt otherwise skews the average).  With
+    `sync=True` a `torch.cuda.synchronize()` flushes the launch queue before
+    and after each timed call so GPU kernels are fully counted.
+    """
+    if sync:
+        torch.cuda.synchronize()
+    for _ in range(warmup):
+        fn(*args, **kwargs)
+        if sync:
+            torch.cuda.synchronize()
+    ts = []
+    for _ in range(repeat):
+        if sync:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        fn(*args, **kwargs)
+        if sync:
+            torch.cuda.synchronize()
+        ts.append(time.perf_counter() - t0)
+    ts.sort()
+    return ts[0], float(np.mean(ts)), float(np.std(ts))
+
+
+def _bench_main(argv=None):
+    """Time each pipeline stage; the harness behind `python cspace_cost_rays.py --bench`.
+
+    Geometry defaults to the Sparrow env (`Sparrow_V2.py`): footprint
+    ``settings.ROBOT_FOOTPRINT`` = 1.2 x 0.14 m, g_min = 0.2 m -> R = 27 ->
+    55 x 55 grid, max_range = 5.0 m, 36 beams, 10 theta layers.  The occupancy
+    map is *empty* so every ray sweeps the full `max_range` (no early exit) —
+    i.e. the reported per-call time is the worst-case / steady-state cost.
+    """
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="Time each stage of the c-space cost-ray pipeline.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--batch", default="1,32,256",
+                   help="comma-separated env-batch sizes N to sweep")
+    p.add_argument("--repeat", type=int, default=20,
+                   help="timed calls per measurement (min is reported)")
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--device", default="auto",
+                   help="cpu | cuda | cuda:N | auto (first available device)")
+    p.add_argument("--footprint", default="sparrow",
+                   help="sparrow (1.2x0.14 m) | pioneer (DEFAULT_CFG) | 'L,W' m")
+    args = p.parse_args(argv)
+
+    cfg = dict(DEFAULT_CFG)
+    fp_arg = args.footprint.lower()
+    if fp_arg == "sparrow":                                  # settings.ROBOT_FOOTPRINT
+        fp = [[0.6, 0.07], [0.6, -0.07], [-0.6, -0.07], [-0.6, 0.07]]
+    elif fp_arg == "pioneer":
+        fp = DEFAULT_CFG["footprint"]
+    else:
+        L, W = [float(x) for x in fp_arg.split(",")]
+        hl, hw = L / 2.0, W / 2.0
+        fp = [[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]]
+    cfg["footprint"] = fp
+
+    batch_sizes = [int(x) for x in args.batch.split(",")]
+    R = int(math.ceil(cfg["cost_ray_max_range"] / cfg["g_min"])) + 2
+    G = 2 * R + 1
+
+    if torch.cuda.is_available():
+        devices = ["cuda:0"] if args.device == "auto" else [args.device]
+    else:
+        devices = ["cpu"] if args.device == "auto" else [args.device]
+
+    # make_footprint_masks is pure numpy/CPU and runs once at env init; build the
+    # masks a single time and move the float32 tensor to each device under test.
+    masks_cpu = make_footprint_masks(cfg["g_min"], cfg["a"], cfg["nz"], fp)  # (nz,m,m)
+    m_min, m_mean, _ = _measure(make_footprint_masks, cfg["g_min"], cfg["a"],
+                                cfg["nz"], fp, repeat=min(args.repeat, 5), warmup=1)
+
+    print(f"cspace cost-ray timing (empty map -> full {cfg['cost_ray_max_range']} m sweep, "
+          f"grid {G}x{G}x{cfg['nz']}, footprint {fp[0]})")
+    print(f"  make_footprint_masks (one-time, CPU): min={m_min*1e3:.3f} ms  "
+          f"mean={m_mean*1e3:.3f} ms")
+
+    for dev_s in devices:
+        dev = torch.device(dev_s)
+        sync = dev.type == "cuda"
+        masks_t = torch.as_tensor(masks_cpu, device=dev)  # (nz, m, m)
+        print(f"\n  device: {dev_s}   min over {args.repeat} calls after {args.warmup} warmups")
+        print(f"    {'N':>5} {'cspace':>10} {'cost_rays3d':>13} {'preproc':>10} "
+              f"{'obs/call':>12} {'obs/env':>11} {'steps/s':>10}")
+        for N in batch_sizes:
+            # empty occupancy -> every beam sweeps the full range (worst case)
+            occ = torch.zeros(N, G, G, dtype=torch.bool, device=dev)
+            robot_cell = torch.full((N, 2), R, dtype=torch.long, device=dev)
+            cr_kw = dict(num_beams=cfg["cost_ray_num_beams"],
+                         h_res_deg=cfg["cost_ray_h_res_degrees"],
+                         max_range=cfg["cost_ray_max_range"],
+                         g_min=cfg["g_min"], a=cfg["a"])
+
+            b = _measure(build_cspace, occ, masks_t, repeat=args.repeat,
+                         warmup=args.warmup, sync=sync)[0] * 1e3
+            cspace = build_cspace(occ, masks_t)
+            r = _measure(cost_rays_3d, cspace, robot_cell, repeat=args.repeat,
+                         warmup=args.warmup, sync=sync, **cr_kw)[0] * 1e3
+            cr = cost_rays_3d(cspace, robot_cell, **cr_kw)
+            pp = _measure(preprocess_cost_rays, cr, max_range=cfg["cost_ray_max_range"],
+                          repeat=args.repeat, warmup=args.warmup, sync=sync)[0] * 1e3
+            tot = b + r + pp
+            print(f"    {N:>5} {b:>10.3f} {r:>13.3f} {pp:>10.3f} "
+                  f"{tot:>12.3f} {tot / N:>11.3f} {N / (tot * 1e-3):>10.1f}")
+
+
+# ---------------------------------------------------------------------------
+# Self-test (run inside the container: `python cspace_cost_rays.py`; add
+# `--bench` for the computation-time test above)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    if "--bench" in sys.argv:
+        # hand the sub-harness only the args *after* the trigger flag
+        raise SystemExit(_bench_main(sys.argv[sys.argv.index("--bench") + 1:]))
+
     torch.manual_seed(0)
     g_min, max_range = DEFAULT_CFG["g_min"], DEFAULT_CFG["cost_ray_max_range"]
     R = int(math.ceil(max_range / g_min)) + 2

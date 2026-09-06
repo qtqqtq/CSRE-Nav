@@ -1,13 +1,14 @@
 """
 Vectorized CNN-SAC training on Sparrow-V2 with a c-space (NavRL) observation.
 
-Trains the existing `cnn_network.CNNSAC` on `sparrow_cspace_env.SparrowCspaceEnv`
+Trains the existing `cnn_network.CNNSAC` on `Sparrow_V2.SparrowCspaceEnv`
 instead of the Gazebo `laser_env.GazeboEnv`, collecting N transitions per step
 (one per vectorized env) so both the simulator and the actor forward pass run
 batched on the GPU.
 
-State / action conventions are identical to `train_cnn_sac.py`:
-    - state  : (N, 364) = flatten(preprocessed cost_rays) + [dist, heading, v_lin, v_ang]
+State / action conventions:
+    - state  : (N, RAY_H_BEAMS×RAY_V_LAYERS + 4) = flatten(preprocessed cost_rays)
+               + [dist, heading, v_lin, v_ang]   (currently 36×30 + 4 = 1084)
     - action : actor outputs tanh(-1,1); env receives
                a_in = settings.map_continuous_action(action)
                (linear a0 in [-1,1] when settings.ALLOW_REVERSE else [0,1];
@@ -16,7 +17,7 @@ State / action conventions are identical to `train_cnn_sac.py`:
                plus goal-seeking shaping)
 
 Usage:
-    python3 train_sparrow_cnn_sac.py
+    python3 train.py
 """
 import os
 import time
@@ -26,7 +27,7 @@ import pygame
 import torch
 
 from replay_buffer import ReplayBuffer
-from sparrow_cspace_env import SparrowCspaceEnv
+from Sparrow_V2 import SparrowCspaceEnv
 from cnn_network import CNNSAC
 from render_utils import draw_hud, draw_cost_rays, draw_cspace_projection
 import settings
@@ -39,7 +40,7 @@ N_ENVS = settings.SPARROW_N_ENVS              # number of vectorized environment
 N_OBSTACLES = settings.SPARROW_N_OBSTACLES    # obstacles per env (matches ColorDynamic's default)
 batch_size = 256
 buffer_size = 250000
-file_name = "SAC_sparrow_cspace_3"
+file_name = "dense_sample_cspace_0"
 save_model = True
 load_model = False
 load_model_name = "SAC_sparrow_cspace_2"
@@ -128,7 +129,7 @@ network = CNNSAC(
     max_action=settings.MAX_ACTION,
     h_beams=settings.RAY_H_BEAMS,
     v_layers=settings.RAY_V_LAYERS,
-    cnn_feature_dim=128,
+    cnn_feature_dim=64,
     lr=settings.LR,
     alpha_lr=settings.ALPHA_LR,
     device=settings.device,

@@ -1,10 +1,11 @@
 """
-NavRL-style CNN static obstacle perception network for TD3.
+NavRL-style CNN static obstacle perception network for SAC.
 
 Mirrors NavRL's LiDAR CNN architecture:
   - 3 convolutional layers over the 2D ray-grid (beams × layers)
-  - Flatten → Linear(128) → LayerNorm → compact feature vector
-  - Actor/Critic heads built on top of CNN features + kinematic state
+  - Flatten → Linear → LayerNorm → compact feature vector
+  - SAC Actor (stochastic) / twin Critic heads built on top of the CNN
+    features + kinematic state
 
 Reference: NavRL (Xu et al., IEEE RA-L 2025)
 """
@@ -26,22 +27,27 @@ class StaticObstacleCNN(nn.Module):
     """
     CNN that processes a 2D ray-grid into a compact feature vector.
 
-    Architecture (mirrors NavRL):
-      Conv2d(C→4,  kernel=[5,3], pad=[2,1]) → ELU
-      Conv2d(4→16, kernel=[5,3], stride=[1,1], pad=[2,1]) → ELU
-      Conv2d(16→16,kernel=[5,3], stride=[1,2], pad=[2,1]) → ELU
+    Architecture (mirrors NavRL, downsampled for the 36×30 cost-ray grid):
+      Conv2d(1→4, kernel=[5,3], pad=[2,1], stride=[1,1]) → ELU   (36,30)
+      Conv2d(4→8, kernel=[5,3], pad=[2,1], stride=[2,2]) → ELU   (18,15)
+      Conv2d(8→8, kernel=[5,3], pad=[2,1], stride=[2,2]) → ELU   ( 9, 8)
       Flatten → Linear(→feature_dim) → ELU → LayerNorm
+
+    Both the beam and the θ axes are halved twice (stride 2), so the 36-beam /
+    30-layer cost-ray grid ends up at 9×8 with 8 channels (576-dim) before the
+    Linear bottleneck.  Sizes come from a dummy forward, so any input shape
+    (h_beams, v_layers) works — no hard-coded dimensions.
 
     Input shape:  (B, in_channels, H_beams, V_layers)
     Output shape: (B, feature_dim)
     """
 
-    def __init__(self, in_channels=1, h_beams=36, v_layers=4, feature_dim=128):
+    def __init__(self, in_channels=1, h_beams=36, v_layers=4, feature_dim=64):
         super().__init__()
 
         self.conv1 = nn.Conv2d(in_channels, 4, kernel_size=[5, 3], padding=[2, 1])
-        self.conv2 = nn.Conv2d(4, 16, kernel_size=[5, 3], stride=[1, 1], padding=[2, 1])
-        self.conv3 = nn.Conv2d(16, 16, kernel_size=[5, 3], stride=[1, 2], padding=[2, 1])
+        self.conv2 = nn.Conv2d(4, 8, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1])
+        self.conv3 = nn.Conv2d(8, 8, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1])
 
         # Compute flattened size by running a dummy forward
         dummy = torch.zeros(1, in_channels, h_beams, v_layers)
@@ -80,60 +86,12 @@ class StaticObstacleCNN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# CNN-based Actor
+# CNN-based Actor (stochastic policy)
 # ---------------------------------------------------------------------------
 
 class CNNActor(nn.Module):
     """
-    Actor network: CNN ray-grid features + kinematic state → action.
-
-    Pipeline:
-      ray_grid (B,1,H,V) → StaticObstacleCNN → (B, feature_dim)
-      concat with kinematic (B, kin_dim)
-      → MLP [400 → 300 → action_dim] → tanh
-    """
-
-    def __init__(self, kinematic_dim=4, action_dim=2,
-                 h_beams=36, v_layers=4, cnn_feature_dim=128):
-        super().__init__()
-
-        self.cnn = StaticObstacleCNN(
-            in_channels=1, h_beams=h_beams, v_layers=v_layers,
-            feature_dim=cnn_feature_dim
-        )
-
-        input_dim = cnn_feature_dim + kinematic_dim
-        self.layer_1 = nn.Linear(input_dim, 400)
-        nn.init.kaiming_uniform_(self.layer_1.weight, nonlinearity='leaky_relu')
-        self.layer_2 = nn.Linear(400, 300)
-        nn.init.kaiming_uniform_(self.layer_2.weight, nonlinearity='leaky_relu')
-        self.layer_3 = nn.Linear(300, action_dim)
-        nn.init.kaiming_uniform_(self.layer_3.weight, nonlinearity='leaky_relu')
-        self.tanh = nn.Tanh()
-
-    def forward(self, ray_grid, kinematic):
-        """
-        Args:
-            ray_grid:  (B, 1, H, V)  — preprocessed ray-grid
-            kinematic: (B, kin_dim)   — [dist_to_goal, heading_error, lin_vel, ang_vel]
-        Returns:
-            action: (B, action_dim) in [-1, 1]
-        """
-        features = self.cnn(ray_grid)
-        x = torch.cat([features, kinematic], dim=-1)
-        x = F.leaky_relu(self.layer_1(x))
-        x = F.leaky_relu(self.layer_2(x))
-        a = self.tanh(self.layer_3(x))
-        return a
-
-
-# ---------------------------------------------------------------------------
-# CNN-based SAC Actor (stochastic policy)
-# ---------------------------------------------------------------------------
-
-class CNNSACActor(nn.Module):
-    """
-    Stochastic Actor for SAC: CNN ray-grid features + kinematic state → (mean, log_std).
+    Actor network (stochastic policy): CNN ray-grid features + kinematic state → (mean, log_std).
 
     Pipeline:
       ray_grid (B,1,H,V) → StaticObstacleCNN → (B, feature_dim)
@@ -142,7 +100,7 @@ class CNNSACActor(nn.Module):
     """
 
     def __init__(self, kinematic_dim=4, action_dim=2,
-                 h_beams=36, v_layers=4, cnn_feature_dim=128):
+                 h_beams=36, v_layers=4, cnn_feature_dim=64):
         super().__init__()
 
         self.cnn = StaticObstacleCNN(
@@ -207,7 +165,7 @@ class CNNCritic(nn.Module):
 
     The heavy StaticObstacleCNN is shared between both Q-paths to save GPU
     memory (~50% reduction vs. dual-CNN). The twin structure starts from the
-    MLP heads, preserving TD3's double-Q overestimation reduction.
+    MLP heads, preserving the double-Q overestimation reduction.
 
     Pipeline:
       ray_grid → shared CNN → (B, feature_dim)
@@ -216,7 +174,7 @@ class CNNCritic(nn.Module):
     """
 
     def __init__(self, kinematic_dim=4, action_dim=2,
-                 h_beams=36, v_layers=4, cnn_feature_dim=128):
+                 h_beams=36, v_layers=4, cnn_feature_dim=64):
         super().__init__()
 
         # ---- Shared CNN backbone ----
@@ -272,17 +230,18 @@ class CNNCritic(nn.Module):
 
 # 训练多少轮之后才惰性创建 TensorBoard SummaryWriter（runs/ 目录）。writer 的创建
 # 以 train() 被调用为门槛：只在真正进入训练、且训练轮数 iter_count 超过该阈值时才写
-# runs/。纯推理构造 CNNSAC（play_cspace / test_cnn，只 load + actor 前向，从不调
+# runs/。纯推理构造 CNNSAC（play_cspace，只 load + actor 前向，从不调
 # train()）因此绝不会产生 runs/ 目录。iter_count 每调用一次 train() 自增 1。
 TENSORBOARD_MIN_ITERS = 5
 
 
 class CNNSAC(object):
     """
-    SAC algorithm using CNN-based stochastic Actor and Twin Critic.
+    SAC agent combining the CNN-based stochastic Actor and twin Critic.
 
-    Reuses CNNCritic as-is (SAC uses the same twin-Q structure as TD3).
-    Only the Actor is stochastic and the train() method differs.
+    The twin-Q structure (a shared CNN backbone feeding two MLP heads) reduces
+    the overestimation bias of a single Q-estimator. Only the Actor is
+    stochastic; train() runs the standard soft Bellman backup.
 
     State representation:
       ray_grid  (1, H, V)  — preprocessed ray-grid from point cloud / cost rays
@@ -295,7 +254,7 @@ class CNNSAC(object):
     """
 
     def __init__(self, kinematic_dim=4, action_dim=2, max_action=1,
-                 h_beams=36, v_layers=4, cnn_feature_dim=128,
+                 h_beams=36, v_layers=4, cnn_feature_dim=64,
                  lr=1e-4, alpha_lr=3e-4, device='cpu',
                  safety_reward_weight=1.0, speed_reward_weight=1.0,
                  tensorboard_min_iters=None):
@@ -309,7 +268,7 @@ class CNNSAC(object):
         self.speed_reward_weight = speed_reward_weight
 
         # Actor (stochastic) — no actor_target in SAC
-        self.actor = CNNSACActor(
+        self.actor = CNNActor(
             kinematic_dim, action_dim, h_beams, v_layers, cnn_feature_dim
         ).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
@@ -343,8 +302,8 @@ class CNNSAC(object):
         """Lazily create the TensorBoard SummaryWriter (runs/ dir).
 
         Only fires when the network is genuinely being trained (train() ran at
-        least self.tensorboard_min_iters times). play_cspace / test_cnn load a
-        model and only run actor inference — they never call train(), so their
+        least self.tensorboard_min_iters times). play_cspace loads a model and
+        only runs actor inference — it never calls train(), so its
         CNNSAC keeps writer=None and no runs/ directory is ever created.
         """
         if self.writer is None and self.iter_count >= self.tensorboard_min_iters:
