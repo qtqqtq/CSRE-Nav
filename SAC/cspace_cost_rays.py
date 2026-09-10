@@ -1,48 +1,44 @@
 """
-PyTorch re-implementation of the `c_space_mapper` "3D cost ray" pipeline
-(NavRL-style configuration-space sampling) used by the CNN SAC variant.
+NavRL-style configuration-space "cost ray" observation used by the CNN SAC
+variant (`Sparrow_V2.SparrowCspaceEnv`).  Fully vectorized / GPU-friendly:
 
-This reproduces, in a fully vectorized / GPU-friendly form, the computation done
-by the ROS C++ node `c_space_mapper/mapper_node.cpp` + `configuration_mapper.cpp`:
+    2D occupancy grid (robot-centric, g_min resolution)
+        -> 3D configuration space (x, y, theta)   [footprint collision]
+        -> 3D cost rays            (beam, theta)  [per-θ radial scan]
 
-    2D occupancy grid
-        -> 3D configuration space  (x, y, theta)   [footprint collision]
-        -> 3D cost rays             (beam, theta)  [3D DDA ray cast]
+The robot is a rigid footprint of *fixed* heading theta_k = k*a per layer.  For
+each horizontal beam direction and each heading layer k, the ray slides the
+robot centre along the beam and reports the first radius at which the footprint
+(heading theta_k) collides — i.e. layer k is one independent distance image of
+the 2-D c-space slice at theta_k (the S_stat construction).  The heading does
+NOT turn along the ray; the returned value is the horizontal-plane distance the
+robot *centre* can reach before its body first touches, in metres.
 
-The output `cost_rays` is exactly the `(num_beams, nz)` Float32MultiArray that
-`laser_env.cost_rays_callback()` reshapes into the CNN state, i.e. shape
-`(N, num_beams=36, nz=10)` here, then `preprocess_cost_rays()` mirrors
-`laser_env._preprocess_cost_rays()`.
+Per env the output `cost_rays` is `(num_beams, nz)`.  The live observation is
+`(N, num_beams×nz + 4)` after `preprocess_cost_rays()` log-inverts the distance
+(near obstacle -> high activation; log amplifies close-range detail) and the
+kinematic terms are appended.
 
-Defaults are taken from `catkin_ws/src/c_space_mapper/config/mapper_node.yaml`:
-
-    a = 0.698 (rad)  -> nz = 10 theta layers
-    g_min = 0.2 (m)  -> c-space spatial resolution
-    footprint = 0.44 x 0.38 m rectangle (Pioneer 3-DX)
-    cost_ray_max_range = 5.0 m
-    cost_ray_num_beams = 36, h_res = 10 deg
-
-NOTE: `DEFAULT_CFG` below keeps those ROS/C++ reference values (used only by
-`--bench` / `verify_cost_rays.py`).  The live Sparrow env does NOT use it: it
-passes its own cfg derived from `settings.CSPACE_*` — g_min=0.1 m,
-a=2*pi/CSPACE_NZ≈0.209 rad, nz=CSPACE_NZ=30, footprint 1.2x0.14 m,
-max_range=3.0 m.  To change the observation geometry, edit `settings.CSPACE_*`
-(single source of truth), not this dict.
+`DEFAULT_CFG` below is a small reference geometry (Pioneer 3-DX, 0.2 m cells,
+5 m range, nz=10) used only by the `--bench` timing harness and the self-test.
+The live Sparrow env does NOT use it: it passes its own cfg derived from
+`settings.CSPACE_*` — g_min=0.1 m, a=2*pi/CSPACE_NZ≈0.209 rad, nz=CSPACE_NZ=30,
+footprint 1.2x0.14 m, max_range=3.0 m.  To change the observation geometry,
+edit `settings.CSPACE_*` (single source of truth), not this dict.
 
 Coordinate convention (documented for reproducibility):
   * Robot-centric. The robot sits at the *center* of a `(2R+1) x (2R+1)` grid,
     `R = ceil(max_range / g_min) + 2`, world origin = robot centre.
   * world -> cell:  `i = R + round(wx / g_min)`   (cell-centre aligned)
-  * theta cell:     `k = floor(theta / a)`          (matches the C++ DDA, where
-    theta starts at 0 = boundary of cell 0)
+  * heading layer:  c-space slice k holds the footprint rotated by theta_k = k*a
+    (`build_cspace`).  `cost_rays_3d` scans slice k at a *constant* k, so no
+    heading cell is stepped along the ray.
 
-Fidelity notes (differences vs the C++ that are negligible for training):
-  * The C++ rasterizes only the *edges* of the footprint polygon; we use the
-    *filled* polygon (more correct for a convex footprint).
+Fidelity notes (negligible for training):
   * Footprint masks are built by 3x3 sub-sampling per cell (point-in-polygon),
     which approximates cell/polygon overlap to ~g_min/3.
-  * Sub-cell alignment of the robot centre differs by < g_min (~0.2 m), far
-    below the 5 m range and the 0.1 m floor of `preprocess_cost_rays`.
+  * The centre line is stepped at acc = g_min/2 and sampled with `round` to the
+    nearest g_min cell centre, so returned distances are quantized to ~g_min.
 
 Pure-Python + PyTorch (numpy only for the one-time footprint-mask build).
 """
@@ -178,13 +174,15 @@ def build_cspace(occ_grid, masks):
 # 3D cost ray cast (beam, theta)
 # ---------------------------------------------------------------------------
 def cost_rays_3d(cspace, robot_cell, num_beams=36, h_res_deg=10.0,
-                 max_range=5.0, g_min=0.2, a=0.698, acc=None):
-    """Cast NavRL-style 3D cost rays through the c-space.
+                 max_range=5.0, g_min=0.2, acc=None):
+    """Cast NavRL-style cost rays through the c-space (fixed heading per layer).
 
-    For each of `num_beams` directions and each theta layer k, the ray sweeps
-    its orientation linearly from theta=0 to theta_k=k*a over `max_range`, and
-    returns the (x,y) distance to the first occupied c-space voxel — i.e.
-    "how far can I drive in this direction while rotating to theta_k".
+    Model B semantics: the robot keeps a *constant* heading while its centre
+    slides along the beam — (beam b, layer k) is the radial scan of the 2-D
+    c-space slice at orientation theta_k = k*a, in horizontal direction b, from
+    the robot centre.  Layer k thus answers "if the robot faces theta_k, how far
+    can its centre reach along direction b" — one independent distance image per
+    orientation layer.  The heading does NOT turn along the ray.
 
     Args:
         cspace:      (N, nx, ny, nz) bool, from build_cspace.
@@ -194,7 +192,7 @@ def cost_rays_3d(cspace, robot_cell, num_beams=36, h_res_deg=10.0,
 
     Returns:
         (N, num_beams, nz) float tensor of distances in metres; `max_range`
-        where no collision is found (matches the C++ convention).
+        where no collision is found.
     """
     N, nx, ny, nz = cspace.shape
     dev = cspace.device
@@ -206,9 +204,8 @@ def cost_rays_3d(cspace, robot_cell, num_beams=36, h_res_deg=10.0,
     dx = torch.cos(beam_ang).view(1, num_beams, 1)
     dy = torch.sin(beam_ang).view(1, num_beams, 1)
 
-    # theta sweep rate per layer: d_theta_k = theta_k / max_range, (1, 1, nz)
-    k_idx = torch.arange(nz, device=dev).float().view(1, 1, nz)
-    d_theta = (k_idx * a) / max_range
+    # constant heading layer per ray: layer k always queries slice k
+    k_layer = torch.arange(nz, device=dev).view(1, 1, nz)      # (1,1,nz)
 
     # robot centre cell, (N, 1, 1)
     ri = robot_cell[:, 0].float().view(N, 1, 1)
@@ -226,12 +223,10 @@ def cost_rays_3d(cspace, robot_cell, num_beams=36, h_res_deg=10.0,
         # world -> cell offset (cell-centre aligned), (N, B, 1)
         ci = (ri + torch.round(dx * t / g_min)).long()
         cj = (rj + torch.round(dy * t / g_min)).long()
-        # theta cell, (1, 1, nz) -> broadcast to (N, B, nz)
-        ck = torch.floor(d_theta * t / a).long().clamp(0, nz - 1)
 
         ci = ci.expand(N, num_beams, nz)
         cj = cj.expand(N, num_beams, nz)
-        ck = ck.expand(N, num_beams, nz)
+        ck = k_layer.expand(N, num_beams, nz)                  # (N, B, nz)
 
         in_bounds = (ci >= 0) & (ci < nx) & (cj >= 0) & (cj < ny)
 
@@ -274,18 +269,33 @@ def compute_cost_rays(occ_grid, robot_cell, cfg=None):
         h_res_deg=cfg["cost_ray_h_res_degrees"],
         max_range=cfg["cost_ray_max_range"],
         g_min=cfg["g_min"],
-        a=cfg["a"],
     )
 
 
-def preprocess_cost_rays(cost_rays, max_range=5.0):
-    """Mirror laser_env._preprocess_cost_rays().
+# Min representable ray distance (m) used as the log floor.  The live Sparrow
+# c-space grid is g_min = 0.1 m and ray distances are quantized to ~g_min, so
+# nothing meaningful exists below one cell (a smaller floor only adds empty
+# bins); at/under this value the ray is a footprint contact.
+LOG_CR_MIN_DIST = 0.1
 
-    Clip min distance to 0.1 m, invert so near obstacles -> high activation,
-    and add the channel dim.  Input (N, B, nz) -> (N, 1, B, nz).
+
+def preprocess_cost_rays(cost_rays, max_range=5.0):
+    """Near-field-sensitive log encoding of the cost-ray distances (1 channel).
+
+    Mirror laser_env._preprocess_cost_rays().  d (m) is clipped to
+    [LOG_CR_MIN_DIST, max_range] then encoded as
+
+        p = ln(max_range / d)            (near obstacle -> high activation)
+
+    which replaces the old *linear* inversion (max_range - d).  Because
+    |dp/dd| = 1/d, close-range (sub-metre) differences get amplified — the
+    regime the robot must react to — at the cost of flattening far rays
+    (d ≳ 2 m).  Floor = LOG_CR_MIN_DIST (≈ c-space grid cell), where any
+    smaller distance is a footprint contact; upper clip keeps ln(·) >= 0.
+    Input (N, B, nz) -> (N, 1, B, nz).
     """
-    cr = torch.clamp_min(cost_rays, 0.1)
-    cr = max_range - cr
+    cr = cost_rays.clamp(LOG_CR_MIN_DIST, max_range)
+    cr = torch.log(max_range / cr)
     return cr.unsqueeze(1)  # (N, 1, B, nz)
 
 
@@ -392,7 +402,7 @@ def _bench_main(argv=None):
             cr_kw = dict(num_beams=cfg["cost_ray_num_beams"],
                          h_res_deg=cfg["cost_ray_h_res_degrees"],
                          max_range=cfg["cost_ray_max_range"],
-                         g_min=cfg["g_min"], a=cfg["a"])
+                         g_min=cfg["g_min"])
 
             b = _measure(build_cspace, occ, masks_t, repeat=args.repeat,
                          warmup=args.warmup, sync=sync)[0] * 1e3

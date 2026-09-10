@@ -45,7 +45,7 @@ $ cd ~
 ### Clone this repo
 $ git clone https://github.com/reiniscimurs/DRL-robot-navigation
 ```
-The network can be run with a standard 2D laser, but this implementation uses a simulated [3D Velodyne sensor](https://github.com/lmark1/velodyne_simulator)
+The network runs on a standard 2D laser scanner (a Hokuyo URG, simulated in Gazebo)
 
 Compile the workspace:
 ```shell
@@ -67,13 +67,13 @@ $ source devel_isolated/setup.bash
 
 Run the training:
 ```shell
-$ cd ~/DRL-robot-navigation/TD3
-$ python3 train_velodyne_td3.py
+$ cd ~/DRL-robot-navigation/SAC
+$ python3 train.py
 ```
 
 To check the training process on tensorboard:
 ```shell
-$ cd ~/DRL-robot-navigation/TD3
+$ cd ~/DRL-robot-navigation/SAC
 $ tensorboard --logdir runs
 ```
 
@@ -84,8 +84,8 @@ $ killall -9 rosout roslaunch rosmaster gzserver nodelet robot_state_publisher g
 
 Once training is completed, test the model:
 ```shell
-$ cd ~/DRL-robot-navigation/TD3
-$ python3 test_velodyne_td3.py
+$ cd ~/DRL-robot-navigation/SAC
+$ python3 play_cspace.py --ModelName dense_sample_cspace_2 --dvc cuda
 ```
 
 Gazebo environment:
@@ -114,6 +114,6 @@ $ sudo docker run -it --rm drl_noetic
 
 Inside the docker, start the training:
 ```shell
-$ cd DRL-robot-navigation/TD3
-$ python3 train_velodyne_td3.py
+$ cd DRL-robot-navigation/SAC
+$ python3 train.py
 ```

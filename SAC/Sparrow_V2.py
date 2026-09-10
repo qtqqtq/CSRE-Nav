@@ -10,6 +10,7 @@ import math
 
 import settings
 from cspace_cost_rays import (
+    LOG_CR_MIN_DIST,
     make_footprint_masks,
     build_cspace,
     cost_rays_3d,
@@ -66,11 +67,10 @@ default_cfg = dict(
     Obs_R=14,  # maximal obstacle radius, cm
     Obs_V=25,  # maximal obstacle velocity, cm/s
     generate_rate=0.5,  # per-region probability of spawning a static obstacle
-    ang_vel_penalty=0.3,  # penalty weight on |angular velocity| (discourage spinning in place)
-    stall_penalty=0.6,    # |实际线速度| < stall_threshold 时的惩罚(满额=静止, 线性过渡)。
-                          # 原地逗留与"前后抖动"(高频正负指令经 K 滤波后 |v| 起不来)都由该项收口；
-                          # 匀速前进/倒车(低通后 |v| 足够大) R_stall=0，不罚。倒车方向正误交给 R_distance。
-    stall_threshold=0.2,  # 线速度死区阈值, 以 v_linear_max(=50 cm/s) 的比例计(0.2 = 10 cm/s)
+    distance_reward_weight=1.0,  # 主奖励权重: 朝目标的归一化距离进度 R_distance
+    fwd_reward_weight=1.0, # 分奖励权重: 纯前向速度, 全速前进(=v_linear_max)该步 +fwd_reward_weight,
+                           # 倒车/停车=0。主奖励是 R_distance(目标距离进度), 本项只是辅助鼓励前进。
+    ang_vel_penalty=0.1,  # 分奖励权重: |ω指令| 惩罚(原地转圈), 每步 −ang_vel_penalty·|ω|
     MapObs=None, # None /or/ the name of .png file, e.g. None / 'map.png'
     ld_a_range=360, # max scanning angle of lidar (degree)
     ld_d_range=100, # max scanning distance of lidar (cm)
@@ -602,39 +602,24 @@ class Sparrow():
         self.dw_vec = self.exceed_vec + self.win_vec #+ self.collide_vec # terminated signal (N,)
         self.done_vec = self.tr_vec + self.dw_vec # (N,), used for AutoReset
 
-        xy_in_target = self.car_state[:, 0:2] - self.target_point # 小车在以target为原点的坐标系下的坐标, (N,2), 注意这里是无噪声的
-        beta = torch.arctan(xy_in_target[:,0] / xy_in_target[:,1]) + torch.pi / 2 + (xy_in_target[:,1] < 0) * torch.pi # (N,)
-        alpha = (beta - self.car_state[:, 2]) / torch.pi # (N,)
-        alpha += (2 * (alpha < -1) - 2 * (alpha > 1))  # 修复1/2象限、3/4象限, (N,)
-
-        R_distance = ((self.d2target_pre - self.d2target_now)/(self.v_linear_max*self.ctrl_interval.view(-1))).clamp_(-1,1) # 朝目标点移动时得分，背离时扣分。 (N,)∈[-1,1]
-        R_orientation = (0.25-alpha.abs().clamp(0,0.25))/0.25  # (-0.25~0~0.25) -> (0,1,0), 朝着目标点时奖励最大,  (N,)
+        # 主奖励 R_distance: 朝目标的归一化距离进度 ∈ [-1,1] (靠近为正, 背离为负)
+        R_distance = ((self.d2target_pre - self.d2target_now)
+                      / (self.v_linear_max * self.ctrl_interval.view(-1))).clamp_(-1, 1)  # (N,)
+        # 分奖励 R_forward / R_angular
         if self.action_type == 'Discrete':
-            R_forward = (current_a==2) # 鼓励使用前进动作(提升移动速度、防止原地滞留) (N,) = 0 or 1
-            R_stall = torch.zeros(self.N, device=self.dvc)   # 离散分支保持原奖励不变
-            R_angular = torch.zeros(self.N, device=self.dvc) # 离散动作不按角速度惩罚
+            R_forward = (current_a == 2)                       # 前进动作 (N,) ∈ {0,1}
+            R_angular = torch.zeros(self.N, device=self.dvc)   # 离散分支不按角速度罚
         else:
-            R_forward = torch.zeros(self.N, device=self.dvc) # 连续分支不再按"向前指令"发奖励
-            if self.stall_threshold > 0:
-                # 实际线速度(经 K 低通滤波后, cm/s)归一化绝对值 ∈[0,1]
-                vhat = (self.car_state[:, 3] / self.v_linear_max).abs()
-                # |v| < stall_threshold 时给惩罚: 静止罚满(stall_penalty), 越接近阈值罚得越少,
-                # >= 阈值不罚。原地逗留与"前后抖动"(高频正负指令在 K 滤波下 |v| 起不来)都被收口;
-                # 匀速前进/倒车 |v| 足够大 -> R_stall=0。倒车方向正误由 R_distance 判断。
-                R_stall = (self.stall_penalty
-                           * (self.stall_threshold - vhat).clamp(min=0.0)
-                           / self.stall_threshold)
-            else:
-                R_stall = torch.zeros(self.N, device=self.dvc)   # threshold=0 -> 关闭该项
-            R_angular = current_a[:,1].abs() # |角速度指令| ∈ [0,1]，惩罚原地转圈
-        self.reward_vec = (0.5 * R_distance + R_forward
-                           - R_stall
+            R_forward = (self.car_state[:, 3] / self.v_linear_max).clamp(min=0.0)  # 纯前向线速度(倒车/停车=0)
+            R_angular = current_a[:, 1].abs()                  # |角速度指令| ∈ [0,1]
+        # 总奖励 = distance_reward_weight·R_distance
+        #           + fwd_reward_weight·R_forward − ang_vel_penalty·R_angular
+        #           − 0.5(常态时间罚: 推动尽快到目标、压低速徘徊)。
+        # 终端(win/+200, 碰撞/越界/−200)在下面由 AWARD/PUNISH 覆盖。
+        self.reward_vec = (self.distance_reward_weight * R_distance
+                           + self.fwd_reward_weight * R_forward
                            - self.ang_vel_penalty * R_angular
-                           - 0.5)  # -0.5 常数, 防止agent太猥琐到处逗留
-        # 注: 移除 R_forward(+1 上限) 与 reverse/Δa 惩罚后, 连续分支非终态稠密奖励上限约
-        # 0.5*R_distance - 0.5 (<=0), 正收益主要来自 win(+200)。想要更正向的引导, 可调低
-        # 上面的 -0.5 常数或提高 R_distance 权重 0.5。
-        # 旧归一化式(参考, 未启用): (0.5*R_distance + R_orientation*R_forward - 0.5*R_retreat_slowdown - 0.25)/1.25
+                           - 0.5)
 
         self.reward_vec[self.win_vec] = self.AWARD
         self.reward_vec[self.exceed_vec] = self.PUNISH
@@ -1196,8 +1181,11 @@ class SparrowCspaceEnv(Sparrow):
 
         params.setdefault("action_type", "Continuous")
         params.setdefault("render_mode", None)
-        params.setdefault("dynamic_obs", settings.SPARROW_DYNAMIC_OBS)   # c-space 环境默认关闭动态障碍物
+        params.setdefault("O", settings.SPARROW_N_OBSTACLES)              # 每个环境的动态障碍物数量
+        params.setdefault("dynamic_obs", settings.SPARROW_DYNAMIC_OBS)   # c-space 环境是否生成动态障碍物
+        params.setdefault("Obs_V", settings.SPARROW_OBS_V)               # 动态障碍物最大速度 (cm/s)
         params.setdefault("generate_rate", settings.SPARROW_GENERATE_RATE)  # 静态障碍物密度 (每区域生成概率)
+        params.setdefault("distance_reward_weight", settings.SPARROW_DISTANCE_REWARD_WEIGHT)
         params.setdefault("stuck_reset", settings.SPARROW_STUCK_RESET)    # 卡死(cost ray 全≈0)时自动重置
         params.setdefault("stuck_threshold", settings.SPARROW_STUCK_THRESHOLD)
         # 雷达探测距离必须覆盖 c-space 窗口：基于雷达的 occupancy grid 在
@@ -1436,7 +1424,6 @@ class SparrowCspaceEnv(Sparrow):
             h_res_deg=cfg["cost_ray_h_res_degrees"],
             max_range=cfg["cost_ray_max_range"],
             g_min=cfg["g_min"],
-            a=cfg["a"],
         )                                                          # (N,B,nz) m
         # stash raw / processed cost rays + c-space for logging & debugging
         self.cost_rays_raw = cost_rays.detach()                    # (N,B,nz) m
@@ -1815,9 +1802,11 @@ if __name__ == "__main__":
     flat = env.cost_ray_num_beams * env.cost_ray_nz        # B*nz (ray-grid cols)
     exp_shape = (env.N, flat + 4)                          # e.g. (2, 1084)
     print("reset state shape:", tuple(s.shape), "(expect %s)" % (exp_shape,))
-    print("cost-ray sub-range: [%.2f, %.2f] (expect [0, %.1f])" % (
+    expected_ray_max = math.log(
+        env.cspace_cfg["cost_ray_max_range"] / LOG_CR_MIN_DIST)
+    print("cost-ray sub-range: [%.2f, %.2f] (expect [0, %.2f])" % (
         s[:, :flat].min().item(), s[:, :flat].max().item(),
-        env.cspace_cfg["cost_ray_max_range"],
+        expected_ray_max,
     ))
     print("distance col (m):", s[:, flat].tolist(), ">=0:", bool((s[:, flat] >= 0).all()))
     print("heading col (rad):", s[:, flat + 1].tolist())

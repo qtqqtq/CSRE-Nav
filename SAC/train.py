@@ -37,13 +37,13 @@ import settings
 # Hyper-parameters
 # ---------------------------------------------------------------------------
 N_ENVS = settings.SPARROW_N_ENVS              # number of vectorized environments (GPU batch)
-N_OBSTACLES = settings.SPARROW_N_OBSTACLES    # obstacles per env (matches ColorDynamic's default)
+N_OBSTACLES = settings.SPARROW_N_OBSTACLES    # moving obstacles per environment
 batch_size = 256
 buffer_size = 250000
-file_name = "dense_sample_cspace_0"
+file_name = "dense_sample_cspace_2"
 save_model = True
-load_model = False
-load_model_name = "SAC_sparrow_cspace_2"
+load_model = True
+load_model_name = "dense_sample_cspace_1"
 
 train_every = 5             # env-steps between training calls
 gradient_steps = 5          # gradient steps per training call (1:1 with steps)
@@ -67,11 +67,12 @@ RENDER_SPEED = settings.SPARROW_RENDER_SPEED  # 'slow'=30FPS / 'fast'=最快 / '
 # Evaluation (deterministic, vectorized)
 # ---------------------------------------------------------------------------
 def evaluate(network, env, eval_steps=EVAL_STEPS):
-    """Return (avg_reward, collision_rate) over a vectorized deterministic run."""
+    """Return (avg_reward, collision_rate, goal_rate) over a vectorized run."""
     state, _ = env.reset()
     total_reward = 0.0
     num_done = 0
     num_collision = 0
+    num_goal = 0
     for _ in range(eval_steps):
         rg = state[:, :settings.RAY_GRID_FLAT_DIM].reshape(
             env.N, 1, settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
@@ -84,13 +85,16 @@ def evaluate(network, env, eval_steps=EVAL_STEPS):
         total_reward += reward.sum().item()
         num_done += done.sum().item()
         num_collision += env.collide_vec.sum().item()
+        num_goal += env.win_vec.sum().item()
     total_steps = eval_steps * env.N
     avg_reward = total_reward / max(num_done, 1)
     # collide_vec 现在是「卡死(stuck)重置事件」掩码，是 done 的子集（每步每个
     # 环境最多触发一次），因此 num_collision <= num_done，碰撞率 = 以碰撞(卡死)
-    # 结束的 episode 占比，天然落在 [0,1]。
+    # 结束的 episode 占比；goal_rate = 以到达目标(win)结束的 episode 占比。
+    # 两者都天然落在 [0,1]。
     collision_rate = num_collision / max(num_done, 1)
-    return avg_reward, collision_rate
+    goal_rate = num_goal / max(num_done, 1)
+    return avg_reward, collision_rate, goal_rate
 
 
 # ---------------------------------------------------------------------------
@@ -236,24 +240,24 @@ while total_steps < settings.MAX_TIMESTEPS:
 
     # periodic evaluation + save
     if total_steps % EVAL_EVERY_STEPS == 0:
-        avg_reward, avg_col = evaluate(network, env)
+        avg_reward, avg_col, avg_goal = evaluate(network, env)
         evaluations.append(avg_reward)
-        network.log_eval(epoch, avg_reward, avg_col)
+        network.log_eval(epoch, avg_reward, avg_col, avg_goal)
         if save_model:
             network.save(file_name, directory=settings.MODEL_DIR)
         np.save("%s/%s" % (settings.RESULTS_DIR, file_name), evaluations)
         print("epoch %d | steps %d | avg_reward %.2f | collision_rate %.3f | "
-              "%.1f ksteps/s" % (
-                  epoch, total_steps, avg_reward, avg_col,
+              "goal_reached %.3f | %.1f ksteps/s" % (
+                  epoch, total_steps, avg_reward, avg_col, avg_goal,
                   total_steps / 1e3 / max(time.time() - t_start, 1e-6)))
         epoch += 1
 
 # ---------------------------------------------------------------------------
 # Final save
 # ---------------------------------------------------------------------------
-avg_reward, avg_col = evaluate(network, env)
+avg_reward, avg_col, avg_goal = evaluate(network, env)
 evaluations.append(avg_reward)
-network.log_eval(epoch, avg_reward, avg_col)
+network.log_eval(epoch, avg_reward, avg_col, avg_goal)
 if save_model:
     network.save(file_name, directory=settings.MODEL_DIR)
 np.save("%s/%s" % (settings.RESULTS_DIR, file_name), evaluations)

@@ -1,0 +1,13 @@
+# c_space_mapper_node (ROS 1) private parameters
+a: 0.698   # ≈ 2π/9 → nz_ = 10 theta orientations
+g_min: 0.2
+g_divide_gmin: 1
+crop_size: 30
+scan_stepsizes: [1]
+scan_detection_windows: [0]
+footprints: ['[[0.22, 0.19], [0.22, -0.19], [-0.22, -0.19], [-0.22, 0.19]]']
+cost_ray_max_range: 5.0
+cost_ray_h_res_degrees: 10.0
+cost_ray_num_beams: 36
+cspace_vis_z_scale: 0.08
+robot_frame_id: base_link

@@ -1,0 +1,40 @@
+<launch>
+  <!--
+    robot_2dnav — Local costmap provider for DRL-robot-navigation
+    Starts map_server + move_base to publish:
+      /move_base/local_costmap/costmap   (8m×8m robot-centric rolling window)
+      /move_base/global_costmap/costmap  (full static map)
+
+    Topics used for RL observation:
+      /move_base/local_costmap/costmap → 160×160 cells, 0.05m res, robot frame
+  -->
+
+  <master auto="start"/>
+
+  <!-- Static Map Server: serves the pre-built PGM map -->
+  <node name="map_server" pkg="map_server" type="map_server"
+        args="$(find robot_2dnav)/maps/TD3-2.yaml">
+    <remap from="/map" to="/map" />
+  </node>
+
+  <!-- move_base: global + local costmaps -->
+  <node pkg="move_base" type="move_base" respawn="false"
+        name="move_base" output="screen">
+
+    <!-- Common params applied under both namespaces -->
+    <rosparam file="$(find robot_2dnav)/costmap_common_params.yaml"
+              command="load" ns="global_costmap" />
+    <rosparam file="$(find robot_2dnav)/costmap_common_params.yaml"
+              command="load" ns="local_costmap" />
+
+    <!-- Layer-specific params -->
+    <rosparam file="$(find robot_2dnav)/global_costmap_params.yaml"
+              command="load" />
+    <rosparam file="$(find robot_2dnav)/local_costmap_params.yaml"
+              command="load" />
+
+    <!-- Disable planners (we only need the costmaps, not planning) -->
+    <param name="base_local_planner" value="base_local_planner/TrajectoryPlannerROS" />
+  </node>
+
+</launch>

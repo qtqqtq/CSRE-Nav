@@ -107,7 +107,7 @@ WARMUP_STEPS = 5e3    # collect this many steps (fill replay buffer) before trai
 # ---------------------------------------------------------------------------
 # SAC hyper-parameters (shared defaults; batch/buffer size are per-script)
 # ---------------------------------------------------------------------------
-DISCOUNT = 0.95       # gamma — discounted future reward
+DISCOUNT = 0.995       # gamma — discounted future reward
 TAU = 0.005           # soft target update rate
 LR = 1e-4             # actor & critic learning rate
 ALPHA_LR = 3e-4       # temperature (entropy) learning rate
@@ -120,15 +120,18 @@ MAX_TIMESTEPS = 5e6   # total training steps
 # ---------------------------------------------------------------------------
 SAFETY_REWARD_WEIGHT = 0.0
 SPEED_REWARD_WEIGHT = 0.0
+SPARROW_DISTANCE_REWARD_WEIGHT = 2.0  # R_distance: normalized progress toward the target
 
 # ---------------------------------------------------------------------------
 # Sparrow c-space environment (Sparrow_V2 / train.py)
 # ---------------------------------------------------------------------------
 SPARROW_N_ENVS = 32          # vectorized environments per training step
-SPARROW_N_OBSTACLES = 8     # obstacles per environment
-SPARROW_DYNAMIC_OBS = False  # whether to spawn moving obstacles (c-space env: off)
+SPARROW_N_OBSTACLES = 8      # moving obstacles per environment
+SPARROW_DYNAMIC_OBS = True   # whether to spawn moving obstacles in c-space environments
+SPARROW_OBS_V = 25           # maximum moving-obstacle speed (cm/s)
 SPARROW_LD_ACC = 8           # lidar DDA step size (cm); larger = faster but coarser scan
-SPARROW_GENERATE_RATE = 0.4
+# 6x6 regions x 2 attempts x 0.25 -> about 18 static line obstacles per map.
+SPARROW_GENERATE_RATE = 0.25
 
 # Stuck auto-reset: boxed-in detection via the theta=0 cost-ray layer
 SPARROW_STUCK_RESET = True

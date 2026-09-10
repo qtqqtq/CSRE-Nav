@@ -534,13 +534,14 @@ class GazeboEnv:
             rospy.logwarn("cost_rays size mismatch: %d != %d*%d",
                           data.size, num_beams, nz)
 
-    # Preprocess cost_rays to match NavRL format:
-    #   - Clip min distance to 0.1 m (avoid divide-by-zero)
-    #   - Invert: near obstacles → high activation (cost-like representation)
+    # Preprocess cost_rays (mirror of cspace_cost_rays.preprocess_cost_rays):
+    #   - Clip distance d to [0.1 m, max_ray_range]
+    #   - Log-encode p = ln(max_range / d): near obstacle → high activation,
+    #     with |dp/dd| = 1/d amplifying close-range (sub-metre) detail
     #   - Add channel dimension: (H, V) → (1, H, V)
     def _preprocess_cost_rays(self):
-        cr = np.maximum(self.cost_rays_data, 0.1)
-        cr = self.max_ray_range - cr
+        cr = np.clip(self.cost_rays_data, 0.1, self.max_ray_range)
+        cr = np.log(self.max_ray_range / cr)
         return cr[np.newaxis, :, :]
 
     # Perform an action and read a new state

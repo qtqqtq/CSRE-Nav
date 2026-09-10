@@ -1,0 +1,18 @@
+# Common parameters for both global and local costmaps
+# DRL-robot-navigation — robot_2dnav
+
+obstacle_range: 2.5
+raytrace_range: 3.0
+
+# Minimal footprint: point-like robot (collision checking done by c_space_mapper)
+footprint: [[0.18, -0.13], [0.18, 0.13], [-0.18, 0.13], [-0.18, -0.13]]
+
+# Inflation radius: small buffer for safety
+inflation_radius: 0.1
+
+# Observation sources: static map only (no sensor layers needed for training)
+observation_sources: static_map
+
+static_map:
+  map_topic: map
+  subscribe_to_updates: false

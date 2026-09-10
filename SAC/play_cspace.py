@@ -37,7 +37,7 @@ from render_utils import draw_hud, draw_cost_rays, draw_cspace_projection, draw_
 parser = argparse.ArgumentParser()
 
 # ---- Model / agent ----
-parser.add_argument('--ModelName', type=str, default='dense_sample_cspace_0',
+parser.add_argument('--ModelName', type=str, default='dense_sample_cspace_2',
                     help='model basename in pytorch_models (e.g. SAC_sparrow_cspace)')
 parser.add_argument('--ModelDir', type=str, default=settings.MODEL_DIR,
                     help='directory holding *_actor.pth / *_critic.pth')
@@ -49,8 +49,9 @@ parser.add_argument('--dvc', type=str, default='cuda', help='cuda / cpu')
 parser.add_argument('--window_size', type=int, default=800)
 parser.add_argument('--D', type=int, default=400, help='max local planning distance')
 parser.add_argument('--O', type=int, default=settings.SPARROW_N_OBSTACLES,
-                    help='number of obstacles per env')
-parser.add_argument('--Obs_V', type=int, default=30, help='max obstacle velocity (cm/s)')
+                    help='number of moving obstacles per env')
+parser.add_argument('--Obs_V', type=int, default=settings.SPARROW_OBS_V,
+                    help='max moving-obstacle velocity (cm/s)')
 parser.add_argument('--MapObs', type=str, default=None, help="map file, e.g. 'map.png' or None")
 parser.add_argument('--render_speed', type=str, default=settings.SPARROW_RENDER_SPEED,
                     help='fast / slow / real (slow = 30 FPS, stable display)')
@@ -145,6 +146,11 @@ def main():
             else:
                 action, _ = network.actor.sample(rg, kin)
 
+            # 当前执行动作的 Q 估计(双 critic): 与训练约定一致 —— 喂原始 tanh(-1,1) 动作,
+            # 而非映射后的 a_in(env 真正执行的物理速度)。min-Q 是 SAC 优化的目标。
+            q1, q2 = network.critic(rg, kin, action)
+            q_pair = (float(q1.item()), float(q2.item()))
+
         # same action convention as training: linear a0 in [-1,1] if ALLOW_REVERSE
         a_in = settings.map_continuous_action(action)
         s, r, dw, tr, info = env.step(a_in)
@@ -156,7 +162,7 @@ def main():
         draw_cost_rays(env, font)
         draw_cspace_projection(env, font)
         draw_lidar_ogm(env, font)
-        draw_hud(env, font, reward_val, ep_reward)
+        draw_hud(env, font, reward_val, ep_reward, q_pair=q_pair)
         pygame.display.update()   # 每帧在所有叠加层绘制完成后只 flush 一次，避免闪动
         if bool(dw.item()):   # win / collide / stuck -> 一个 episode 结束，累计奖励清零
             ep_reward = 0.0

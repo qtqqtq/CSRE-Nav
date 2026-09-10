@@ -17,19 +17,28 @@ import numpy as np
 import pygame
 
 
-def draw_hud(env, font, reward_val, ep_reward):
-    """Overlay the instantaneous / cumulative reward onto the rendered window."""
+def draw_hud(env, font, reward_val, ep_reward, q_pair=None):
+    """Overlay the instantaneous / cumulative reward onto the rendered window.
+
+    q_pair: optional (q1, q2) — twin-critic Q estimate of the action that is
+    being executed, drawn as extra HUD lines (min-Q is the value SAC optimizes).
+    """
     if env.window is None:
         return
     lines = [("Reward: %+.2f" % reward_val,
               (120, 255, 120) if reward_val >= 0 else (255, 120, 120)),
              ("Total : %+.2f" % ep_reward, (255, 255, 255))]
+    if q_pair is not None:
+        q1, q2 = float(q_pair[0]), float(q_pair[1])
+        lines.append(("Q     : %+.1f" % min(q1, q2), (120, 220, 255)))
+        lines.append(("Q1/Q2 : %+.1f %+.1f" % (q1, q2), (200, 220, 220)))
     if bool(env.win_vec[env.ri].item()):
         lines.append(("WIN", (120, 255, 120)))
     if bool(env.collide_vec[env.ri].item()):
         lines.append(("COLLIDE", (255, 80, 80)))
 
-    panel = pygame.Surface((200, 18 * len(lines) + 12), pygame.SRCALPHA)
+    panel_w = max(200, max(font.size(text)[0] for text, _ in lines) + 40)
+    panel = pygame.Surface((panel_w, 18 * len(lines) + 12), pygame.SRCALPHA)
     panel.fill((0, 0, 0, 160))
     env.window.blit(panel, (8, 8))
     y = 12

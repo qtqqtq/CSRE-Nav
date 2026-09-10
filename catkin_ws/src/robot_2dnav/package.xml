@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>robot_2dnav</name>
+  <version>0.0.0</version>
+  <description>Local costmap provider for DRL-robot-navigation</description>
+  <maintainer email="3101438240@qq.com">qtqqtq</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>map_server</exec_depend>
+  <exec_depend>move_base</exec_depend>
+  <exec_depend>costmap_2d</exec_depend>
+
+  <export>
+  </export>
+</package>

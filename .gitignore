@@ -1,0 +1,27 @@
+# Python caches and local profiling output
+__pycache__/
+*.py[cod]
+SAC/.profile_train_timing_tmp.py
+SAC/.tensorboard-info/
+
+# Training artifacts
+SAC/runs/
+SAC/results/
+SAC/pytorch_models/
+SAC/models_backup/
+runs/
+results/
+
+# Catkin build products and local workspace metadata
+build/
+install/
+catkin_ws/build/
+catkin_ws/devel/
+catkin_ws/install/
+catkin_ws/logs/
+catkin_ws/.catkin_workspace
+.catkin_tools/
+
+# Local editor and assistant state
+.vscode/
+.claude/

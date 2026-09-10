@@ -471,13 +471,14 @@ class CNNSAC(object):
         self.writer.add_scalar("Episode/collision", int(collision), episode_num)
         self.writer.add_scalar("Episode/alpha", self.alpha.item(), episode_num)
 
-    def log_eval(self, epoch, avg_reward, avg_collision_rate):
+    def log_eval(self, epoch, avg_reward, avg_collision_rate, avg_goal_rate):
         """Log evaluation metrics to TensorBoard (no-op before writer exists)."""
         self._ensure_writer()
         if self.writer is None:
             return
         self.writer.add_scalar("Eval/avg_reward", avg_reward, epoch)
         self.writer.add_scalar("Eval/avg_collision_rate", avg_collision_rate, epoch)
+        self.writer.add_scalar("Eval/goal_reached", avg_goal_rate, epoch)
 
     def log_cost_rays(self, step, cost_rays_proc, cost_rays_raw=None):
         """Visualize cost_rays input as TensorBoard figure (matplotlib-based).
