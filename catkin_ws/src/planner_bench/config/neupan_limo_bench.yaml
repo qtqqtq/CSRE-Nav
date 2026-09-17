@@ -1,0 +1,70 @@
+# NeuPAN planner config for the shared bench arena.
+#
+# Base: neupan_ros/example/gazebo_limo/config/neupan_planner_limo_noloop.yaml
+# (the noloop variant, NOT neupan_planner_limo.yaml -- the latter has
+# `loop: True`, which makes the robot lap the initial path forever and never
+# terminate a trial).
+#
+# Two edits, both mandatory for the bench:
+#
+#  1. `waypoints: []`.  The upstream file ships [[0,0,0],[5,0,0]], and
+#     neupan_core.run() does:
+#         if len(waypoints) >= 1 and initial_path is None:
+#             set_initial_path_from_state(robot_state)
+#     so with the shipped value the robot starts DRIVING TO (5,0) at startup,
+#     before trial 1 and before any goal is ever published.  Emptying the list
+#     makes it idle on "waiting for neupan initial path" until a goal arrives,
+#     which is both the correct behaviour and the readiness signal bench.py
+#     waits for.
+#
+#  2. Nothing else.  In particular do NOT try to tune the `pan:` block below:
+#     neupan_core.py builds `pan = {'dune_checkpoint': ...}` and passes it to
+#     neupan.init_from_yaml(), and neupan.py does `config.update(kwargs)`, which
+#     REPLACES the whole `pan` dict rather than merging into it.  So
+#     iter_num / dune_max_num / nrmp_max_num / iter_threshold in this file are
+#     ignored at runtime.  They are left at the upstream values because those
+#     happen to equal the library defaults, which is why nobody noticed.
+
+receding: 5
+step_time: 0.3
+ref_speed: 0.3
+device: 'cpu'
+time_print: False
+collision_threshold: 0.01
+
+# robot -- left exactly as shipped.  The DUNE checkpoint's MLP maps a 2-D input to
+# a 4-edge output, and 0.322 x 0.22 is the geometry it was trained on.  It also
+# agrees with the Limo URDF's real collision footprint (bench_common derives
+# 0.29 x 0.22), so "correcting" it would be both wrong and out of distribution.
+robot:
+  kinematics: 'diff'
+  max_speed: [1, 3.14]
+  max_acce: [1, 3.14]
+  length: 0.322
+  width: 0.22
+
+ipath:
+  interval: 0.09
+  waypoints: []         # <-- edit 1.  Empty, so nothing happens before a goal.
+  curve_style: 'line'   # straight line to the goal: this is why gen_goals.py
+                        # rejects goals with no line of sight (see bench.yaml
+                        # goal.los_margin).
+  min_radius: 0.0
+  loop: False           # <-- must stay False; True laps forever
+  arrive_threshold: 0.2
+  close_threshold: 0.1
+  arrive_index_threshold: 0 # end of the path
+
+pan:
+  iter_num: 2
+  dune_max_num: 100
+  nrmp_max_num: 10
+  dune_checkpoint: None   # overridden by the ~dune_checkpoint ROS param
+  iter_threshold: 0.1
+
+adjust:
+  q_s: 0.3
+  p_u: 2.5
+  eta: 10.0
+  d_max: 0.15
+  d_min: 0.01

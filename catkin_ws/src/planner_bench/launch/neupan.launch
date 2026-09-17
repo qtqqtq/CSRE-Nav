@@ -1,0 +1,49 @@
+<?xml version="1.0"?>
+<!--
+  The NeuPAN planner node, alone.  No rviz.
+
+  Mirrors the node block of
+  neupan_ros/example/gazebo_limo/launch/neupan_gazebo_limo.launch verbatim, with
+  two deliberate differences:
+
+    * config_file points at planner_bench's own copy, so the bench can set
+      `waypoints: []` (see config/neupan_limo_bench.yaml - the upstream file
+      ships a waypoint list that makes the robot drive off before trial 1).
+    * map_frame is odom and there is no `map` frame anywhere in sim.launch.
+      Both this and cspace treat map_frame==odom; if anyone flips it to `map`,
+      neupan's tf lookup fails and it publishes NO velocity at all - it does not
+      fall back, it just spins at 50 Hz doing nothing.
+-->
+<launch>
+  <arg name="config_file" default="$(find planner_bench)/config/neupan_limo_bench.yaml"/>
+  <arg name="dune_checkpoint"
+       default="$(find neupan_ros)/example/gazebo_limo/pretrain_limo/model_5000.pth"/>
+  <arg name="map_frame" default="odom"/>
+  <arg name="base_frame" default="base_link"/>
+  <arg name="lidar_frame" default="laser_link"/>
+  <arg name="scan_range" default="0.0 5.0"/>
+  <arg name="scan_angle_range" default="-3.14 3.14"/>
+  <arg name="marker_size" default="0.05"/>
+  <arg name="marker_z" default="1.0"/>
+  <arg name="scan_downsample" default="6"/>
+  <arg name="refresh_initial_path" default="false"/>
+
+  <node name="neupan_control" pkg="neupan_ros" type="neupan_node.py"
+        output="screen" required="true">
+    <param name="config_file" value="$(arg config_file)"/>
+    <param name="map_frame" value="$(arg map_frame)"/>
+    <param name="base_frame" value="$(arg base_frame)"/>
+    <param name="lidar_frame" value="$(arg lidar_frame)"/>
+    <param name="scan_range" value="$(arg scan_range)"/>
+    <param name="scan_angle_range" value="$(arg scan_angle_range)"/>
+    <param name="marker_size" value="$(arg marker_size)"/>
+    <param name="marker_z" value="$(arg marker_z)"/>
+    <param name="scan_downsample" value="$(arg scan_downsample)"/>
+    <param name="dune_checkpoint" value="$(arg dune_checkpoint)"/>
+    <param name="refresh_initial_path" value="$(arg refresh_initial_path)"/>
+
+    <remap from="/scan" to="/limo/scan"/>
+    <remap from="/neupan_cmd_vel" to="/cmd_vel"/>
+    <remap from="/neupan_goal" to="/move_base_simple/goal"/>
+  </node>
+</launch>

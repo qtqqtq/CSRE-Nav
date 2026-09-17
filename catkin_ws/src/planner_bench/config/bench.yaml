@@ -1,0 +1,134 @@
+# planner_bench -- authored ground truth, thresholds, and the fairness contract.
+#
+# Everything here is a *definition* of the benchmark, not a tuning knob: change a
+# value and previous reports are no longer comparable.  compare_reports.py hashes
+# the fields that matter and refuses to diff two runs that disagree.
+
+arena:
+  # Interior of worlds/bench_arena.world, i.e. the inner faces of the boundary
+  # walls.  bench_common.infer_bounds() re-derives this from the world file and
+  # the selftest asserts the two agree to 1 cm -- so this is a cross-check, not
+  # the source of truth.
+  bounds: [-5.0, 5.0, -5.0, 5.0]
+  # Spawn pose.  Deliberately the origin of the odom frame: the Limo's skid-steer
+  # plugin derives odometry from the model's world pose, so spawning at the world
+  # origin makes odom == Gazebo world and removes an entire class of frame bug.
+  start: [-2.5, -1.0, 0.0]
+  # Room to rotate at the start pose before anything else goes wrong.
+  start_clearance: 0.6
+  # Narrowest corridor the world may contain.  Budget: the cspace checkpoint
+  # dilates obstacles by its 1.20 m training footprint, so anything tighter than
+  # ~1.3 m is invisible to it and a tighter-than-that corridor would measure the
+  # footprint mismatch rather than navigation.
+  min_passage: 1.6
+  # 4 boundary walls + 2 divider + 2 pocket + 3 boxes.
+  min_obstacles: 11
+
+robot:
+  # Half-extents in the base_footprint frame, used only when /robot_description
+  # is unavailable.  bench.py derives the real value from the live URDF via
+  # bench_common.footprint_from_urdf() and warns if it disagrees with this.
+  #
+  # 0.29 x 0.22 is what the shipped Limo URDF actually yields: the base_link box
+  # is 0.13 x 0.12, and the four wheels are <cylinder length=.045 radius=.045>
+  # under rpy="1.57 0 0", i.e. axis along Y, so each wheel's XY footprint is a
+  # 0.09 x 0.045 rectangle centred at (+-0.1, +-0.0875) -> x +-0.145, y +-0.11.
+  # That the width lands exactly on neupan's own `robot.width: 0.22` is a useful
+  # independent confirmation.  (Treating a rotated cylinder as a bounding square
+  # instead would inflate the half-width to 0.155.)
+  #
+  # NOT inflated.  Gazebo's collision primitives are exactly this union, so
+  # clearance <= 0 means real contact.  Padding it further would manufacture
+  # collisions that never physically happened.
+  half_length: 0.145
+  half_width: 0.11
+  # Warn if the derived footprint differs from the above by more than this.
+  tolerance: 0.02
+
+goal:
+  # Goal distance band.  cspace trained on targets 2.4-3.6 m away and truncated
+  # episodes beyond 4 m (SparrowCspaceEnv D=400 cm), so a longer goal is out of
+  # distribution for it and the comparison would be unfair rather than hard.
+  # The band is widened slightly to 2.2-3.8 to make room for ~11 well-separated
+  # goals: at these clearances an annulus around a single start pose can only
+  # hold so many (see `clearance` below -- loosening the clearance buys more
+  # goals, but at the cost of cspace fairness, so the distance band gives
+  # instead).
+  min_distance: 2.2
+  max_distance: 3.8
+  # Clearance a goal must keep from any obstacle AABB.  Sized for the most
+  # conservative planner: cspace's 0.6 m dilated half-length plus its 0.3 m
+  # arrival tolerance.  A goal inside that ring is one cspace can never reach,
+  # which would hand neupan a free point.
+  clearance: 0.8
+  # Minimum spacing between two goals in the set.
+  separation: 1.0
+  # Minimum distance from the start pose.
+  min_from_start: 1.5
+  # Line-of-sight band.  A goal whose straight line from the start passes closer
+  # than this to an obstacle is rejected: both planners are structurally local
+  # (cspace is reactive on the raw goal bearing, neupan builds a straight initial
+  # path), so such a goal is an architectural limit, not a navigation test.
+  los_margin: 0.35
+  # Difficulty bands on the line-of-sight clearance, reported per bucket.  With
+  # ~12-20 goals an overall success rate is noisy; the per-bucket split plus
+  # Wilson intervals is what makes a difference defensible.
+  #
+  # Thresholds are calibrated to what this arena can actually produce, not picked
+  # a priori: sampling ~10k legal candidates from the start pose gives a LOS
+  # clearance of 0.35 (the floor, set by los_margin) to 1.40 m, median 0.96.  The
+  # cuts below land near the 20th and 75th percentiles, so the three buckets
+  # divide the set rather than piling everything into one.
+  bands:
+    tight: 0.75
+    medium: 1.15     # > tight and <= medium; above medium is "open"
+
+trial:
+  # Success is judged on GROUND TRUTH pose, not on either planner's own
+  # odometry, and the threshold is the looser of the two planners' stop
+  # tolerances (cspace stops at 0.3 m, neupan at 0.2 m).  final_error is reported
+  # for every trial so the threshold cannot hide a difference.
+  success_radius: 0.30
+  # Both planners publish a zero Twist on arrival, so requiring a sustained stop
+  # is a safe extra condition and rejects a robot that merely passes through the
+  # goal radius at speed.
+  success_settle: 0.5
+  # Ground-truth displacement that counts as "the robot started moving".  The
+  # trial clock starts here, not at goal publication, which removes the two
+  # planners' differing startup latency from time-to-goal.
+  motion_epsilon: 0.05
+  # How close the ground-truth pose must be to the start pose for the per-trial
+  # teleport (/gazebo/set_model_state) to count as having taken effect.  The
+  # robot's skid-steer plugin derives odometry from its world pose, so the
+  # teleport moves odom and tf with it -- verified, not assumed.
+  teleport_tolerance: 0.05
+  # Max sim seconds to wait for a planner to ACCEPT a goal, i.e. to publish its
+  # first /cmd_vel after the goal goes out.  This is the readiness handshake, and
+  # it is deliberately observable rather than a fixed sleep: cspace loads a torch
+  # checkpoint and neupan builds its initial path, and until a planner accepts the
+  # goal the robot provably cannot move (no cmd_vel -> no motion).  The goal is
+  # re-published every 2 s until accepted, so a planner that was not yet listening
+  # when the goal first went out still gets it.
+  planner_timeout: 120.0
+  start_timeout: 8.0
+  # Sim seconds, not wall seconds: a loaded GPU box can drop RTF below 1 and a
+  # wall-clock timeout would silently truncate trials.
+  trial_timeout: 90.0
+  # Not at goal and not colliding, but no progress: best distance-to-goal has
+  # improved by less than progress_epsilon over stuck_window while still
+  # commanding motion.  Tracked separately from timeout because cspace's training
+  # env reset on exactly this failure mode, so it is a real, expected outcome.
+  stuck_window: 8.0
+  progress_epsilon: 0.10
+  # Commanded speed above which the robot counts as "trying" (so a robot that has
+  # correctly stopped is never labelled stuck).
+  moving_speed: 0.02
+  # Sample rate for the trial log.
+  log_rate: 20.0
+
+trial_checks:
+  # Lidar proximity cross-check: reported alongside the exact AABB collision
+  # flag, never used as the classifier.  A 240-degree lidar cannot see the
+  # 120 degrees behind it, so proximity alone would miss rear collisions -- which
+  # is precisely the region cspace's training (360-degree) let it ignore.
+  near_miss_distance: 0.15

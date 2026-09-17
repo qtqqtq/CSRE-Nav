@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+
+"""Compare two planner_bench runs side by side.
+
+    python3 report.py reports/cspace_run.json reports/neupan_run.json
+    python3 report.py                      # both files in ../reports/
+
+Pure stdlib and no ROS on purpose: this reads two JSON reports and prints a
+table, and it has to keep working after the simulation is gone.
+
+Two rules the report follows, because both change what the numbers mean:
+
+  * It refuses to compare runs whose world or goal set differ.  A success rate
+    against a different set of goals is not a comparison, it is two unrelated
+    measurements that happen to be printed next to each other.
+
+  * Time to goal is reported as median and IQR, never mean.  It is right
+    censored -- a planner that never arrives has no arrival time, and dropping
+    those trials while averaging the rest flatters whichever planner failed
+    more.  The denominator is printed so the censoring is visible.
+"""
+
+import argparse
+import json
+import math
+import os
+import sys
+
+
+def wilson(k, n, z=1.96):
+    """Wilson score interval for a binomial proportion.
+
+    Not the normal approximation: with n ~ 11 goals and rates near 0 or 1 that
+    interval runs outside [0, 1] and reads as precision the run does not have.
+    """
+    if n == 0:
+        return (float("nan"), float("nan"))
+    p = float(k) / n
+    d = 1.0 + z * z / n
+    c = p + z * z / (2.0 * n)
+    r = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n))
+    return ((c - r) / d, (c + r) / d)
+
+
+def quantile(xs, q):
+    xs = sorted(xs)
+    if not xs:
+        return float("nan")
+    if len(xs) == 1:
+        return xs[0]
+    pos = q * (len(xs) - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
+
+
+def med(xs):
+    return quantile(xs, 0.5)
+
+
+def fmt(x, spec="%.2f", dash="-"):
+    if x is None or x != x:
+        return dash
+    return spec % x
+
+
+class Run(object):
+    def __init__(self, path):
+        with open(path) as fh:
+            self.doc = json.load(fh)
+        self.path = path
+        self.name = self.doc["meta"]["planner"]
+        self.trials = self.doc["trials"]
+        self.by_i = {t["i"]: t for t in self.trials}
+
+    def count(self, verdict):
+        return sum(1 for t in self.trials if t["verdict"] == verdict)
+
+    @property
+    def n(self):
+        return len(self.trials)
+
+    def median_of(self, key, only_verdict=None):
+        vals = [t[key] for t in self.trials
+                if t.get(key) is not None
+                and (only_verdict is None or t["verdict"] == only_verdict)]
+        return med(vals) if vals else None
+
+    def iqr_of(self, key, only_verdict=None):
+        vals = [t[key] for t in self.trials
+                if t.get(key) is not None
+                and (only_verdict is None or t["verdict"] == only_verdict)]
+        if len(vals) < 2:
+            return None
+        return (quantile(vals, 0.25), quantile(vals, 0.75))
+
+    def extreme(self, key, pick=min):
+        vals = [t[key] for t in self.trials if t.get(key) is not None]
+        return pick(vals) if vals else None
+
+    def achieved_speed(self, t):
+        """The robot's real mean speed for one trial.
+
+        Reports written before mean_speed was split recorded the COMMANDED
+        /cmd_vel average under that name, which reads as a healthy 0.18 m/s for
+        a planner whose robot never moved.  Those files are still valid data, so
+        recover the achieved speed from the ground-truth trace they carry rather
+        than either trusting the mislabelled field or discarding the run.
+        """
+        if "mean_cmd_speed" in t:
+            return t.get("mean_speed")
+        log = t.get("log") or []
+        total = span = 0.0
+        for a, b in zip(log, log[1:]):
+            dt = b["t"] - a["t"]
+            if dt <= 0:
+                continue
+            total += math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+            span += dt
+        return total / span if span > 0 else None
+
+    def commanded_speed(self, t):
+        if "mean_cmd_speed" in t:
+            return t.get("mean_cmd_speed")
+        return t.get("mean_speed")
+
+
+VERDICTS = ["success", "collision", "stuck", "timeout", "no_motion",
+            "no_planner", "aborted"]
+
+
+def check_comparable(a, b):
+    """Refuse to print a comparison that would not mean anything."""
+    problems = []
+    wa, wb = a.doc["meta"].get("world_sha1"), b.doc["meta"].get("world_sha1")
+    if wa and wb and wa != wb:
+        # Name the hashes, not just the basenames.  The two runs normally share
+        # a path -- that is the point of a fixed world -- so printing two
+        # identical filenames tells the reader nothing about what went wrong.
+        # The hashes are the thing that actually differs, and the usual cause is
+        # that the world file was edited between the two runs.
+        problems.append("different worlds -- same path, different content "
+                        "(%s: %s vs %s: %s)"
+                        % (a.name, wa[:12], b.name, wb[:12]))
+    ga = os.path.basename(a.doc["meta"].get("goal_set", ""))
+    gb = os.path.basename(b.doc["meta"].get("goal_set", ""))
+    if ga and gb and ga != gb:
+        problems.append("different goal sets (%s vs %s)" % (ga, gb))
+    sa = a.doc["meta"].get("start")
+    sb = b.doc["meta"].get("start")
+    if sa and sb and any(abs(x - y) > 1e-6 for x, y in zip(sa, sb)):
+        problems.append("different start poses (%s vs %s)" % (sa, sb))
+    if a.n != b.n:
+        problems.append("different trial counts (%d vs %d)" % (a.n, b.n))
+    ia, ib = set(a.by_i), set(b.by_i)
+    if ia != ib:
+        problems.append("different goal indices (%s vs %s)"
+                        % (sorted(ia), sorted(ib)))
+    return problems
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("reports", nargs="*",
+                    help="two planner run JSONs; default: every *_run.json in "
+                         "../reports/")
+    ap.add_argument("--out", default=None, help="also write the table to a file")
+    ap.add_argument("--force", action="store_true",
+                    help="print the comparison even if the runs are not comparable")
+    args = ap.parse_args(argv)
+
+    paths = args.reports
+    if not paths:
+        here = os.path.dirname(os.path.abspath(__file__))
+        rdir = os.path.normpath(os.path.join(here, os.pardir, "reports"))
+        if os.path.isdir(rdir):
+            paths = sorted(os.path.join(rdir, f) for f in os.listdir(rdir)
+                           if f.endswith("_run.json"))
+        if len(paths) != 2:
+            sys.exit("expected exactly 2 reports in %s, found %d.  Run both "
+                     "planners first:\n"
+                     "  roslaunch planner_bench bench.launch planner:=cspace\n"
+                     "  roslaunch planner_bench bench.launch planner:=neupan"
+                     % (rdir, len(paths)))
+    if len(paths) != 2:
+        sys.exit("expected exactly 2 reports, got %d" % len(paths))
+
+    a, b = Run(paths[0]), Run(paths[1])
+    problems = check_comparable(a, b)
+    out = []
+    w = out.append
+
+    w("planner_bench comparison")
+    w("=" * 68)
+    meta = a.doc["meta"]
+    w("world     : %s" % os.path.basename(meta["world"]))
+    w("            sha1 %s" % (meta.get("world_sha1") or "-")[:16])
+    w("goal set  : %s (seed %s, %d goals)"
+      % (os.path.basename(meta.get("goal_set", "-")),
+         meta.get("goal_set_seed"), a.n))
+    w("start     : %s" % (meta.get("start"),))
+    w("robot     : %.3f x %.3f m (%s) / %.3f x %.3f m (%s)"
+      % (2 * a.doc["meta"]["robot"]["half_length"],
+         2 * a.doc["meta"]["robot"]["half_width"], a.name,
+         2 * b.doc["meta"]["robot"]["half_length"],
+         2 * b.doc["meta"]["robot"]["half_width"], b.name))
+    w("")
+
+    if problems and not args.force:
+        w("NOT COMPARABLE:")
+        for p in problems:
+            w("  * %s" % p)
+        w("")
+        w("These runs do not share a world, a goal set and a start pose, so a "
+          "difference between them")
+        w("cannot be attributed to the planners.  Re-run both, or pass --force "
+          "to print anyway.")
+        text = "\n".join(out)
+        print(text)
+        if args.out:
+            open(args.out, "w").write(text + "\n")
+        return 1
+    for p in problems:
+        w("WARNING: %s" % p)
+    if problems:
+        w("")
+
+    # ---------------------------------------------------------------- headline
+    w("%-26s %-18s %-18s" % ("", a.name, b.name))
+    w("-" * 68)
+    w("%-26s %-18s %-18s" % ("trials", a.n, b.n))
+
+    for v in VERDICTS:
+        ca, cb = a.count(v), b.count(v)
+        if ca == 0 and cb == 0:
+            continue
+        w("%-26s %-18s %-18s" % (
+            v, "%d  (%.1f%%)" % (ca, 100.0 * ca / a.n),
+            "%d  (%.1f%%)" % (cb, 100.0 * cb / b.n)))
+
+    w("-" * 68)
+    ci = []
+    for run in (a, b):
+        lo, hi = wilson(run.count("success"), run.n)
+        ci.append("%.1f%%  [%.1f, %.1f]" % (
+            100.0 * run.count("success") / run.n, 100 * lo, 100 * hi))
+    w("%-26s %-18s %-18s" % ("success rate", ci[0], ci[1]))
+    w("%-26s %-18s %-18s" % ("  95% Wilson CI", "on %d trials" % a.n,
+                             "on %d trials" % b.n))
+    w("")
+
+    # Censored: only successful trials have an arrival time, so the denominator
+    # is printed rather than implied.
+    w("%-26s %-18s %-18s" % ("time to goal (s)", a.name, b.name))
+    la = "%s  (n=%d)" % (fmt(a.median_of("duration", "success"), "%.1f"),
+                         a.count("success"))
+    lb = "%s  (n=%d)" % (fmt(b.median_of("duration", "success"), "%.1f"),
+                         b.count("success"))
+    w("%-26s %-18s %-18s" % ("median", la, lb))
+    ia, ib = a.iqr_of("duration", "success"), b.iqr_of("duration", "success")
+    w("%-26s %-18s %-18s" % (
+        "  IQR",
+        "%s" % (fmt(ia[0], "%.1f") + " - " + fmt(ia[1], "%.1f") if ia else "-"),
+        "%s" % (fmt(ib[0], "%.1f") + " - " + fmt(ib[1], "%.1f") if ib else "-")))
+    w("")
+
+    def both(label, key, spec, pick=None, only=None):
+        fa = a.extreme(key, pick) if pick else a.median_of(key, only)
+        fb = b.extreme(key, pick) if pick else b.median_of(key, only)
+        w("%-26s %-18s %-18s" % (label, fmt(fa, spec), fmt(fb, spec)))
+
+    w("%-26s %-18s %-18s" % ("outcome quality", a.name, b.name))
+    both("final error (median m)", "final_error", "%.3f")
+    both("min clearance (worst m)", "min_clearance", "%.3f", pick=min)
+    both("path length (median m)", "path_length", "%.2f")
+    # Speed is shown twice on purpose.  Achieved is the robot; commanded is the
+    # planner.  When they diverge the planner is asking for motion it is not
+    # getting, which is a different failure from going slowly -- and averaging
+    # only one of them hides exactly that case.
+    def speed_row(label, getter):
+        vals = []
+        for run in (a, b):
+            v = [getter(t) for t in run.trials]
+            v = [x for x in v if x is not None]
+            vals.append(med(v) if v else None)
+        w("%-26s %-18s %-18s" % (label, fmt(vals[0], "%.3f"),
+                                 fmt(vals[1], "%.3f")))
+
+    speed_row("mean speed achieved (m/s)", a.achieved_speed)
+    speed_row("mean speed commanded (m/s)", a.commanded_speed)
+    both("near-miss samples (med)", "n_near_miss", "%.0f")
+    w("")
+
+    # ------------------------------------------------------------- by goal
+    w("per goal")
+    w("%-4s %-8s %-7s %-22s %-22s" % ("i", "band", "dist", a.name, b.name))
+    w("-" * 68)
+    agree = {"both": 0, "neither": 0, "a_only": 0, "b_only": 0}
+    for i in sorted(set(a.by_i) & set(b.by_i)):
+        ta, tb = a.by_i[i], b.by_i[i]
+        band = ta["goal"].get("band", "-")
+        dist = ta["goal"].get("distance", float("nan"))
+        sa = ta["verdict"] == "success"
+        sb = tb["verdict"] == "success"
+        if sa and sb:
+            agree["both"] += 1
+        elif sa:
+            agree["a_only"] += 1
+        elif sb:
+            agree["b_only"] += 1
+        else:
+            agree["neither"] += 1
+
+        def cell(t, ok):
+            extra = ("%.1fs" % t["duration"]) if ok else (
+                "%.2fm off" % t["final_error"] if t.get("final_error") is not None
+                else "-")
+            return "%-9s %s" % (t["verdict"], extra)
+
+        w("%-4d %-8s %-7s %-22s %-22s"
+          % (i, band, fmt(dist, "%.2f"), cell(ta, sa), cell(tb, sb)))
+    w("")
+    w("%-26s %-18s %-18s" % ("paired outcome", a.name, b.name))
+    w("%-26s %d" % ("both succeed", agree["both"]))
+    w("%-26s %d" % ("both fail", agree["neither"]))
+    w("%-26s %d" % ("only %s" % a.name, agree["a_only"]))
+    w("%-26s %d" % ("only %s" % b.name, agree["b_only"]))
+    w("")
+
+    # ------------------------------------------------------------ by band
+    bands = []
+    for i in sorted(set(a.by_i) & set(b.by_i)):
+        bd = a.by_i[i]["goal"].get("band")
+        if bd and bd not in bands:
+            bands.append(bd)
+    if bands:
+        w("by difficulty band (line-of-sight clearance from the start pose)")
+        w("%-10s %-24s %-24s" % ("band", a.name, b.name))
+        w("-" * 68)
+        for bd in bands:
+            idx = [i for i in a.by_i if a.by_i[i]["goal"].get("band") == bd]
+            sa = sum(1 for i in idx if a.by_i[i]["verdict"] == "success")
+            sb = sum(1 for i in idx if b.by_i[i]["verdict"] == "success")
+            w("%-10s %-24s %-24s"
+              % (bd, "%d/%d  (%.0f%%)" % (sa, len(idx), 100.0 * sa / len(idx)),
+                 "%d/%d  (%.0f%%)" % (sb, len(idx), 100.0 * sb / len(idx))))
+        w("")
+
+    # --------------------------------------------------------- the caveats
+    w("known asymmetries -- not normalised, and they are not symmetric")
+    w("-" * 68)
+    for line in [
+        "footprint: both planners are scored with the same ground-truth robot,",
+        "  but cspace's POLICY was trained to dilate obstacles by a 1.20 x 0.14 m",
+        "  footprint while the Limo is 0.29 x 0.22 m.  Changing it would take the",
+        "  checkpoint off its training distribution, so it stands: cspace keeps",
+        "  ~0.6 m of fore/aft clearance and is genuinely handicapped in tight",
+        "  gaps.  This is the one asymmetry config alone cannot remove.",
+        "lidar FOV: the Limo scans 240 deg; cspace trained on 360 deg and has",
+        "  allow_reverse enabled, so its rear 120 deg is blind here.",
+        "control rate: cspace 10 Hz, neupan 50 Hz.  Reported, not equalised.",
+        "speed caps: cspace +/-0.5 m/s; neupan ref_speed 0.3.",
+        "stop thresholds: cspace stops at 0.3 m, neupan at 0.2 m.  Both are",
+        "  scored against the same success_radius, with final_error shown.",
+    ]:
+        w(line)
+
+    text = "\n".join(out)
+    print(text)
+    if args.out:
+        with open(args.out, "w") as fh:
+            fh.write(text + "\n")
+        print("\nwrote %s" % args.out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

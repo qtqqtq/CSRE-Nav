@@ -1,0 +1,162 @@
+{
+  "goals": [
+    {
+      "band": "tight",
+      "distance": 3.4115,
+      "i": 0,
+      "los_clearance": 0.602,
+      "x": -1.2027,
+      "y": -4.1552,
+      "yaw": -1.180704
+    },
+    {
+      "band": "medium",
+      "distance": 2.3603,
+      "i": 1,
+      "los_clearance": 1.0658,
+      "x": -3.9342,
+      "y": 0.8746,
+      "yaw": 2.223873
+    },
+    {
+      "band": "open",
+      "distance": 2.568,
+      "i": 2,
+      "los_clearance": 1.1581,
+      "x": -2.8657,
+      "y": 1.5419,
+      "yaw": 1.713685
+    },
+    {
+      "band": "tight",
+      "distance": 2.9543,
+      "i": 3,
+      "los_clearance": 0.3703,
+      "x": -3.8867,
+      "y": -3.6086,
+      "yaw": -2.059394
+    },
+    {
+      "band": "medium",
+      "distance": 2.3462,
+      "i": 4,
+      "los_clearance": 1.0038,
+      "x": -0.6288,
+      "y": -2.4153,
+      "yaw": -0.647559
+    },
+    {
+      "band": "open",
+      "distance": 2.3041,
+      "i": 5,
+      "los_clearance": 1.402,
+      "x": -1.3227,
+      "y": 0.9806,
+      "yaw": 1.034493
+    },
+    {
+      "band": "tight",
+      "distance": 2.3432,
+      "i": 6,
+      "los_clearance": 0.6472,
+      "x": -1.5311,
+      "y": -3.1335,
+      "yaw": -1.144508
+    },
+    {
+      "band": "medium",
+      "distance": 3.2857,
+      "i": 7,
+      "los_clearance": 0.8657,
+      "x": 0.5837,
+      "y": 0.1343,
+      "yaw": 0.352476
+    },
+    {
+      "band": "open",
+      "distance": 2.3007,
+      "i": 8,
+      "los_clearance": 1.2705,
+      "x": -0.4227,
+      "y": -0.0112,
+      "yaw": 0.444266
+    },
+    {
+      "band": "medium",
+      "distance": 3.4769,
+      "i": 9,
+      "los_clearance": 0.9567,
+      "x": -0.5817,
+      "y": 1.8998,
+      "yaw": 0.986359
+    },
+    {
+      "band": "medium",
+      "distance": 3.6556,
+      "i": 10,
+      "los_clearance": 0.9126,
+      "x": -3.9459,
+      "y": 2.3575,
+      "yaw": 1.977441
+    }
+  ],
+  "meta": {
+    "bands": {
+      "medium": 1.15,
+      "tight": 0.75
+    },
+    "bounds": [
+      -5.0,
+      5.0,
+      -5.0,
+      5.0
+    ],
+    "generator": "planner_bench/scripts/gen_goals.py",
+    "goal_thresholds": {
+      "bands": {
+        "medium": 1.15,
+        "tight": 0.75
+      },
+      "clearance": 0.8,
+      "los_margin": 0.35,
+      "max_distance": 3.8,
+      "min_distance": 2.2,
+      "min_from_start": 1.5,
+      "separation": 1.0
+    },
+    "n": 11,
+    "rejected": {
+      "distance": 0,
+      "los": 61,
+      "obstacle": 5721,
+      "start": 0
+    },
+    "robot": {
+      "half_length": 0.145,
+      "half_width": 0.11,
+      "tolerance": 0.02
+    },
+    "seed": 0,
+    "start": [
+      -2.5,
+      -1.0,
+      0.0
+    ],
+    "trial": {
+      "log_rate": 20.0,
+      "motion_epsilon": 0.05,
+      "moving_speed": 0.02,
+      "planner_timeout": 120.0,
+      "progress_epsilon": 0.1,
+      "start_timeout": 8.0,
+      "stuck_window": 8.0,
+      "success_radius": 0.3,
+      "success_settle": 0.5,
+      "teleport_tolerance": 0.05,
+      "trial_timeout": 90.0
+    },
+    "world": "worlds/bench_arena.world",
+    "world_sha1": "9271d235239ba295bae8113a292e5989f115e25d",
+    "yaw_used_by": "neupan_only"
+  }
+}

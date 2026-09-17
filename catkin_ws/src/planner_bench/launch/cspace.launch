@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!--
+  The CNN-SAC c-space policy node, alone.
+
+  Declares the node directly rather than <include>-ing
+  sac_cspace_ros/launch/sac_cspace.launch, for two reasons: that launch is
+  `required="true"` (fine) but also optionally spawns a send_goal.py node, and a
+  goal published by the launch file racing the harness's own goal is a
+  nondeterminism the bench cannot afford.
+
+  No file in sac_cspace_ros is modified: the /r1 prefix lives only in its config
+  YAML, so pointing `~`-params at planner_bench's own Limo profile is enough.
+-->
+<launch>
+  <arg name="config" default="$(find planner_bench)/config/sac_cspace_limo.yaml"/>
+  <arg name="model_name" default="dense_sample_cspace_3"/>
+  <arg name="device" default="cuda"/>
+  <arg name="sac_dir" default="/DRL-robot-navigation/SAC"/>
+
+  <node pkg="sac_cspace_ros" type="sac_cspace_node.py" name="sac_cspace_node"
+        output="screen" required="true">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="model_name" value="$(arg model_name)"/>
+    <param name="device" value="$(arg device)"/>
+    <param name="sac_dir" value="$(arg sac_dir)"/>
+  </node>
+</launch>

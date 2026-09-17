@@ -1,0 +1,77 @@
+<?xml version="1.0"?>
+<!--
+  One-command entry point for the shared cspace / neupan benchmark.
+
+    roslaunch planner_bench bench.launch planner:=cspace
+    roslaunch planner_bench bench.launch planner:=neupan
+
+  Both runs use the SAME world, the SAME robot, the SAME goal file and the SAME
+  harness - only `planner` differs.  That is the whole point: the comparison is
+  a post-hoc diff of two JSON reports (report.py), not something one run
+  produces, because only one planner is up at a time.
+
+  All <arg>s are declared before any consumer.  roslaunch walks the document in
+  order and mutates the arg context as it goes, so a <group> that reads an arg
+  declared below it raises ArgException.
+-->
+<launch>
+  <arg name="planner" default="cspace" doc="cspace | neupan"/>
+  <arg name="world" default="$(find planner_bench)/worlds/bench_arena.world"/>
+  <arg name="gui" default="true"/>
+  <arg name="harness" default="true" doc="false to bring up sim+planner only"/>
+
+  <arg name="start_x" default="-2.5"/>
+  <arg name="start_y" default="-1.0"/>
+  <arg name="start_yaw" default="0.0"/>
+
+  <arg name="cspace_config" default="$(find planner_bench)/config/sac_cspace_limo.yaml"/>
+  <arg name="cspace_model" default="dense_sample_cspace_3"/>
+  <arg name="cspace_device" default="cuda"/>
+  <arg name="sac_dir" default="/DRL-robot-navigation/SAC"/>
+
+  <arg name="neupan_config" default="$(find planner_bench)/config/neupan_limo_bench.yaml"/>
+  <arg name="neupan_ckpt"
+       default="$(find neupan_ros)/example/gazebo_limo/pretrain_limo/model_5000.pth"/>
+
+  <arg name="goal_set" default="$(find planner_bench)/config/goal_sets/bench_seed0.json"/>
+  <arg name="report_dir" default="$(find planner_bench)/reports"/>
+  <arg name="trial_timeout" default="90.0"/>
+
+  <include file="$(find planner_bench)/launch/sim.launch">
+    <arg name="world" value="$(arg world)"/>
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="x" value="$(arg start_x)"/>
+    <arg name="y" value="$(arg start_y)"/>
+    <arg name="yaw" value="$(arg start_yaw)"/>
+  </include>
+
+  <!-- arg('planner') rather than a bare `planner`: both evaluate correctly in
+       this roslaunch, but the accessor form is the documented idiom. -->
+  <group if="$(eval arg('planner') == 'cspace')">
+    <include file="$(find planner_bench)/launch/cspace.launch">
+      <arg name="config" value="$(arg cspace_config)"/>
+      <arg name="model_name" value="$(arg cspace_model)"/>
+      <arg name="device" value="$(arg cspace_device)"/>
+      <arg name="sac_dir" value="$(arg sac_dir)"/>
+    </include>
+  </group>
+
+  <group if="$(eval arg('planner') == 'neupan')">
+    <include file="$(find planner_bench)/launch/neupan.launch">
+      <arg name="config_file" value="$(arg neupan_config)"/>
+      <arg name="dune_checkpoint" value="$(arg neupan_ckpt)"/>
+      <arg name="map_frame" value="odom"/>
+      <arg name="base_frame" value="base_link"/>
+      <arg name="lidar_frame" value="laser_link"/>
+    </include>
+  </group>
+
+  <node if="$(arg harness)" pkg="planner_bench" type="bench.py" name="bench_harness"
+        output="screen" required="false"
+        args="--planner $(arg planner)
+              --goals $(arg goal_set)
+              --world $(arg world)
+              --out $(arg report_dir)/$(arg planner)_run.json
+              --start $(arg start_x) $(arg start_y) $(arg start_yaw)
+              --timeout $(arg trial_timeout)"/>
+</launch>
