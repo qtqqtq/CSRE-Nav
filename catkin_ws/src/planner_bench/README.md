@@ -162,9 +162,15 @@ already-running sim. `gui:=false` is the default in `run_bench.sh` and worth
 keeping when timing anything — the GUI steals CPU from the physics and sim time
 is what the trials are measured in.
 
-One trial is up to `trial_timeout` (90 s) of sim time, which headless runs at
-roughly wall-clock rate, so budget ~90 s per goal plus ~20 s of startup: a full
-11-goal run is about 20 minutes, the three-goal control about 5.
+One trial is capped at `trial_timeout` (90 s) of sim time, which headless runs at
+roughly wall-clock rate, and each trial adds ~6 s of teleport/settle/onset
+overhead. Measured on the committed set: cspace 176 s of trial time, neupan
+120 s, so a full run is **4–5 minutes per planner** and about 10 for `both`
+including startup and the resets. The three-goal control is ~3.5 minutes.
+
+None of that is the worst case — a planner that times out on every goal pays the
+full 90 s each time, which is what makes the negative control's two unreachable
+goals cost 180 s between them.
 
 ## Verifying the bench itself
 
