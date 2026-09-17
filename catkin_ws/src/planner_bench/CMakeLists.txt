@@ -28,6 +28,16 @@ catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+# The two drivers are shell, not python, so they do not go through
+# catkin_install_python -- that rewrites shebangs for python and has no business
+# touching these.  Same destination, so `rosrun planner_bench run_bench.sh` and
+# `rosrun planner_bench reset_ros.sh` resolve.
+install(PROGRAMS
+  scripts/run_bench.sh
+  scripts/reset_ros.sh
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 install(DIRECTORY launch config worlds
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )

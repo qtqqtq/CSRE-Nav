@@ -113,28 +113,58 @@ src/bench_common.py         world parsing, ground-truth collision, URDF footprin
 scripts/gen_goals.py        seeded goal generation + the negative control
 scripts/bench.py            the harness: handshake, teleport, measure, verdict
 scripts/report.py           side-by-side comparison; pure stdlib, runs without ROS
+scripts/run_bench.sh        driver: reset, run a planner, wait, print verdicts
+scripts/reset_ros.sh        kill ROS/Gazebo and prove it, before each run
 reports/*_run.json          the harness output that report.py reads
 ```
 
 ## Running it
 
 ```bash
-cd catkin_ws && catkin_make -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && source devel/setup.bash
+cd catkin_ws && catkin_make -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+source /opt/ros/noetic/setup.bash && source devel/setup.bash
 
-# 1. the goal set (once; committed, and both runs must use the same file)
-rosrun planner_bench gen_goals.py --check
+# everything, in order: reset, cspace, reset, neupan, comparison table
+rosrun planner_bench run_bench.sh both
+```
 
-# 2. each planner over the same goals
-roslaunch planner_bench bench.launch planner:=cspace
+Or step by step, if you want to watch each stage:
+
+```bash
+rosrun planner_bench gen_goals.py --check      # goal set reproduces (committed)
+roslaunch planner_bench bench.launch planner:=cspace    # add gui:=false headless
 roslaunch planner_bench bench.launch planner:=neupan
-
-# 3. compare
 rosrun planner_bench report.py
+```
+
+**Reset between runs.** `run_bench.sh` does it for you; doing it by hand means
+`rosrun planner_bench reset_ros.sh`, and it must print `clean` before you start.
+A rosmaster or gzserver left over from the previous planner does not announce
+itself as a port conflict — it attaches the new run to the old master and you get
+a robot that does not move and a report full of `no_motion` that looks exactly
+like a planner bug.
+
+Useful overrides, all passed straight through to `roslaunch`:
+
+```bash
+# the negative control, into a scratch directory so it cannot overwrite the
+# benchmark's own reports
+PLANNER_BENCH_REPORT_DIR=/tmp/negctl rosrun planner_bench run_bench.sh both \
+    goal_set:=$(rospack find planner_bench)/config/goal_sets/negcontrol.json
+
+roslaunch planner_bench bench.launch planner:=cspace gui:=true   # watch it
+roslaunch planner_bench bench.launch planner:=neupan harness:=false
 ```
 
 `harness:=false` brings up the sim and the planner without the harness, which is
 what you want when driving trials by hand or attaching `bench.py` to an
-already-running sim.
+already-running sim. `gui:=false` is the default in `run_bench.sh` and worth
+keeping when timing anything — the GUI steals CPU from the physics and sim time
+is what the trials are measured in.
+
+One trial is up to `trial_timeout` (90 s) of sim time, which headless runs at
+roughly wall-clock rate, so budget ~90 s per goal plus ~20 s of startup: a full
+11-goal run is about 20 minutes, the three-goal control about 5.
 
 ## Verifying the bench itself
 
