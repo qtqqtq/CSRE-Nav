@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from settings import LOG_STD_MIN, LOG_STD_MAX
+from settings import KINEMATIC_DIM, LOG_STD_MIN, LOG_STD_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ class CNNActor(nn.Module):
       → MLP [400 → 300 → action_dim*2] → (mean, log_std)
     """
 
-    def __init__(self, kinematic_dim=4, action_dim=2,
+    def __init__(self, kinematic_dim=KINEMATIC_DIM, action_dim=2,
                  h_beams=36, v_layers=4, cnn_feature_dim=64):
         super().__init__()
 
@@ -173,7 +173,7 @@ class CNNCritic(nn.Module):
                                    → Q2 MLP [400→300→1]
     """
 
-    def __init__(self, kinematic_dim=4, action_dim=2,
+    def __init__(self, kinematic_dim=KINEMATIC_DIM, action_dim=2,
                  h_beams=36, v_layers=4, cnn_feature_dim=64):
         super().__init__()
 
@@ -253,7 +253,7 @@ class CNNSAC(object):
     once train() has run >= tensorboard_min_iters times (see _ensure_writer).
     """
 
-    def __init__(self, kinematic_dim=4, action_dim=2, max_action=1,
+    def __init__(self, kinematic_dim=KINEMATIC_DIM, action_dim=2, max_action=1,
                  h_beams=36, v_layers=4, cnn_feature_dim=64,
                  lr=1e-4, alpha_lr=3e-4, device='cpu',
                  safety_reward_weight=1.0, speed_reward_weight=1.0,

@@ -6,13 +6,18 @@ sac_cspace_core -- ROS 1 wrapper for the CNN-SAC c-space (NavRL) navigation poli
 The policy is the cost-ray CNN actor trained on `Sparrow_V2.SparrowCspaceEnv`.
 Its observation is
 
-    state = flatten( preprocess(cost_rays) ) + [distance, heading, v_lin, v_ang]
-              |__ num_beams x nz cost rays __|  |__________ 4 __________|
+    state = flatten( preprocess(cost_rays) ) + [distance, heading]
+              |__ num_beams x nz cost rays __|  |_____ 2 _____|
 
 where the cost rays are built from the robot's line-of-sight lidar hits, exactly
 as `SparrowCspaceEnv._build_occ_grid()` does.  This node rebuilds that observation
 from live ROS sensor data using the same pure-numpy/torch helpers in
 `SAC/cspace_cost_rays.py`, so it needs neither Gazebo nor the C++ c_space_mapper.
+
+The kinematic block is `[distance (m), heading_error (rad)]`.  It previously also
+carried the previous action command (v_lin, v_ang); that feedback was removed from
+the training env, so checkpoints trained before the change (feat+4 in `layer_1`)
+cannot load here and must be retrained -- see `_load_actor`.
 
 THREE things differ between the checkpoint families in `SAC/pytorch_models/`, and
 each is a knob here:
@@ -202,6 +207,34 @@ def wrap_to_pi(angle):
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
+# Size of the kinematic block appended to the cost rays: [distance, heading].
+# Kept in sync with SAC/settings.py KINEMATIC_DIM.
+KINEMATIC_DIM = 2
+
+
+def _kin_dim_of(state_dict, feature_dim, name=None):
+    """Sniff the kinematic-block width out of an actor state dict.
+
+    The block is concatenated with the CNN features and goes into `layer_1`, so
+    that layer's input width is the checkpoint's only remaining trace of it.
+    Checkpoints trained before the previous-action feedback was removed carried
+    `[dist, heading, v_lin, v_ang]` and can no longer be loaded.
+
+    Returns the width, or raises ValueError with a readable message.  Shared by
+    the node and check_models.py so the two cannot disagree about the layout.
+    """
+    kin_dim = state_dict["layer_1.weight"].shape[1] - feature_dim
+    if kin_dim != KINEMATIC_DIM:
+        raise ValueError(
+            "%swas trained with a %d-dim kinematic block (layer_1 expects "
+            "feature_dim+%d), but this build uses %d ([distance, heading]). "
+            "Checkpoints predating the removal of the previous-action feedback "
+            "carried [dist, heading, v_lin, v_ang] and must be retrained."
+            % ("checkpoint '%s' " % name if name else "", kin_dim, kin_dim,
+               KINEMATIC_DIM))
+    return kin_dim
+
+
 class SacCspaceCore(object):
     """Subscribes to a laser scan + odometry + goal, publishes velocity commands."""
 
@@ -279,7 +312,6 @@ class SacCspaceCore(object):
         self.robot_state = None        # np.array([x, y, yaw]) in `map_frame`
         self.goal = None               # np.array([x, y])
         self.occ_grid = None
-        self.last_action = np.zeros(2, dtype=np.float32)   # previous command, in [-1,1]
         self.arrived = False
 
         self.vel_pub = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
@@ -298,7 +330,7 @@ class SacCspaceCore(object):
                       "-> ray_grid=%dx%d, occ_grid=%dx%d, state_dim=%d",
                       self.nz, self.a, self.g_min, self.max_range, self.num_beams,
                       self.num_beams, self.nz, self.G, self.G,
-                      self.num_beams * self.nz + 4)
+                      self.num_beams * self.nz + KINEMATIC_DIM)
         rospy.loginfo("sac_cspace: ray_frame=%s preprocess=%s scale=(%.2f m/s, %.2f rad/s) "
                       "rate=%.1f Hz", self.ray_frame, self.preprocess,
                       self.v_linear_max, self.v_angular_max, self.rate_hz)
@@ -340,7 +372,12 @@ class SacCspaceCore(object):
         actor = actor_cls(
             backbone_cls(in_channels=1, h_beams=self.num_beams, v_layers=self.nz,
                          feature_dim=self.feature_dim),
-            self.feature_dim, 4, 2)
+            self.feature_dim, KINEMATIC_DIM, 2)
+
+        # Same idea for the kinematic block: a checkpoint from before the
+        # previous-action feedback was removed expects feature_dim + 4, and would
+        # otherwise fail with an opaque shape mismatch on layer_1.
+        _kin_dim_of(state, self.feature_dim, self.model_name)
 
         # The ray grid comes from the config; the checkpoint pins only the fc
         # width, which is a product of both axes.  Compare *those* first so the
@@ -384,7 +421,6 @@ class SacCspaceCore(object):
         self.goal = np.array([msg.pose.position.x, msg.pose.position.y],
                              dtype=np.float64)
         self.arrived = False
-        self.last_action[:] = 0.0
         rospy.loginfo("sac_cspace: new goal (%.2f, %.2f)", self.goal[0], self.goal[1])
         if self.publish_debug:
             self._publish_goal_marker()
@@ -451,7 +487,7 @@ class SacCspaceCore(object):
 
     # ------------------------------------------------------------- inference
     def _build_state(self):
-        """Assemble the (1, B*nz + 4) observation plus the raw rays."""
+        """Assemble the (1, B*nz + KINEMATIC_DIM) observation plus the raw rays."""
         if self.occ_grid is None:
             # No usable return: the world is free within the horizon, which is
             # exactly what an empty occupancy grid encodes.
@@ -479,8 +515,7 @@ class SacCspaceCore(object):
         # atan2(robot - goal) + pi/2 - yaw formulation.
         heading = wrap_to_pi(math.atan2(dy, dx) - self.robot_state[2])
 
-        kin = torch.tensor([[distance, heading, float(self.last_action[0]),
-                             float(self.last_action[1])]],
+        kin = torch.tensor([[distance, heading]],
                            dtype=torch.float32, device=self.device)
         return torch.cat([cr, kin], dim=1), rays, distance
 
@@ -522,15 +557,11 @@ class SacCspaceCore(object):
                 if not self.arrived:
                     rospy.loginfo("sac_cspace: goal reached (%.2f m)", distance)
                 self.arrived = True
-                self.last_action[:] = 0.0
                 self.vel_pub.publish(Twist())
                 rate.sleep()
                 continue
 
             self.arrived = False
-            # The state's last two terms are the *command*, not the measured
-            # velocity -- exactly what the env feeds back as `current_a`.
-            self.last_action[:] = action
             self.vel_pub.publish(self._command_to_twist(action))
 
             if self.publish_debug:

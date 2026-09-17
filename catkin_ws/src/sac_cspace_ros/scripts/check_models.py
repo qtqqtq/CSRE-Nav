@@ -27,8 +27,8 @@ for _p in (_HERE, os.path.join(_HERE, os.pardir, "src")):
 import torch
 import yaml
 
-from sac_cspace_core import _ActorDeterministic, _ActorStochastic, _arch_of
-from sac_cspace_core import _BackboneNew, _BackboneOld
+from sac_cspace_core import (KINEMATIC_DIM, _ActorDeterministic, _ActorStochastic,
+                             _arch_of, _BackboneNew, _BackboneOld, _kin_dim_of)
 
 # models this node supports are the CNN c-space actors; the MLP SAC_laser_* and
 # the *_critic.pth files are not
@@ -59,8 +59,16 @@ def check(name, cfg, sac_dir):
     actor = actor_cls(
         backbone_cls(in_channels=1, h_beams=cfg["cost_ray_num_beams"],
                      v_layers=cfg["nz"], feature_dim=feature_dim),
-        feature_dim, 4, 2)
+        feature_dim, KINEMATIC_DIM, 2)
     detail = "backbone=%s head=%s feature_dim=%d" % (backbone, head, feature_dim)
+
+    # A checkpoint from before the previous-action feedback was removed is not a
+    # config mismatch but a stale model: report it as a FAIL (not a skip) so
+    # "3/11 ok" cannot quietly mean "3 loadable".
+    try:
+        _kin_dim_of(state, feature_dim, name)
+    except ValueError as exc:
+        return False, "%s -- %s" % (detail, exc)
 
     want = state["cnn.fc.weight"].shape[1]
     got = actor.cnn.fc.weight.shape[1]
@@ -90,15 +98,18 @@ def check(name, cfg, sac_dir):
                         max_range=cfg["cost_ray_max_range"], g_min=g_min)
     cr = preprocess_cost_rays(rays, max_range=cfg["cost_ray_max_range"]).reshape(1, -1)
 
-    kin = torch.tensor([[2.0, 0.1, 0.0, 0.0]], dtype=torch.float32)
+    # kinematic block: [distance (m), heading (rad)], same as the node's _build_state
+    kin = torch.zeros(1, KINEMATIC_DIM)
+    kin[0, 0], kin[0, 1] = 2.0, 0.1
     with torch.no_grad():
         action = actor.get_mean_action(cr.reshape(1, 1, beams, nz), kin)
     a = action.reshape(-1)
     if a.numel() != 2 or not torch.isfinite(a).all() or (a.abs() > 1.0 + 1e-6).any():
         return False, "%s -- bad action %s" % (detail, a.tolist())
 
-    return True, ("%s | rays %s -> state %d | action [%.3f, %.3f]"
-                  % (detail, tuple(rays.shape), cr.shape[1], a[0], a[1]))
+    return True, ("%s | rays %s -> state %d (+%d kinematic) | action [%.3f, %.3f]"
+                  % (detail, tuple(rays.shape), cr.shape[1], KINEMATIC_DIM,
+                     a[0], a[1]))
 
 
 def main(argv):

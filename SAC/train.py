@@ -7,8 +7,8 @@ instead of the Gazebo `laser_env.GazeboEnv`, collecting N transitions per step
 batched on the GPU.
 
 State / action conventions:
-    - state  : (N, RAY_H_BEAMS×RAY_V_LAYERS + 4) = flatten(preprocessed cost_rays)
-               + [dist, heading, v_lin, v_ang]   (currently 36×30 + 4 = 1084)
+    - state  : (N, RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM) = flatten(preprocessed
+               cost_rays) + [dist, heading]   (currently 36×30 + 2 = 1082)
     - action : actor outputs tanh(-1,1); env receives
                a_in = settings.map_continuous_action(action)
                (linear a0 in [-1,1] when settings.ALLOW_REVERSE else [0,1];

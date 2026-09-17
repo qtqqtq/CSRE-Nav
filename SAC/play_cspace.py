@@ -10,8 +10,8 @@ Usage (inside the container, with a display / GPU):
     python3 play_cspace.py --ModelName SAC_sparrow_cspace --dvc cuda
     python3 play_cspace.py --ModelName SAC_sparrow_cspace --dvc cuda --global_plan
 
-The model consumes the (RAY_H_BEAMS×RAY_V_LAYERS + 4)-dim c-space state
-(currently 36×30 + 4 = 1084 cost-ray grid + kinematic), so it must have been
+The model consumes the (RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim c-space state
+(currently 36×30 + 2 = 1082 cost-ray grid + [dist, heading]), so it must have been
 trained on `SparrowCspaceEnv` (e.g. `SAC_sparrow_cspace`).
 
 With `--global_plan`, clicking the map plans a global path in the c-space graph

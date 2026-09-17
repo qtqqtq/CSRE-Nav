@@ -10,13 +10,26 @@ velocity commands:
 /r1/front_laser/scan ─┐
 /r1/odom ─────────────┼─→ occ grid → c-space → 36×nz cost rays → log encode ─┐
 /sac_cspace/goal ─────┘                                                       ├─→ actor → /r1/cmd_vel
-                              [distance, heading, prev_action] ───────────────┘
+                                    [distance, heading] ──────────────────────┘
 ```
 
 It calls the same pure-numpy/torch helpers the training env uses
 (`SAC/cspace_cost_rays.py: make_footprint_masks / build_cspace / cost_rays_3d /
 preprocess_cost_rays`), so **no Gazebo and no C++ `c_space_mapper` node are
 required** — just a laser scan, odometry and a tf tree.
+
+> ### ⚠ Breaking change: the kinematic block is now `[distance, heading]`
+>
+> The observation used to append the previous action command on top of
+> `[distance, heading]`, making `state` 1084-dim. That action feedback was removed
+> from the training env, so the state is now **1082-dim** (`36×30 + 2`).
+>
+> **Every checkpoint currently in `SAC/pytorch_models/` predates this change and
+> can no longer be loaded.** `check_models.py` reports `0/11 ok`, and the node
+> refuses to start with a message naming the offending model and saying it must be
+> retrained. That is the intended behaviour, not a regression — retrain with
+> `SAC/train.py` (it reads `settings.KINEMATIC_DIM`, so nothing else needs
+> editing) and the config profiles below apply to the new checkpoint as-is.
 
 ## Quick start
 
@@ -93,10 +106,12 @@ policy, which is why they are explicit config knobs rather than hardcoded.
    quantisation; `ray_frame: ros` is the un-mirrored variant the old C++ mapper
    produced.
 
-2. **The state's last two entries are the *command*, not the measured velocity.**
-   The env feeds its own previous action (`current_a ∈ [-1,1]`) back into
-   `state[1082:1084]`, not the filtered wheel speeds. The node does the same — do
-   not "improve" it by substituting odometry.
+2. **The kinematic block is `[distance, heading]` only.** The observation used to
+   also append the previous action command (`v_lin, v_ang`), making it
+   `[dist, heading, v_lin, v_ang]`; that feedback was removed from the training env
+   and no longer exists here. The consequence: **checkpoints trained before the
+   change carry a `feature_dim + 4` first actor layer and cannot load** — the node
+   detects this and tells you to retrain rather than failing with a shape mismatch.
 
 Also worth knowing: the cost rays are quantised to 0.05 m march steps on a 0.1 m
 grid, so raw values can reach ~3.05 m before the log encoding clips them at
@@ -131,10 +146,13 @@ marked occupied (there is no ray-traced clearing). A real laser gives a richer g
 ## Tools
 
 - `check_models.py` — load every checkpoint against a config and run one
-  observation→action step; catches a config/checkpoint mismatch before a rollout.
+  observation→action step; catches both a config/checkpoint geometry mismatch and
+  a checkpoint too old to load (wrong kinematic block), before a rollout.
   ```bash
   rosrun sac_cspace_ros check_models.py --config config/sac_cspace_legacy_sparrow.yaml
   ```
+  It shares `_kin_dim_of` and `KINEMATIC_DIM` with the node, so it cannot report a
+  model as loadable that the node would reject.
 - `send_goal.py` — publish a goal `PoseStamped`.
   ```bash
   rosrun sac_cspace_ros send_goal.py 3.0 3.0 --frame odom

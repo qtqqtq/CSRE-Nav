@@ -1108,12 +1108,15 @@ observation live in a single module.
 # This "stitches" the NavRL-style configuration-space cost-ray pipeline
 # (`cspace_cost_rays.py`) into ColorDynamic's GPU-vectorized `Sparrow` simulator,
 # replacing the Gazebo/c_space_mapper ROS pipeline.  The observation is exactly the
-# (RAY_H_BEAMS×RAY_V_LAYERS + 4)-dim CNN state consumed by `cnn_network.py` /
-# `train.py` (currently 36×30 + 4 = 1084; geometry comes from
+# (RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim CNN state consumed by
+# `cnn_network.py` / `train.py` (currently 36×30 + 2 = 1082; geometry comes from
 # `settings.CSPACE_*`):
 #
-#     state = flatten( preprocess(cost_rays) ) + [distance, heading, v_lin, v_ang]
-#               |__ RAY_H_BEAMS × RAY_V_LAYERS __|  |___________ 4 ____________|
+#     state = flatten( preprocess(cost_rays) ) + [distance, heading]
+#               |__ RAY_H_BEAMS × RAY_V_LAYERS __|  |_____ 2 _____|
+#
+# (the kinematic block used to include the previous action command, [v_lin, v_ang];
+# that feedback was removed — see settings.KINEMATIC_DIM)
 #
 # matching `laser_env.step()` (CNN mode), where:
 #     cost_rays : (36 beams × 30 theta layers) NavRL cost rays, metres
@@ -1163,10 +1166,11 @@ class SparrowCspaceEnv(Sparrow):
     """Sparrow-V2 with a c-space (NavRL) observation.
 
     Use exactly like `Sparrow`, but `reset()`/`step()` return the cost-ray c-space
-    CNN state (B*nz + 4 dims, currently 36×30+4 = 1084) instead of the default
-    lidar state.  Defaults to the Continuous action (action_dim=2); set
+    CNN state (B*nz + KINEMATIC_DIM dims, currently 36×30+2 = 1082) instead of the
+    default lidar state.  Defaults to the Continuous action (action_dim=2); set
     `action_type='Discrete'` for the 7-way discrete action (the last two state
-    terms then hold the mapped `a_state` velocities).
+    terms are then the mapped `a_state` velocities — discrete mode is *not* part of
+    the current CNN pipeline and was not re-verified after the block shrank).
     """
 
     def __init__(self, **params):
@@ -1365,14 +1369,6 @@ class SparrowCspaceEnv(Sparrow):
         alpha = beta - self.car_state[:, 2]                      # heading error
         return (alpha + torch.pi) % (2 * torch.pi) - torch.pi
 
-    def _action_to_v(self, current_a):
-        """Return the (N,2) velocity command held in the last two state terms."""
-        if current_a is None:
-            return torch.zeros(self.N, 2, device=self.dvc)
-        if self.action_type == "Continuous":
-            return current_a
-        return self.a_state[current_a]                            # (N,2)
-
     # ------------------------------------------------------------------- core
     def _build_occ_grid(self):
         """Rasterise lidar hit points into a robot-centric grid (N,G,G).
@@ -1414,7 +1410,14 @@ class SparrowCspaceEnv(Sparrow):
         return occ_flat.view(self.N, G, G)
 
     def _get_cspace_state(self, current_a):
-        """Build the CNN state (N, B*nz + 4), e.g. (N, 1080 + 4)."""
+        """Build the CNN state (N, B*nz + KINEMATIC_DIM), e.g. (N, 1080 + 2).
+
+        The block appended to the cost rays is [distance, heading] only.  It used
+        to also carry the previous action command as [v_lin, v_ang]; that feedback
+        was removed (see settings.KINEMATIC_DIM).  `current_a` is still accepted so
+        the reset/step call sites stay uniform, but it no longer enters the
+        observation.
+        """
         cfg = self.cspace_cfg
         occ = self._build_occ_grid()
         cspace = build_cspace(occ, self._cspace_masks)
@@ -1435,15 +1438,14 @@ class SparrowCspaceEnv(Sparrow):
         self.cost_rays_proc = cr_proc.detach()
         cr = cr_proc.reshape(self.N, -1)                           # (N, B*nz)
 
-        # fresh distance (post AutoReset) + heading + velocity command
+        # fresh distance (post AutoReset) + heading
         self.d2target_now = (
             self.car_state[:, 0:2] - self.target_point
         ).pow(2).sum(-1).pow(0.5)
         distance = (self.d2target_now / 100.0).unsqueeze(-1)       # (N,1) m
         heading = self._heading_error().unsqueeze(-1)              # (N,1) rad
-        v = self._action_to_v(current_a)                           # (N,2)
 
-        return torch.cat([cr, distance, heading, v], dim=1)        # (N, B*nz+4)
+        return torch.cat([cr, distance, heading], dim=1)           # (N, B*nz+2)
 
     def is_stuck(self, threshold=0.05):
         """Return (N,) bool: at theta=0 (driving straight, no rotation) even the
@@ -1800,7 +1802,7 @@ if __name__ == "__main__":
     )
     s, info = env.reset()
     flat = env.cost_ray_num_beams * env.cost_ray_nz        # B*nz (ray-grid cols)
-    exp_shape = (env.N, flat + 4)                          # e.g. (2, 1084)
+    exp_shape = (env.N, flat + settings.KINEMATIC_DIM)      # e.g. (2, 1082)
     print("reset state shape:", tuple(s.shape), "(expect %s)" % (exp_shape,))
     expected_ray_max = math.log(
         env.cspace_cfg["cost_ray_max_range"] / LOG_CR_MIN_DIST)
