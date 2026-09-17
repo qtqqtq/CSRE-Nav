@@ -1,0 +1,58 @@
+# CNN-SAC c-space policy -- oldest generation, Gazebo + C++ c_space_mapper
+# (36 x 10 rays, 128 features, 0.44 x 0.38 m Pioneer footprint, 5 m horizon).
+#
+# Use with: SAC_cspace, SAC_cspace_1, SAC_cspace_2
+#
+# EXPERIMENTAL.  These models never saw the Python cost-ray pipeline: they were
+# trained by SAC/train_cnn_sac.py + SAC/velodyne_env.py (the pre-rename
+# laser_env.py) reading /cost_rays from the C++ c_space_mapper node, which
+#
+#   * published ray distances already in metres with a *linear* inversion
+#     (cr = max_range - max(cr, 0.1)) rather than the log encoding used later;
+#   * published the actor output straight to /r1/cmd_vel, so its linear channel is
+#     m/s and already scaled -- not the Sparrow 50 cm/s * a0;
+#   * built its grid in the standard ROS frame rather than the mirrored one the
+#     Sparrow envs use (hence ray_frame: ros below).
+#
+# The geometry below is transcribed from catkin_ws/src/c_space_mapper/config/
+# mapper_node.yaml.  `ray_frame` and the `v_*_max` scale are *inferred* from the
+# training code, not verified against a rollout -- treat this profile as a starting
+# point and check the behaviour before trusting it.
+#
+# Note SAC_cspace_* and SAC_sparrow_cspace_* have byte-identical network shapes
+# (both 36 x 10, 128 features), so the loader cannot tell them apart -- the config
+# is the only thing separating the two pipelines.  Use this profile for the
+# SAC_cspace_* names and sac_cspace_legacy_sparrow.yaml for SAC_sparrow_cspace_*.
+
+model_name: SAC_cspace_2
+device: cuda
+stochastic: false
+
+# --- c-space geometry (from mapper_node.yaml) ---
+g_min: 0.2
+nz: 10
+a: 0.698
+cost_ray_max_range: 5.0
+cost_ray_num_beams: 36
+cost_ray_h_res_degrees: 10.0
+footprint: [[0.22, 0.19], [0.22, -0.19], [-0.22, -0.19], [-0.22, 0.19]]
+
+ray_frame: ros
+preprocess: subtract
+
+# --- action scaling: actor output went to /cmd_vel unscaled ---
+v_linear_max: 1.0
+v_angular_max: 1.0
+allow_reverse: true
+
+# --- io / frames ---
+scan_topic: /r1/front_laser/scan
+odom_topic: /r1/odom
+cmd_vel_topic: /r1/cmd_vel
+goal_topic: /sac_cspace/goal
+map_frame: odom
+base_frame: base_link
+lidar_frame: front_laser
+rate: 10.0
+goal_tolerance: 0.3
+publish_debug: true

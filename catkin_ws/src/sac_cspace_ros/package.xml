@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>sac_cspace_ros</name>
+  <version>0.1.0</version>
+  <description>
+    ROS 1 wrapper for the CNN-SAC c-space (cost-ray) navigation policy trained in
+    DRL-robot-navigation/SAC.  Rebuilds the training observation (36 x nz cost rays
+    + distance/heading/previous action) from live LaserScan + Odometry and publishes
+    velocity commands, without needing Gazebo or the C++ c_space_mapper node.
+  </description>
+
+  <maintainer email="qtqqtq@todo.todo">qtqqtq</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-torch</exec_depend>
+</package>

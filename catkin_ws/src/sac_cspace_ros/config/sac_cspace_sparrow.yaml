@@ -1,0 +1,44 @@
+# CNN-SAC c-space policy -- CURRENT generation (SparrowCspaceEnv, 36 x 30 rays).
+#
+# Use with: dense_sample_cspace_{0,1,2}
+# Geometry source: SAC/settings.py CSPACE_* (36 beams, nz=30, a=2*pi/30, 3 m,
+# 0.1 m cells, 1.20 x 0.14 m footprint).  Do not change `nz`/`a` independently of
+# the checkpoint -- the node validates the ray-grid shape at load and aborts on a
+# mismatch rather than running with a wrong observation.
+
+# --- model ---
+model_name: dense_sample_cspace_2
+device: cuda                 # "cpu" also works and is enough for one 36x30 grid
+stochastic: false            # false = tanh(mean), the deterministic eval policy
+
+# --- c-space geometry (must match training) ---
+g_min: 0.1
+nz: 30
+a: 0.20943951023931953       # 2*pi/30
+cost_ray_max_range: 3.0
+cost_ray_num_beams: 36
+cost_ray_h_res_degrees: 10.0
+footprint: [[0.6, 0.07], [0.6, -0.07], [-0.6, -0.07], [-0.6, 0.07]]
+
+# SparrowCspaceEnv builds its occupancy grid with axis 1 running to the robot's
+# RIGHT, i.e. mirrored w.r.t. the ROS body frame; and encodes rays as
+# ln(max_range / d).  Both are load-bearing -- see the core module docstring.
+ray_frame: env
+preprocess: log
+
+# --- action scaling: v = 50 cm/s * a0, omega = 2 rad/s * a1 ---
+v_linear_max: 0.5
+v_angular_max: 2.0
+allow_reverse: true          # settings.ALLOW_REVERSE
+
+# --- io / frames ---
+scan_topic: /r1/front_laser/scan
+odom_topic: /r1/odom
+cmd_vel_topic: /r1/cmd_vel
+goal_topic: /sac_cspace/goal
+map_frame: odom
+base_frame: base_link
+lidar_frame: front_laser
+rate: 10.0                   # Sparrow control interval is 0.1 s
+goal_tolerance: 0.3          # Sparrow target_area = 30 cm
+publish_debug: true
