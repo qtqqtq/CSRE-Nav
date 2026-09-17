@@ -24,12 +24,14 @@ required** — just a laser scan, odometry and a tf tree.
 > `[distance, heading]`, making `state` 1084-dim. That action feedback was removed
 > from the training env, so the state is now **1082-dim** (`36×30 + 2`).
 >
-> **Every checkpoint currently in `SAC/pytorch_models/` predates this change and
-> can no longer be loaded.** `check_models.py` reports `0/11 ok`, and the node
-> refuses to start with a message naming the offending model and saying it must be
-> retrained. That is the intended behaviour, not a regression — retrain with
-> `SAC/train.py` (it reads `settings.KINEMATIC_DIM`, so nothing else needs
-> editing) and the config profiles below apply to the new checkpoint as-is.
+> **The 11 checkpoints that predate this change can no longer be loaded.**
+> `check_models.py` reports `1/12 ok`; the one that loads is
+> **`dense_sample_cspace_3`** — retrained against the new observation — and it is
+> what the node runs by default. The other eleven fail with a message naming the
+> model and saying it must be retrained. That is the intended behaviour, not a
+> regression — retrain with `SAC/train.py` (it reads `settings.KINEMATIC_DIM`, so
+> nothing else needs editing) and the config profiles below apply to the new
+> checkpoint as-is.
 
 ## Quick start
 
@@ -76,7 +78,7 @@ a wrong observation (which would be silent and dangerous).
 
 | config | use with | ray grid | features | pipeline |
 |---|---|---|---|---|
-| `config/sac_cspace_sparrow.yaml` | `dense_sample_cspace_{0,1,2}` | 36×30 | 64 | log encode, `env` frame, 0.5 m/s / 2 rad/s, 3 m, 0.1 m cells, 1.20×0.14 m footprint |
+| `config/sac_cspace_sparrow.yaml` | `dense_sample_cspace_{0,1,2,3}` | 36×30 | 64 | log encode, `env` frame, 0.5 m/s / 2 rad/s, 3 m, 0.1 m cells, 1.20×0.14 m footprint |
 | `config/sac_cspace_legacy_sparrow.yaml` | `SAC_sparrow_cspace{,_1..4}` | 36×10 | 128 | same, but `a=0.698` → nz=10 |
 | `config/sac_cspace_legacy_gazebo.yaml` | `SAC_cspace{,_1,_2}` | 36×10 | 128 | **experimental** — subtract encode, `ros` frame, 1.0 m/s / 1.0 rad/s, 5 m, 0.2 m cells, 0.44×0.38 m footprint |
 
@@ -123,7 +125,7 @@ marked occupied (there is no ray-traced clearing). A real laser gives a richer g
 
 | param | default | meaning |
 |---|---|---|
-| `~model_name` | `dense_sample_cspace_2` | checkpoint basename in `~model_dir` |
+| `~model_name` | `dense_sample_cspace_3` | checkpoint basename in `~model_dir` |
 | `~model_dir` | `<sac_dir>/pytorch_models` | where the `*_actor.pth` files live |
 | `~sac_dir` | `/DRL-robot-navigation/SAC` | training tree, for `cspace_cost_rays` |
 | `~device` | `cuda` | `cuda` or `cpu` |

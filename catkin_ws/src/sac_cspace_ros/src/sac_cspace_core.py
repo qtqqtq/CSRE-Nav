@@ -242,7 +242,7 @@ class SacCspaceCore(object):
         rospy.init_node("sac_cspace_node", anonymous=True)
 
         # ---- model ------------------------------------------------------
-        self.model_name = rospy.get_param("~model_name", "dense_sample_cspace_2")
+        self.model_name = rospy.get_param("~model_name", "dense_sample_cspace_3")
         self.sac_dir = rospy.get_param("~sac_dir", "/DRL-robot-navigation/SAC")
         self.model_dir = rospy.get_param("~model_dir", None)
         self.device = torch.device(rospy.get_param("~device", "cuda"))

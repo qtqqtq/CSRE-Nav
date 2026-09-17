@@ -1,13 +1,13 @@
 # CNN-SAC c-space policy -- CURRENT generation (SparrowCspaceEnv, 36 x 30 rays).
 #
-# Use with: dense_sample_cspace_{0,1,2}
+# Use with: dense_sample_cspace_{0,1,2,3}   (only _3 loads -- see README banner)
 # Geometry source: SAC/settings.py CSPACE_* (36 beams, nz=30, a=2*pi/30, 3 m,
 # 0.1 m cells, 1.20 x 0.14 m footprint).  Do not change `nz`/`a` independently of
 # the checkpoint -- the node validates the ray-grid shape at load and aborts on a
 # mismatch rather than running with a wrong observation.
 
 # --- model ---
-model_name: dense_sample_cspace_2
+model_name: dense_sample_cspace_3
 device: cuda                 # "cpu" also works and is enough for one 36x30 grid
 stochastic: false            # false = tanh(mean), the deterministic eval policy
 

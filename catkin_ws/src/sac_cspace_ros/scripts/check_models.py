@@ -34,6 +34,29 @@ from sac_cspace_core import (KINEMATIC_DIM, _ActorDeterministic, _ActorStochasti
 # the *_critic.pth files are not
 SKIP_PREFIX = ("SAC_laser", "Global_")
 
+DEFAULT_CONFIG = "sac_cspace_sparrow.yaml"
+
+
+def default_config():
+    """Locate the default config from either the source tree or an install space.
+
+    From the source tree the config is a sibling of `scripts/`.  Installed by
+    catkin, `catkin_install_python` puts this script in `lib/<pkg>/` while the
+    configs go to `share/<pkg>/config/`, so `<here>/../config` would resolve to
+    `lib/config` and not exist -- ask ros for the package path instead.  (In a
+    devel-only build both work, since rospack resolves to the source tree.)
+    """
+    local = os.path.normpath(
+        os.path.join(_HERE, os.pardir, "config", DEFAULT_CONFIG))
+    if os.path.exists(local):
+        return local
+    try:
+        import rospkg
+        return os.path.join(rospkg.RosPack().get_path("sac_cspace_ros"),
+                            "config", DEFAULT_CONFIG)
+    except Exception:                      # no ros / package not on ROS_PACKAGE_PATH
+        return local
+
 
 def discover(model_dir):
     names = []
@@ -113,8 +136,7 @@ def check(name, cfg, sac_dir):
 
 
 def main(argv):
-    here = os.path.dirname(os.path.abspath(__file__))
-    default_cfg = os.path.join(here, "..", "config", "sac_cspace_sparrow.yaml")
+    default_cfg = default_config()
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=default_cfg)
