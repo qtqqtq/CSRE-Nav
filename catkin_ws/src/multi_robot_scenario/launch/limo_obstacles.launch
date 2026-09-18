@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  Drives the moving obstacles that worlds/limo_complex.world spawns.
+
+  Three pieces, and all three are needed or nothing moves:
+
+    world          20 models named cross_clone_0 .. cross_clone_19, each carrying
+                   a `libmulti_obs` plugin.  The plugin is a pure actuator: it
+                   subscribes to /obstacles_velocity and calls SetLinearVel.
+    rvo_node       reads /gazebo/model_states, runs RVO2 over every model whose
+                   name starts with `agent_name`, and publishes the collision-
+                   avoiding velocities to /obstacles_velocity.
+    set_goals      hands rvo_node the goal rectangle the agents wander inside.
+                   Without it every agent has zero preferred velocity, so RVO
+                   holds them still and the world looks static.
+
+  rvo_node's two remaps are not optional.  Its defaults are /rvo/model_states
+  and /rvo_vel, neither of which exists here; the remaps are what wire it to
+  gazebo and to the plugins.
+
+  config/rvo_config_complex.yaml sets `agent_name: 'cross_clone_'`, which is the
+  prefix match against the model names - it is why the models are named the way
+  they are, and renaming them silently stops the obstacles.
+-->
+<launch>
+  <!-- The rectangle the agents wander in, as x_min x_max y_min y_max.  Overlap
+       with the robot's own start pose is deliberate: the point of the arena is
+       that the robot has to avoid things that are themselves avoiding things. -->
+  <arg name="goal_x_min" default="1.0"/>
+  <arg name="goal_x_max" default="4.0"/>
+  <arg name="goal_y_min" default="-3.0"/>
+  <arg name="goal_y_max" default="3.0"/>
+
+  <rosparam command="load" file="$(find multi_robot_scenario)/config/rvo_config_complex.yaml"/>
+
+  <node name="rvo_node" pkg="rvo_ros" type="rvo_node">
+    <remap from="/rvo/model_states" to="/gazebo/model_states"/>
+    <remap from="/rvo_vel" to="/obstacles_velocity"/>
+  </node>
+
+  <node name="set_goals_client" pkg="rvo_ros" type="set_goals_client"
+        args="random $(arg goal_x_min) $(arg goal_x_max) $(arg goal_y_min) $(arg goal_y_max)"/>
+</launch>

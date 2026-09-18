@@ -70,9 +70,9 @@ from sensor_msgs.msg import LaserScan
 # that starts after the planner has already logged would wait forever.
 PLANNERS = {
     "cspace": {
-        "nodes": ("sac_cspace",),
-        "goal_topic": "/sac_cspace/goal",
-        "claimed_arrival": ("sac_cspace: goal reached",),
+        "nodes": ("cnav",),
+        "goal_topic": "/cnav_goal",
+        "claimed_arrival": ("cnav: goal reached",),
         "goal_frame": "odom",
     },
     "neupan": {

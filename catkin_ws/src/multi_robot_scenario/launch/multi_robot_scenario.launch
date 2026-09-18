@@ -1,28 +1,71 @@
+<?xml version="1.0"?>
+<!--
+  Step 1 of 2: the simulation.  Gazebo + a world + one Limo + its controllers.
+  There is no planner in this file on purpose - the controller is a separate
+  launch, so the same environment serves CNav, NeuPAN or anything else.
+
+    roslaunch multi_robot_scenario multi_robot_scenario.launch   # this file
+    roslaunch cnav_ros cnav.launch                               # the controller
+
+  The world defaults to a 20-obstacle arena whose obstacles MOVE, driven by
+  RVO2 (see launch/limo_obstacles.launch).  That is the environment NeuPAN
+  ships as example/gazebo_limo; this package carries its own copy so the
+  scenario survives that repository changing.
+
+  For a bare arena, with no obstacles and no rvo_ros:
+
+    roslaunch multi_robot_scenario multi_robot_scenario.launch \
+        world_name:=$(find multi_robot_scenario)/launch/empty.world obstacles:=false
+
+  `world_name` is passed to Gazebo EXPLICITLY.  It has to be: gazebo_ros's
+  empty_world.launch defaults it to an empty string, which resolves to Gazebo's
+  own empty.world, which ships with no <physics> block at all.  Gazebo then
+  falls back to a 1 ms step, the robot's ground contacts blow the ODE solver up,
+  and gzserver segfaults in libgazebo_ode right after reporting a successful
+  spawn - a dead simulator that reads as "the planner never moves the robot".
+
+  The vendored models/ directory is put on GAZEBO_MODEL_PATH because
+  worlds/limo_complex.world refers to model://arm_part, model://cross_joint_part
+  and model://rescue_randy, which are not in /usr/share/gazebo-11/models.  That
+  directory holds only ground_plane and sun, and is kept on the path so a world
+  that does use them still resolves.
+-->
 <launch>
+  <arg name="world_name" default="$(find multi_robot_scenario)/worlds/limo_complex.world"/>
+  <arg name="obstacles" default="true"/>
+  <arg name="gui" default="true"/>
+  <arg name="verbose" default="false"/>
 
-<arg name="gui" value="true"/>
-   <!-- Gazebo  -->
-  <include file="$(find gazebo_ros)/launch/empty_world.launch" />
+  <arg name="robot_namespace" default="/"/>
+  <arg name="x" default="0.0"/>
+  <arg name="y" default="0.0"/>
+  <arg name="z" default="0.0"/>
+  <arg name="yaw" default="0.0"/>
 
-  <!-- Robot with diff drive -->
-  <include file="$(find multi_robot_scenario)/launch/pioneer3dx.gazebo.launch">
-     <arg name="robot_name" value="r1" />
-     <arg name="robot_position" value="-x 5.0 -y -12.0 -z 0.01 -R 0 -P 0 -Y +1.57" />
-   </include>
+  <env name="GAZEBO_MODEL_PATH"
+       value="$(find multi_robot_scenario)/models:/usr/share/gazebo-11/models"/>
 
- <!-- <include file="$(find multi_robot_scenario)/launch/pioneer3dx.gazebo.launch">
-     <arg name="robot_name" value="r2" />
-     <arg name="robot_position" value="-x 0.0 -y 0.5 -z 0.01 -R 0 -P 0 -Y -1.57" />
-   </include >-->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(arg world_name)"/>
+    <arg name="paused" value="false"/>
+    <arg name="use_sim_time" value="true"/>
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="headless" value="false"/>
+    <arg name="debug" value="false"/>
+    <arg name="verbose" value="$(arg verbose)"/>
+  </include>
 
+  <!-- The obstacle drivers.  Pointless against a world with no cross_clone_*
+       models in it, hence the switch: rvo_node would start, match nothing and
+       publish an empty velocity array forever. -->
+  <include if="$(arg obstacles)"
+           file="$(find multi_robot_scenario)/launch/limo_obstacles.launch"/>
 
-  <node pkg="tf" type="static_transform_publisher" name="base_to_odom_r1"
-     args="0.0 -0.0 0.0 0.0 0.0 0.0 base_link r1/odom 200" />
-
- <!-- <node pkg="tf" type="static_transform_publisher" name="base_to_odom_r2"
-     args="0.0  0.0 0.0 0.0 0.0 0.0 base_link r2/odom 200" />-->
-
-  <!-- RVIZ -->
-  <node pkg="rviz" type="rviz" name="rviz" args="-d $(find multi_robot_scenario)/launch/pioneer3dx.rviz" />
-
+  <include file="$(find multi_robot_scenario)/launch/limo.gazebo.launch">
+    <arg name="robot_namespace" value="$(arg robot_namespace)"/>
+    <arg name="x" value="$(arg x)"/>
+    <arg name="y" value="$(arg y)"/>
+    <arg name="z" value="$(arg z)"/>
+    <arg name="yaw" value="$(arg yaw)"/>
+  </include>
 </launch>

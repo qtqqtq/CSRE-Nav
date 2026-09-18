@@ -1,0 +1,47 @@
+# CNN-SAC c-space policy, retargeted from the r1/Pioneer scenario onto the Limo.
+#
+# Only the IO block and the frame names differ from
+# cnav_ros/config/cnav_sparrow.yaml.  The geometry, the ray pipeline
+# and the action scale are copied VERBATIM and must stay that way: they describe
+# the checkpoint, not the robot.  Changing `footprint` to the Limo's real
+# 0.29 x 0.22 would put dense_sample_cspace_3 out of distribution -- the node
+# only validates the ray-grid shape, not the footprint, so it would run and
+# silently degrade rather than fail.  This is the one asymmetry the benchmark
+# cannot normalise away; see README "Known asymmetries".
+
+model_name: dense_sample_cspace_3
+device: cuda
+stochastic: false
+
+# --- c-space geometry (copied verbatim from cnav_sparrow.yaml) ---
+g_min: 0.1
+nz: 30
+a: 0.20943951023931953       # 2*pi/30
+cost_ray_max_range: 3.0
+cost_ray_num_beams: 36
+cost_ray_h_res_degrees: 10.0
+footprint: [[0.6, 0.07], [0.6, -0.07], [-0.6, -0.07], [-0.6, 0.07]]
+
+ray_frame: env
+preprocess: log
+
+v_linear_max: 0.5
+v_angular_max: 2.0
+allow_reverse: true
+
+# --- io / frames: THIS is the block that changed, to match the Limo ---
+# The Limo's skid-steer plugin resolves its relative commandTopic/odometryTopic
+# against robotNamespace, and sim.launch passes robot_namespace:=/, so the
+# plugin's topics land on /cmd_vel and /odom at the root.  The laser, though, is
+# hardcoded to the absolute topic /limo/scan with frame laser_link.
+scan_topic: /limo/scan
+odom_topic: /odom
+cmd_vel_topic: /cmd_vel
+goal_topic: /cnav_goal
+map_frame: odom
+base_frame: base_link
+lidar_frame: laser_link
+
+rate: 10.0
+goal_tolerance: 0.3
+publish_debug: true

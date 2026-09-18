@@ -49,7 +49,7 @@ PATTERNS=(
     "gazebo_ros/spawn_model"
     # The two planners.  Matched on the node script names, which is what the
     # command line holds -- not on the launch files.
-    "sac_cspace_node.py"
+    "cnav_node.py"
     "neupan"
     # The harness itself.  Without this a bench.py left over from a killed
     # roslaunch keeps publishing goals into the next run's fresh sim.
@@ -63,7 +63,7 @@ for pat in "${PATTERNS[@]}"; do
 done
 sleep 4
 
-survivors=$(pgrep -af "rosmaster|gzserver|gzclient|roslaunch|sac_cspace_node|neupan|bench.py" 2>/dev/null)
+survivors=$(pgrep -af "rosmaster|gzserver|gzclient|roslaunch|cnav_node|neupan|bench.py" 2>/dev/null)
 kept=""
 while read -r pid rest; do
     [ -z "$pid" ] && continue

@@ -24,7 +24,7 @@
   <arg name="start_y" default="-1.0"/>
   <arg name="start_yaw" default="0.0"/>
 
-  <arg name="cspace_config" default="$(find planner_bench)/config/sac_cspace_limo.yaml"/>
+  <arg name="cspace_config" default="$(find planner_bench)/config/cnav_limo.yaml"/>
   <arg name="cspace_model" default="dense_sample_cspace_3"/>
   <arg name="cspace_device" default="cuda"/>
   <arg name="sac_dir" default="/DRL-robot-navigation/SAC"/>

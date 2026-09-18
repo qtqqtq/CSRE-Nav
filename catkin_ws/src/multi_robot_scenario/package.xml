@@ -2,7 +2,13 @@
 <package format="2">
   <name>multi_robot_scenario</name>
   <version>0.0.0</version>
-  <description>The multi_robot_scenario package</description>
+  <description>
+    Gazebo worlds and robot models for the navigation scenarios.  Spawns the
+    Limo through the vendored copy under xacro/limo/ and meshes/limo/, and
+    carries the 20-obstacle moving-obstacle arena under worlds/ so the scenario
+    does not depend on another checkout staying put.  The Pioneer 3-DX files
+    are still here and still used by SAC/laser_env.py.
+  </description>
 
   <!-- One maintainer tag required, multiple allowed, one person per tag -->
   <!-- Example:  -->
@@ -51,7 +57,21 @@
   <buildtool_depend>catkin</buildtool_depend>
   <build_depend>xacro</build_depend>
   <build_export_depend>xacro</build_export_depend>
+
+  <!-- Runtime only: this package builds no code, it is data that something else
+       launches.  Listed because a missing one is not a build error, it is a
+       launch that dies halfway with a plugin that never loaded. -->
   <exec_depend>xacro</exec_depend>
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>gazebo_plugins</exec_depend>
+  <exec_depend>gazebo_ros_control</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_state_controller</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <!-- Drives the moving obstacles in worlds/limo_complex.world.  Only reached
+       through limo_obstacles.launch, which multi_robot_scenario.launch includes
+       unless obstacles:=false. -->
+  <exec_depend>rvo_ros</exec_depend>
 
 
   <!-- The export tag contains other, unspecified, tags -->

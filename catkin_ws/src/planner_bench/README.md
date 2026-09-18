@@ -1,6 +1,6 @@
 # planner_bench
 
-One arena, one robot, one goal set — so that **cspace** (`sac_cspace_ros`) and
+One arena, one robot, one goal set — so that **cspace** (`cnav_ros`) and
 **NeuPAN** (`neupan_ros`) can be compared without the comparison being decided by
 whose simulation it is.
 
@@ -102,12 +102,12 @@ worlds/bench_arena.world    10x10 m, 11 static AABBs: 4 boundary walls, a centra
                             divider with one 2 m doorway, a dead-end pocket, 3 boxes.
                             Pure primitives, no plugins, no model:// URIs.
 launch/sim.launch           Gazebo + world + Limo + controllers + robot_state_publisher
-launch/cspace.launch        the cspace node alone, pointed at config/sac_cspace_limo.yaml
+launch/cspace.launch        the cspace node alone, pointed at config/cnav_limo.yaml
 launch/neupan.launch        the NeuPAN node alone, no rviz
 launch/bench.launch         entry point: planner:=cspace|neupan, optionally + harness
 config/bench.yaml           thresholds and the fairness contract, authored by hand
 config/goal_sets/*.json     committed goal sets; both planners read the same file
-config/sac_cspace_limo.yaml cspace IO/frames for the Limo (geometry kept verbatim)
+config/cnav_limo.yaml       cspace IO/frames for the Limo (geometry kept verbatim)
 config/neupan_limo_bench.yaml  NeuPAN config, `waypoints: []` and `loop: False`
 src/bench_common.py         world parsing, ground-truth collision, URDF footprint
 scripts/gen_goals.py        seeded goal generation + the negative control
@@ -268,6 +268,21 @@ trusting the mislabelled field.
   are out of distribution for cspace and the goal set is built so none of them
   occur. It is also why the negative control's reachable goal is borrowed from the
   committed set rather than hand-placed.
+- **cspace's rate on the committed set is not reproducible run to run — 9/11 and
+  11/11 have both been measured on byte-identical code.** Two consecutive runs,
+  same build, same world hash, same goal set, same start pose: 81.8% then 100%.
+  Goals 7 and 10 (`distance` 3.29 and 3.66 m, the two longest in the set) flipped
+  `stuck` -> `success` between them. A `stuck` trial here is not a frozen robot —
+  trial 7 drove 10.4 m of path and commanded 0.23 m/s on average before timing out
+  at 90 s, and `min_clearance` stayed at 1.10 m, so it wandered rather than wedged.
+  The policy is deterministic (`stochastic: false`), but the closed loop is not:
+  the two runs' command sequences agree for the first few samples and then diverge,
+  and a goal near the behaviour boundary is decided by which way the wander goes.
+  Note goal 10 lies outside the 2.4-3.6 m band above while goal 7 lies inside it, so
+  the band alone does not predict this. **Read the headline rate with its Wilson CI,
+  not as a fixed property of the planner** — an 11/11 and a 9/11 here are the same
+  cspace. This is the argument for `report.py`'s paired-outcome table, which scores
+  both planners on the same trials rather than comparing two headline rates.
 - **Regenerate goals only through `gen_goals.py`.** It is the only thing that
   enforces the rejection rules (inside an obstacle, no line of sight, out of the
   distance band, too close to the start or to another goal). A hand-edited goal
@@ -289,7 +304,15 @@ trusting the mislabelled field.
 ## This package is additive
 
 It modifies no upstream clone (`rvo_ros`, `limo_ros`, `neupan_ros`,
-`sac_cspace_ros`) and does not touch `multi_robot_scenario`. cspace's `/r1` topic
-prefix appears only in its config YAML, so passing this package's own
-`sac_cspace_limo.yaml` is enough; NeuPAN's launch file mirrors the upstream node
-block but points `config_file` at this package's copy.
+`cnav_ros`) and does not touch `multi_robot_scenario`.
+
+`config/cnav_limo.yaml` is a **frozen copy** of cnav_ros's own Limo profile, and
+it stays a copy even though the two currently agree. The contract is that the
+configuration is identical across the two runs being compared; if this package
+read cnav_ros's file directly, a later edit to that package would silently
+change one side of a comparison that was already run. `sim.launch` still builds
+its Limo from `limo_description`/`limo_gazebo_sim` rather than from
+`multi_robot_scenario`'s vendored copy, for the same reason — the URDF is part
+of what is being held fixed, so it should not move when another package's copy
+is updated. NeuPAN's launch file mirrors the upstream node block but points
+`config_file` at this package's copy.

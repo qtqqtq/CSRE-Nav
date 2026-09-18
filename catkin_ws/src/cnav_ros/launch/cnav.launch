@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  CNN-SAC c-space navigation node.
+
+  Brings up only the policy; it expects the robot (Gazebo or real), its
+  /scan, /odom and the tf tree to already be running.
+
+  Example, alongside the existing Gazebo scenario:
+    roslaunch multi_robot_scenario multi_robot_scenario.launch
+    roslaunch cnav_ros cnav.launch
+    rosrun cnav_ros send_goal.py 3.0 3.0
+
+  Switch checkpoint family:
+    roslaunch cnav_ros cnav.launch \
+        config:=$(rospack find cnav_ros)/config/cnav_legacy_sparrow.yaml \
+        model_name:=SAC_sparrow_cspace_2
+-->
+<launch>
+  <arg name="config" default="$(find cnav_ros)/config/cnav_sparrow.yaml"
+       doc="geometry/IO profile; must match the checkpoint's generation"/>
+  <arg name="model_name" default=""
+       doc="override the config's model_name (e.g. dense_sample_cspace_0)"/>
+  <arg name="device" default="" doc="override the config's device (cuda/cpu)"/>
+  <arg name="stochastic" default="" doc="override: true to sample instead of tanh(mean)"/>
+
+  <arg name="send_initial_goal" default="false"
+       doc="publish one goal at (goal_x, goal_y) on startup"/>
+  <arg name="goal_x" default="3.0"/>
+  <arg name="goal_y" default="3.0"/>
+
+  <node pkg="cnav_ros" type="cnav_node.py" name="cnav_node"
+        output="screen" required="true">
+    <rosparam command="load" file="$(arg config)"/>
+
+    <param name="model_name" value="$(arg model_name)" if="$(eval arg('model_name') != '')"/>
+    <param name="device"     value="$(arg device)"     if="$(eval arg('device') != '')"/>
+    <param name="stochastic" value="$(arg stochastic)" if="$(eval arg('stochastic') != '')"/>
+  </node>
+
+  <node pkg="cnav_ros" type="send_goal.py" name="cnav_initial_goal"
+        output="screen" args="$(arg goal_x) $(arg goal_y) --delay 2.0"
+        if="$(arg send_initial_goal)"/>
+</launch>

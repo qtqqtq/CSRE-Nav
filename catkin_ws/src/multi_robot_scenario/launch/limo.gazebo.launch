@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<!--
+  One Limo + its controllers, into whatever world is already running.
+
+  This is the robot half of the bringup and knows nothing about the world, so
+  the same file serves the empty arena and the 20-obstacle arena.  The world
+  half is multi_robot_scenario.launch, which includes this.
+
+  The model is the vendored copy under xacro/limo/, not limo_description - see
+  that directory for what was changed.  Behaviour is otherwise verbatim,
+  including the parts that are awkward but load-bearing:
+
+    * limo_gazebo.gazebo hardcodes the laser at the ABSOLUTE topic /limo/scan
+      with frame laser_link.  It ignores robot_namespace, so /limo/scan is the
+      topic no matter how this robot is spawned.
+    * robot_namespace:=/ makes the skid-steer plugin's *relative* cmd_vel and
+      odom resolve to /cmd_vel and /odom at the root.  Any other value moves
+      those two topics under a prefix while /limo/scan stays put.
+    * robot_state_publisher needs no arguments.  Do not set
+      `publish_fixed_joints`: it does not exist in rsp 1.15.3 and is a silent
+      no-op.  base_footprint -> base_link -> laser_link arrive on /tf_static.
+-->
+<launch>
+  <arg name="robot_namespace" default="/"/>
+  <arg name="model_name" default="limo"/>
+
+  <!-- Spawn pose. -->
+  <arg name="x" default="0.0"/>
+  <arg name="y" default="0.0"/>
+  <arg name="z" default="0.0"/>
+  <arg name="yaw" default="0.0"/>
+
+  <!-- Upstream names this model 'limo$(arg robot_namespace)', which with the
+       default namespace produces a model literally called "limo/".  Every
+       /gazebo/model_states lookup then has to carry that slash.  The model name
+       is independent of robot_namespace, so it is a free choice and `limo` is
+       the one the rest of this repo (and planner_bench) already reads. -->
+  <param name="robot_description"
+         command="$(find xacro)/xacro '$(find multi_robot_scenario)/xacro/limo/limo_four_diff.xacro'
+                  robot_namespace:=$(arg robot_namespace)"/>
+
+  <node name="spawn_limo_model" pkg="gazebo_ros" type="spawn_model"
+        args="-x $(arg x) -y $(arg y) -z $(arg z) -Y $(arg yaw)
+              -unpause -urdf -param robot_description -model $(arg model_name)"/>
+
+  <rosparam file="$(find multi_robot_scenario)/config/limo_four_diff_control.yaml" command="load"/>
+  <node name="controller_spawner" pkg="controller_manager" type="spawner"
+        respawn="false" output="screen" args="limo_state_controller"/>
+
+  <!-- Publishes base_footprint -> base_link -> laser_link from the URDF's fixed
+       joints.  A planner that looks up base_link -> laser_link per scan and
+       returns quietly when the lookup fails will look alive and never move, so
+       this node failing is the most likely cause of that symptom. -->
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"/>
+</launch>
