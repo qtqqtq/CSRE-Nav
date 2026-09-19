@@ -63,6 +63,18 @@ roslaunch cnav_ros cnav_rviz.launch rviz:=false  # policy alone
 It starts no Gazebo — terminal 1 above is still required, and must come first so
 rviz picks up `/use_sim_time`.
 
+The **2D Nav Goal** tool has to publish on `~goal_topic` (`/cnav_goal`), which is
+what `rviz/cnav.rviz` sets it to. rviz's own default is
+`/move_base_simple/goal`, and nothing here subscribes to that, so a config left
+on the default makes the tool look broken rather than mispointed — this is the
+first thing to check if clicking the map does nothing. In the GUI it lives at
+left panel → **Tool Properties** → **2D Nav Goal** → **Topic**. The click is
+read in the fixed frame (`odom`): the node ignores the message's
+`header.frame_id` and takes its own pose from `/odom`.
+
+**2D Pose Estimate** is deliberately left unwired; nothing here reads
+`/initialpose`.
+
 `~sac_dir` defaults to `/DRL-robot-navigation/SAC`; set it if your checkout lives
 elsewhere. `~device` defaults to `cuda` in the configs — `cpu` is plenty for a
 single 36×nz grid.
@@ -86,10 +98,15 @@ single reactive policy with none of those, so there is no placeholder for them.
 | `/cnav_cost_ray_image` | `sensor_msgs/Image` | the full 36×nz cost-ray grid as an `rgb8` heatmap — the observation the actor actually consumes. See [Reading the cost-ray image](#reading-the-cost-ray-image) |
 | `/cnav_goal_marker` | `visualization_msgs/Marker` | cylinder at the current goal, gated by `~publish_debug` |
 
-Both debug topics keep publishing once the goal is reached — a parked robot is
-exactly when "what does the policy perceive right now" is worth looking at.
-(They used to go silent on arrival, because the arrival branch skipped the
-publish block.)
+Both debug topics publish for as long as the node has a pose, whether or not
+there is a goal: from startup, while driving, and after arrival. A parked robot
+is exactly when "what does the policy perceive right now" is worth looking at,
+and a viewer opened before the first goal click should not sit on "No Image".
+(They used to be silent in both of those windows — before the first goal, and
+again on arrival.)
+
+The goal marker is the exception: it is published from `goal_callback`, so it
+appears only once a goal exists.
 
 ### Subscribers
 

@@ -498,13 +498,18 @@ class CnavCore(object):
         self.occ_grid = occ
 
     # ------------------------------------------------------------- inference
-    def _build_state(self):
-        """Assemble the (1, B*nz + KINEMATIC_DIM) observation.
+    def _build_perception(self):
+        """Scan -> occupancy -> c-space -> cost rays -> processed grid.
 
-        Returns `(state, rays, cr3, distance)`: the flat observation, the raw
-        `(1, B, nz)` cost-ray distances in metres, the `(1, B, nz)` *processed*
-        grid the CNN actually consumes (kept un-flattened for the debug image),
-        and the goal distance.
+        Returns `(rays, cr3)`: the raw `(1, B, nz)` cost-ray distances in
+        metres, and the `(1, B, nz)` *processed* grid the CNN actually consumes
+        (kept un-flattened for the debug image).
+
+        Deliberately goal-free, which is what lets `run()` publish the debug
+        topics before any goal has been set.  A viewer opened before the first
+        click would otherwise sit on "No Image" -- the topics are advertised
+        from startup, so it looks like a dead publisher rather than a policy
+        that is simply not driving anywhere yet.
         """
         if self.occ_grid is None:
             # No usable return: the world is free within the horizon, which is
@@ -525,6 +530,15 @@ class CnavCore(object):
         else:
             cr = (self.max_range - rays.clamp(min=0.1)).unsqueeze(1)
         cr3 = cr.reshape(1, self.num_beams, self.nz).float()   # for the debug image
+        return rays, cr3
+
+    def _build_state(self, rays, cr3):
+        """Assemble the (1, B*nz + KINEMATIC_DIM) observation.
+
+        Takes the perception half as an argument rather than recomputing it, so
+        that `run()` can build it once and still publish it on the ticks where
+        no goal exists.  Returns `(state, distance)`.
+        """
         cr = cr3.reshape(1, -1)
 
         dx = self.goal[0] - self.robot_state[0]
@@ -536,7 +550,7 @@ class CnavCore(object):
 
         kin = torch.tensor([[distance, heading]],
                            dtype=torch.float32, device=self.device)
-        return torch.cat([cr, kin], dim=1), rays, cr3, distance
+        return torch.cat([cr, kin], dim=1), distance
 
     def _command_to_twist(self, action):
         """Actor output in [-1,1] -> physical Twist (m/s, rad/s)."""
@@ -552,15 +566,29 @@ class CnavCore(object):
         rate = rospy.Rate(self.rate_hz)
 
         while not rospy.is_shutdown():
-            if self.robot_state is None or self.goal is None:
-                if self.goal is None:
-                    rospy.logwarn_throttle(
-                        5.0, "cnav: no goal yet -- publish a PoseStamped on %s",
-                        self.goal_topic)
+            if self.robot_state is None:
                 rate.sleep()
                 continue
 
-            state, rays, cr3, distance = self._build_state()
+            rays, cr3 = self._build_perception()
+
+            # Published before the goal check on purpose, in both directions:
+            # a stopped robot is exactly when "what does the policy perceive
+            # right now" is worth looking at, and a robot with no goal at all
+            # still has perception worth showing.  Both topics used to be
+            # silent until the first goal and again once it was reached.
+            if self.publish_debug:
+                self._publish_cost_ray_path(rays)
+                self._publish_cost_ray_image(cr3)
+
+            if self.goal is None:
+                rospy.logwarn_throttle(
+                    5.0, "cnav: no goal yet -- publish a PoseStamped on %s",
+                    self.goal_topic)
+                rate.sleep()
+                continue
+
+            state, distance = self._build_state(rays, cr3)
 
             with torch.no_grad():
                 rg = state[:, :self.num_beams * self.nz].reshape(
@@ -571,14 +599,6 @@ class CnavCore(object):
                 else:
                     action = self.actor.get_mean_action(rg, kin)
             action = np.clip(action.detach().cpu().numpy().reshape(-1), -1.0, 1.0)
-
-            # Published before the arrival check on purpose: a stopped robot is
-            # exactly when "what does the policy perceive right now" is worth
-            # looking at, and both topics used to go silent the moment the goal
-            # was reached.
-            if self.publish_debug:
-                self._publish_cost_ray_path(rays)
-                self._publish_cost_ray_image(cr3)
 
             if distance <= self.goal_tolerance:
                 if not self.arrived:
