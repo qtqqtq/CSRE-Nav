@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<!--
+  The cnav policy plus rviz, and nothing else.
+
+  Gazebo is NOT started here.  The robot, its scan topic, /odom and the tf tree
+  must already be running:
+
+    # terminal 1 - the environment
+    roslaunch multi_robot_scenario multi_robot_scenario.launch
+    # terminal 2 - the policy and the viewer
+    roslaunch cnav_ros cnav_rviz.launch
+
+  Then place a goal with the "2D Nav Goal" tool in rviz.  It publishes a
+  geometry_msgs/PoseStamped on /cnav_goal (this config's `goal_topic`), which
+  cnav accepts: goal_callback reads only pose.position.x/y and ignores
+  header.frame_id, and the node takes its own pose from /odom, so the click is
+  interpreted in the fixed frame (odom), the same frame its odometry is in.
+  "2D Pose Estimate" is deliberately left unwired; nothing here reads
+  /initialpose.
+
+  The node is declared directly rather than <include>-ing cnav.launch, for the
+  same reason planner_bench/launch/cspace.launch does it: cnav.launch can spawn
+  a send_goal.py, and a startup goal racing the one clicked in rviz is exactly
+  the nondeterminism a viewer-centric launch must not have.  Declaring it here
+  also exposes ~sac_dir, which cnav.launch does not, and leaves cnav.launch
+  untouched for the headless workflow.
+
+  rviz:=false gives the planner alone (then: rosrun cnav_ros send_goal.py 3.0 3.0).
+
+  Switch checkpoint family.  Note that `config` and `model_name` travel
+  together, since only the config knows the ray pipeline and geometry:
+    roslaunch cnav_ros cnav_rviz.launch \
+        config:=$(rospack find cnav_ros)/config/cnav_legacy_sparrow.yaml \
+        model_name:=SAC_sparrow_cspace_2
+-->
+<launch>
+  <arg name="config" default="$(find cnav_ros)/config/cnav_sparrow.yaml"
+       doc="geometry/IO profile; must match the checkpoint's generation"/>
+  <arg name="model_name" default=""
+       doc="override the config's model_name (e.g. dense_sample_cspace_0)"/>
+  <arg name="device" default="" doc="override the config's device (cuda/cpu)"/>
+  <arg name="stochastic" default="" doc="override: true to sample instead of tanh(mean)"/>
+  <arg name="sac_dir" default=""
+       doc="override the node's /DRL-robot-navigation/SAC checkout location"/>
+
+  <arg name="rviz" default="true" doc="false to run the policy with no viewer"/>
+  <arg name="rviz_config" default="$(find cnav_ros)/rviz/cnav.rviz"/>
+
+  <node pkg="cnav_ros" type="cnav_node.py" name="cnav_node"
+        output="screen" required="true">
+    <rosparam command="load" file="$(arg config)"/>
+
+    <param name="model_name" value="$(arg model_name)" if="$(eval arg('model_name') != '')"/>
+    <param name="device"     value="$(arg device)"     if="$(eval arg('device') != '')"/>
+    <param name="stochastic" value="$(arg stochastic)" if="$(eval arg('stochastic') != '')"/>
+    <param name="sac_dir"    value="$(arg sac_dir)"    if="$(eval arg('sac_dir') != '')"/>
+  </node>
+
+  <!-- required="true" above means a policy that dies on startup takes rviz with
+       it, rather than leaving a viewer attached to nothing.  The reverse does
+       not hold: closing rviz leaves the policy running. -->
+  <node name="rviz" pkg="rviz" type="rviz" if="$(arg rviz)"
+        args="-d $(arg rviz_config)"/>
+</launch>

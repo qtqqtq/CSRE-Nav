@@ -52,6 +52,17 @@ roslaunch cnav_ros cnav.launch
 rosrun cnav_ros send_goal.py 3.0 3.0
 ```
 
+`cnav_rviz.launch` is the same policy with rviz attached, for watching it and
+placing the goal with the **2D Nav Goal** tool instead of `send_goal.py`:
+
+```bash
+roslaunch cnav_ros cnav_rviz.launch              # policy + rviz
+roslaunch cnav_ros cnav_rviz.launch rviz:=false  # policy alone
+```
+
+It starts no Gazebo — terminal 1 above is still required, and must come first so
+rviz picks up `/use_sim_time`.
+
 `~sac_dir` defaults to `/DRL-robot-navigation/SAC`; set it if your checkout lives
 elsewhere. `~device` defaults to `cuda` in the configs — `cpu` is plenty for a
 single 36×nz grid.
@@ -72,7 +83,13 @@ single reactive policy with none of those, so there is no placeholder for them.
 |---|---|---|
 | `/cnav_cmd_vel` | `geometry_msgs/Twist` | velocity command to the robot |
 | `/cnav_cost_ray_path` | `nav_msgs/Path` | the θ=0 cost-ray polar profile — the free space the policy currently perceives. **Not a planned path**, which is why it is not called `/cnav_plan` |
+| `/cnav_cost_ray_image` | `sensor_msgs/Image` | the full 36×nz cost-ray grid as an `rgb8` heatmap — the observation the actor actually consumes. See [Reading the cost-ray image](#reading-the-cost-ray-image) |
 | `/cnav_goal_marker` | `visualization_msgs/Marker` | cylinder at the current goal, gated by `~publish_debug` |
+
+Both debug topics keep publishing once the goal is reached — a parked robot is
+exactly when "what does the policy perceive right now" is worth looking at.
+(They used to go silent on arrival, because the arrival branch skipped the
+publish block.)
 
 ### Subscribers
 
@@ -147,6 +164,42 @@ grid, so raw values can reach ~3.05 m before the log encoding clips them at
 marked occupied (there is no ray-traced clearing). A real laser gives a richer grid
 — that is the intended sim→real direction, not a bug.
 
+## Reading the cost-ray image
+
+`/cnav_cost_ray_image` is the HUD panel `SAC/play_cspace.py` draws, republished
+for rviz's Image display:
+
+```
+        beam b = 0 ────────────────────────► b = 35      (10° apart)
+layer k = 0  ████████████████████████████   ← robot keeps its current heading
+   (θ = 0)
+   │              ▓▓▓▓▓▓                      red  = obstacle close
+   │              ▓▓▓▓▓▓                      green = free / far
+   ▼                                          colour = (255v, 255(1-v), 40)
+layer k = 29 ████████████████████████████        v = clamp(log-range / max_range)
+```
+
+- **x axis is the beam** (0..35 at 10°, so 360° across), **y axis is the θ layer**
+  (0..nz-1) — row 0 is the layer where the robot holds its current heading.
+  Neither axis is unwrapped or rotated; the layout is exactly play_cspace's.
+- **The colour is the post-`~preprocess` value, not the raw distance.** Under
+  `log`, `v = clamp(ln(max_range / d) / max_range, 0, 1)` — at `max_range = 3 m`
+  that is green for free space, `(93, 161, 40)` at 1 m, and saturated red near
+  0.15 m. The log is the point: it magnifies near range (`|dp/dd| = 1/d`), so
+  what turns red here is what the policy actually reacts to.
+- **A fully red image means the robot is already in collision at its current
+  pose**, which is a genuine reading, not a bug: the first march step is
+  `g_min/2 = 0.05 m`, so every ray clips there. Compare against the actual pose
+  before concluding the perception is broken.
+- **This is deliberately not the same mapping as `c_space_mapper`'s
+  `cost_ray_image`**, which is `mono8`, linear (`1 - d/max_range`), and
+  horizontally unwrapped so beam 0 lands in the middle. That node's convention
+  is for its own `unit/costray.rviz`; this one follows play_cspace. Two nodes,
+  two topics, two mappings — not a duplicate implementation.
+
+The image is a fixed-size raster: rviz renders it 1:1 and will not scale it, so
+raise `~cost_ray_image_cell` on a large screen (10 ⇒ 360×300).
+
 ## Parameters
 
 | param | default | meaning |
@@ -169,7 +222,9 @@ marked occupied (there is no ray-traced clearing). A real laser gives a richer g
 | `~goal_tolerance` | `0.3` | arrival radius (m); training's `target_area` |
 | `~scan_max_range` | `0` | hits beyond this count as no-return; `0` ⇒ use `~cost_ray_max_range` |
 | `~scan_min_range` | `0` | ignore returns closer than this |
-| `~publish_debug` | `true` | publish the goal marker and cost-ray path |
+| `~cost_ray_image_topic` | `/cnav_cost_ray_image` | cost-ray heatmap topic |
+| `~cost_ray_image_cell` | `5` | pixels per cost-ray cell in that image (5 ⇒ 180×150) |
+| `~publish_debug` | `true` | publish the goal marker and both cost-ray visualisations |
 
 ## Tools
 
