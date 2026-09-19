@@ -21,7 +21,7 @@ empty space:
 
 ```bash
 roslaunch multi_robot_scenario multi_robot_scenario.launch \
-    world_name:=$(find multi_robot_scenario)/launch/empty.world obstacles:=false
+    world_name:=$(find multi_robot_scenario)/worlds/empty.world obstacles:=false
 ```
 
 Spawn pose and namespace are arguments: `x`, `y`, `z`, `yaw`,

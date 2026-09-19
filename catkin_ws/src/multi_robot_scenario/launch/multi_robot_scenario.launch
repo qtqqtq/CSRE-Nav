@@ -15,7 +15,7 @@
   For a bare arena, with no obstacles and no rvo_ros:
 
     roslaunch multi_robot_scenario multi_robot_scenario.launch \
-        world_name:=$(find multi_robot_scenario)/launch/empty.world obstacles:=false
+        world_name:=$(find multi_robot_scenario)/worlds/empty.world obstacles:=false
 
   `world_name` is passed to Gazebo EXPLICITLY.  It has to be: gazebo_ros's
   empty_world.launch defaults it to an empty string, which resolves to Gazebo's

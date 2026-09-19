@@ -10,6 +10,12 @@
     roslaunch cnav_ros cnav.launch
     rosrun cnav_ros send_goal.py 3.0 3.0
 
+  For the same policy plus rviz (place the goal with the 2D Nav Goal tool there
+  instead of running send_goal.py), see cnav_rviz.launch.
+
+  Note: an XML comment cannot contain two hyphens in a row, so that punctuation
+  is not usable as a dash in this file; it makes the launch unreadable.
+
   Switch checkpoint family:
     roslaunch cnav_ros cnav.launch \
         config:=$(rospack find cnav_ros)/config/cnav_legacy_sparrow.yaml \
