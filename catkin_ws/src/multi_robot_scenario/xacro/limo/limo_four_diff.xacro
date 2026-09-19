@@ -24,6 +24,14 @@
 
     <xacro:property name="wheel_length" value="0.045" />
     <xacro:property name="wheel_radius" value="0.045" />
+
+    <!-- The footprint the cnav policy plans with (settings.CSPACE_*), i.e. the
+         1.20 x 0.14 m rectangle in cnav_sparrow.yaml.  Drawn above the robot so
+         the assumed size can be compared against the real 0.13 x 0.12 m chassis. -->
+    <xacro:property name="cspace_footprint_x" value="1.20" />
+    <xacro:property name="cspace_footprint_y" value="0.14" />
+    <xacro:property name="cspace_footprint_z" value="0.12" />
+
   <link name="base_footprint"/>
 
   <joint name="base_joint" type="fixed">
@@ -46,6 +54,17 @@
               <box size="${base_x_size} ${base_y_size} ${base_z_size}"/>
           </geometry>
         </collision>
+        <!-- The cnav footprint.  Visual only, no collision, so it cannot change
+             how the robot drives. -->
+        <visual>
+            <origin xyz="0 0 ${cspace_footprint_z}" rpy="0 0 0" />
+            <geometry>
+                <box size="${cspace_footprint_x} ${cspace_footprint_y} 0.02"/>
+            </geometry>
+            <material name="cspace_footprint">
+                <color rgba="1.0 0.40 0.0 1.0"/>
+            </material>
+        </visual>
     </link>
 
     <!-- <link name="inertial_link">
