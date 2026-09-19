@@ -60,7 +60,7 @@ import rospy
 import tf
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import Image, LaserScan
 from visualization_msgs.msg import Marker
 
 
@@ -258,11 +258,21 @@ class CnavCore(object):
         self.goal_topic = rospy.get_param("~goal_topic", "/cnav_goal")
         self.plan_topic = rospy.get_param("~plan_topic", "/cnav_cost_ray_path")
         self.marker_topic = rospy.get_param("~marker_topic", "/cnav_goal_marker")
+        self.cost_ray_image_topic = rospy.get_param("~cost_ray_image_topic",
+                                                    "/cnav_cost_ray_image")
 
         # 10 Hz matches the training control interval (Sparrow ctrl_interval = 0.1 s)
         self.rate_hz = float(rospy.get_param("~rate", 10.0))
         self.goal_tolerance = float(rospy.get_param("~goal_tolerance", 0.3))
         self.publish_debug = bool(rospy.get_param("~publish_debug", True))
+
+        # Pixels per cost-ray cell in the debug image; 5 is what play_cspace.py
+        # draws, giving 36*5 x nz*5 = 180 x 150.  Bump it on a large screen --
+        # rviz renders the image 1:1 and does not scale it.
+        self.cost_ray_image_cell = int(rospy.get_param("~cost_ray_image_cell", 5))
+        if self.cost_ray_image_cell < 1:
+            raise ValueError("~cost_ray_image_cell must be >= 1, got %d"
+                             % self.cost_ray_image_cell)
 
         # ---- geometry (must match the checkpoint's training run) ---------
         self.g_min = float(rospy.get_param("~g_min", 0.1))
@@ -317,6 +327,8 @@ class CnavCore(object):
         self.vel_pub = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
         self.plan_pub = rospy.Publisher(self.plan_topic, Path, queue_size=1)
         self.marker_pub = rospy.Publisher(self.marker_topic, Marker, queue_size=1)
+        self.cost_ray_image_pub = rospy.Publisher(self.cost_ray_image_topic, Image,
+                                                  queue_size=1)
 
         self.listener = tf.TransformListener()
         rospy.Subscriber(self.scan_topic, LaserScan, self.scan_callback, queue_size=1)
@@ -487,7 +499,13 @@ class CnavCore(object):
 
     # ------------------------------------------------------------- inference
     def _build_state(self):
-        """Assemble the (1, B*nz + KINEMATIC_DIM) observation plus the raw rays."""
+        """Assemble the (1, B*nz + KINEMATIC_DIM) observation.
+
+        Returns `(state, rays, cr3, distance)`: the flat observation, the raw
+        `(1, B, nz)` cost-ray distances in metres, the `(1, B, nz)` *processed*
+        grid the CNN actually consumes (kept un-flattened for the debug image),
+        and the goal distance.
+        """
         if self.occ_grid is None:
             # No usable return: the world is free within the horizon, which is
             # exactly what an empty occupancy grid encodes.
@@ -506,7 +524,8 @@ class CnavCore(object):
             cr = self._preprocess(rays, max_range=self.max_range)
         else:
             cr = (self.max_range - rays.clamp(min=0.1)).unsqueeze(1)
-        cr = cr.reshape(1, -1).float()
+        cr3 = cr.reshape(1, self.num_beams, self.nz).float()   # for the debug image
+        cr = cr3.reshape(1, -1)
 
         dx = self.goal[0] - self.robot_state[0]
         dy = self.goal[1] - self.robot_state[1]
@@ -517,7 +536,7 @@ class CnavCore(object):
 
         kin = torch.tensor([[distance, heading]],
                            dtype=torch.float32, device=self.device)
-        return torch.cat([cr, kin], dim=1), rays, distance
+        return torch.cat([cr, kin], dim=1), rays, cr3, distance
 
     def _command_to_twist(self, action):
         """Actor output in [-1,1] -> physical Twist (m/s, rad/s)."""
@@ -541,7 +560,7 @@ class CnavCore(object):
                 rate.sleep()
                 continue
 
-            state, rays, distance = self._build_state()
+            state, rays, cr3, distance = self._build_state()
 
             with torch.no_grad():
                 rg = state[:, :self.num_beams * self.nz].reshape(
@@ -553,6 +572,14 @@ class CnavCore(object):
                     action = self.actor.get_mean_action(rg, kin)
             action = np.clip(action.detach().cpu().numpy().reshape(-1), -1.0, 1.0)
 
+            # Published before the arrival check on purpose: a stopped robot is
+            # exactly when "what does the policy perceive right now" is worth
+            # looking at, and both topics used to go silent the moment the goal
+            # was reached.
+            if self.publish_debug:
+                self._publish_cost_ray_path(rays)
+                self._publish_cost_ray_image(cr3)
+
             if distance <= self.goal_tolerance:
                 if not self.arrived:
                     rospy.loginfo("cnav: goal reached (%.2f m)", distance)
@@ -563,9 +590,6 @@ class CnavCore(object):
 
             self.arrived = False
             self.vel_pub.publish(self._command_to_twist(action))
-
-            if self.publish_debug:
-                self._publish_cost_ray_path(rays)
 
             rate.sleep()
 
@@ -605,3 +629,38 @@ class CnavCore(object):
             ps.pose.orientation.w = 1.0
             path.poses.append(ps)
         self.plan_pub.publish(path)
+
+    def _publish_cost_ray_image(self, cr3):
+        """Render the processed (B, nz) grid the actor consumes as an rgb8 image.
+
+        This is the heatmap `SAC/render_utils.py:draw_cost_rays` paints for
+        play_cspace.py, republished for rviz: columns are the 36 beams (10 deg
+        apart), rows are the nz heading layers, and the colour is the same
+        log-encoded value the actor sees -- v = clamp(proc/max_range, 0, 1) ->
+        (255v, 255(1-v), 40), so free space is green and a near obstacle is red.
+        The encoding is the point: log compresses the far field and magnifies
+        near range (|dp/dd| = 1/d), so what goes red here is what the policy
+        actually reacts to.  This is NOT the mono8/linear/unwrapped image
+        c_space_mapper's cost_ray_image publishes -- same idea, different
+        mapping, deliberately kept separate.
+        """
+        cell = self.cost_ray_image_cell
+        proc = cr3[0].detach().cpu().numpy()                    # (B, nz)
+        v = np.clip(proc / self.max_range, 0.0, 1.0)            # (B, nz)
+        # Transposing to (nz, B, 3) puts the beam on the image x axis and the
+        # heading layer on y, the orientation play_cspace draws it in.
+        rgb = np.empty((self.nz, self.num_beams, 3), dtype=np.uint8)
+        rgb[:, :, 0] = (255.0 * v.T).astype(np.uint8)
+        rgb[:, :, 1] = (255.0 * (1.0 - v.T)).astype(np.uint8)
+        rgb[:, :, 2] = 40
+        # Nearest-neighbour upscale; no PIL or cv_bridge needed for that.
+        big = np.repeat(np.repeat(rgb, cell, axis=0), cell, axis=1)
+        img = Image()
+        img.header.frame_id = self.base_frame
+        img.header.stamp = rospy.Time.now()
+        img.height, img.width = big.shape[0], big.shape[1]
+        img.encoding = "rgb8"
+        img.is_bigendian = 0
+        img.step = img.width * 3
+        img.data = big.tobytes()
+        self.cost_ray_image_pub.publish(img)
