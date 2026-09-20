@@ -37,7 +37,7 @@ from render_utils import draw_hud, draw_cost_rays, draw_cspace_projection, draw_
 parser = argparse.ArgumentParser()
 
 # ---- Model / agent ----
-parser.add_argument('--ModelName', type=str, default='dense_sample_cspace_2',
+parser.add_argument('--ModelName', type=str, default='dense_sample_cspace_3',
                     help='model basename in pytorch_models (e.g. SAC_sparrow_cspace)')
 parser.add_argument('--ModelDir', type=str, default=settings.MODEL_DIR,
                     help='directory holding *_actor.pth / *_critic.pth')

@@ -9,7 +9,7 @@ velocity commands:
 ```
 /scan ────┐
 /odom ────┼─→ occ grid → c-space → 36×nz cost rays → log encode ─┐
-/cnav_goal┘                                                       ├─→ actor → /cnav_cmd_vel
+/cnav_goal┘                                                       ├─→ actor → velocity filter → /cnav_cmd_vel
                               [distance, heading] ─────────────────┘
 ```
 
@@ -235,6 +235,7 @@ raise `~cost_ray_image_cell` on a large screen (10 ⇒ 360×300).
 | `~preprocess` | `log` | `log` \| `subtract` |
 | `~v_linear_max`, `~v_angular_max` | `0.5`, `2.0` | action scale (m/s, rad/s) |
 | `~allow_reverse` | `true` | maps `a0` to `[0,1]` when false |
+| `~velocity_filter_k` | `[0,0]` | first-order `[linear, angular]` command filter; Sparrow profiles set `[0.55,0.60]` |
 | `~rate` | `10.0` | control rate (Hz); training used 0.1 s |
 | `~goal_tolerance` | `0.3` | arrival radius (m); training's `target_area` |
 | `~scan_max_range` | `0` | hits beyond this count as no-return; `0` ⇒ use `~cost_ray_max_range` |

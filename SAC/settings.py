@@ -128,6 +128,9 @@ MAX_TIMESTEPS = 5e6   # total training steps
 SAFETY_REWARD_WEIGHT = 0.0
 SPEED_REWARD_WEIGHT = 0.0
 SPARROW_DISTANCE_REWARD_WEIGHT = 2.0  # R_distance: normalized progress toward the target
+SPARROW_FORWARD_REWARD_WEIGHT = 1.5   # full-speed forward motion: +1.5 per step
+SPARROW_REVERSE_PENALTY_WEIGHT = 1.5  # full-speed reverse motion: -1.5 per step
+SPARROW_ANGULAR_VEL_PENALTY = 0.1     # full angular command: -0.1 per step
 
 # ---------------------------------------------------------------------------
 # Sparrow c-space environment (Sparrow_V2 / train.py)

@@ -308,6 +308,19 @@ class CnavCore(object):
         self.v_linear_max = float(rospy.get_param("~v_linear_max", 0.5))
         self.v_angular_max = float(rospy.get_param("~v_angular_max", 2.0))
 
+        # Match Sparrow's first-order actuator model:
+        #   velocity = K * previous_velocity + (1 - K) * target_velocity
+        # A zero K keeps the legacy direct-output behaviour.
+        filter_k = rospy.get_param("~velocity_filter_k", [0.0, 0.0])
+        if not isinstance(filter_k, (list, tuple)) or len(filter_k) != 2:
+            raise ValueError("~velocity_filter_k must be [linear_k, angular_k]")
+        self.velocity_filter_k = np.asarray(filter_k, dtype=np.float64)
+        if (not np.all(np.isfinite(self.velocity_filter_k))
+                or np.any(self.velocity_filter_k < 0.0)
+                or np.any(self.velocity_filter_k >= 1.0)):
+            raise ValueError("~velocity_filter_k values must be finite and in [0, 1)")
+        self.filtered_velocity = np.zeros(2, dtype=np.float64)
+
         # Hits at or beyond this range count as "no return", mirroring the sim's
         # `ld_scan_result < ld_d_range`.  0 => use cost_ray_max_range.
         scan_max = float(rospy.get_param("~scan_max_range", 0.0))
@@ -344,8 +357,11 @@ class CnavCore(object):
                       self.num_beams, self.nz, self.G, self.G,
                       self.num_beams * self.nz + KINEMATIC_DIM)
         rospy.loginfo("cnav: ray_frame=%s preprocess=%s scale=(%.2f m/s, %.2f rad/s) "
-                      "rate=%.1f Hz", self.ray_frame, self.preprocess,
-                      self.v_linear_max, self.v_angular_max, self.rate_hz)
+                      "filter_k=(%.2f, %.2f) rate=%.1f Hz",
+                      self.ray_frame, self.preprocess,
+                      self.v_linear_max, self.v_angular_max,
+                      self.velocity_filter_k[0], self.velocity_filter_k[1],
+                      self.rate_hz)
         rospy.loginfo("cnav: waiting for a goal on %s", self.goal_topic)
 
     # ------------------------------------------------------------------ setup
@@ -553,14 +569,27 @@ class CnavCore(object):
         return torch.cat([cr, kin], dim=1), distance
 
     def _command_to_twist(self, action):
-        """Actor output in [-1,1] -> physical Twist (m/s, rad/s)."""
+        """Actor output in [-1,1] -> filtered physical Twist (m/s, rad/s)."""
         a0 = float(action[0])
         if not self.allow_reverse:
             a0 = (a0 + 1.0) / 2.0
+
+        target_velocity = np.array([
+            self.v_linear_max * a0,
+            self.v_angular_max * float(action[1]),
+        ], dtype=np.float64)
+        self.filtered_velocity = (
+            self.velocity_filter_k * self.filtered_velocity
+            + (1.0 - self.velocity_filter_k) * target_velocity
+        )
+
         twist = Twist()
-        twist.linear.x = self.v_linear_max * a0
-        twist.angular.z = self.v_angular_max * float(action[1])
+        twist.linear.x = self.filtered_velocity[0]
+        twist.angular.z = self.filtered_velocity[1]
         return twist
+
+    def _reset_command_filter(self):
+        self.filtered_velocity.fill(0.0)
 
     def run(self):
         rate = rospy.Rate(self.rate_hz)
@@ -604,6 +633,7 @@ class CnavCore(object):
                 if not self.arrived:
                     rospy.loginfo("cnav: goal reached (%.2f m)", distance)
                 self.arrived = True
+                self._reset_command_filter()
                 self.vel_pub.publish(Twist())
                 rate.sleep()
                 continue
@@ -613,6 +643,7 @@ class CnavCore(object):
 
             rate.sleep()
 
+        self._reset_command_filter()
         self.vel_pub.publish(Twist())
 
     # -------------------------------------------------------------- debug viz

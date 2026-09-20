@@ -26,6 +26,7 @@ preprocess: log
 v_linear_max: 0.5
 v_angular_max: 2.0
 allow_reverse: true
+velocity_filter_k: [0.55, 0.60]  # Sparrow K_linear, K_angular
 
 # --- io / frames ---
 # Points at the Limo that multi_robot_scenario.launch spawns.  /limo/scan is

@@ -40,10 +40,10 @@ N_ENVS = settings.SPARROW_N_ENVS              # number of vectorized environment
 N_OBSTACLES = settings.SPARROW_N_OBSTACLES    # moving obstacles per environment
 batch_size = 256
 buffer_size = 250000
-file_name = "dense_sample_cspace_2"
+file_name = "dense_sample_cspace_4"
 save_model = True
 load_model = True
-load_model_name = "dense_sample_cspace_1"
+load_model_name = "dense_sample_cspace_3"
 
 train_every = 5             # env-steps between training calls
 gradient_steps = 5          # gradient steps per training call (1:1 with steps)

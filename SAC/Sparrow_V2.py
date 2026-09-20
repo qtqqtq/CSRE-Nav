@@ -68,8 +68,8 @@ default_cfg = dict(
     Obs_V=25,  # maximal obstacle velocity, cm/s
     generate_rate=0.5,  # per-region probability of spawning a static obstacle
     distance_reward_weight=1.0,  # 主奖励权重: 朝目标的归一化距离进度 R_distance
-    fwd_reward_weight=1.0, # 分奖励权重: 纯前向速度, 全速前进(=v_linear_max)该步 +fwd_reward_weight,
-                           # 倒车/停车=0。主奖励是 R_distance(目标距离进度), 本项只是辅助鼓励前进。
+    fwd_reward_weight=1.0, # 分奖励权重: 纯前向速度, 全速前进(=v_linear_max)该步 +fwd_reward_weight
+    reverse_penalty=0.0,   # 倒车惩罚权重: 全速倒车该步 -reverse_penalty；0 保持旧行为
     ang_vel_penalty=0.1,  # 分奖励权重: |ω指令| 惩罚(原地转圈), 每步 −ang_vel_penalty·|ω|
     MapObs=None, # None /or/ the name of .png file, e.g. None / 'map.png'
     ld_a_range=360, # max scanning angle of lidar (degree)
@@ -605,19 +605,24 @@ class Sparrow():
         # 主奖励 R_distance: 朝目标的归一化距离进度 ∈ [-1,1] (靠近为正, 背离为负)
         R_distance = ((self.d2target_pre - self.d2target_now)
                       / (self.v_linear_max * self.ctrl_interval.view(-1))).clamp_(-1, 1)  # (N,)
-        # 分奖励 R_forward / R_angular
+        # 分奖励 R_forward / R_reverse / R_angular
         if self.action_type == 'Discrete':
             R_forward = (current_a == 2)                       # 前进动作 (N,) ∈ {0,1}
+            R_reverse = (current_a == 5)                       # 倒车动作 (N,) ∈ {0,1}
             R_angular = torch.zeros(self.N, device=self.dvc)   # 离散分支不按角速度罚
         else:
-            R_forward = (self.car_state[:, 3] / self.v_linear_max).clamp(min=0.0)  # 纯前向线速度(倒车/停车=0)
+            normalized_speed = self.car_state[:, 3] / self.v_linear_max
+            R_forward = normalized_speed.clamp(min=0.0)        # 前进速度比例 ∈ [0,1]
+            R_reverse = (-normalized_speed).clamp(min=0.0)     # 倒车速度比例 ∈ [0,1]
             R_angular = current_a[:, 1].abs()                  # |角速度指令| ∈ [0,1]
         # 总奖励 = distance_reward_weight·R_distance
-        #           + fwd_reward_weight·R_forward − ang_vel_penalty·R_angular
+        #           + fwd_reward_weight·R_forward − reverse_penalty·R_reverse
+        #           − ang_vel_penalty·R_angular
         #           − 0.5(常态时间罚: 推动尽快到目标、压低速徘徊)。
         # 终端(win/+200, 碰撞/越界/−200)在下面由 AWARD/PUNISH 覆盖。
         self.reward_vec = (self.distance_reward_weight * R_distance
                            + self.fwd_reward_weight * R_forward
+                           - self.reverse_penalty * R_reverse
                            - self.ang_vel_penalty * R_angular
                            - 0.5)
 
@@ -1190,6 +1195,9 @@ class SparrowCspaceEnv(Sparrow):
         params.setdefault("Obs_V", settings.SPARROW_OBS_V)               # 动态障碍物最大速度 (cm/s)
         params.setdefault("generate_rate", settings.SPARROW_GENERATE_RATE)  # 静态障碍物密度 (每区域生成概率)
         params.setdefault("distance_reward_weight", settings.SPARROW_DISTANCE_REWARD_WEIGHT)
+        params.setdefault("fwd_reward_weight", settings.SPARROW_FORWARD_REWARD_WEIGHT)
+        params.setdefault("reverse_penalty", settings.SPARROW_REVERSE_PENALTY_WEIGHT)
+        params.setdefault("ang_vel_penalty", settings.SPARROW_ANGULAR_VEL_PENALTY)
         params.setdefault("stuck_reset", settings.SPARROW_STUCK_RESET)    # 卡死(cost ray 全≈0)时自动重置
         params.setdefault("stuck_threshold", settings.SPARROW_STUCK_THRESHOLD)
         # 雷达探测距离必须覆盖 c-space 窗口：基于雷达的 occupancy grid 在
