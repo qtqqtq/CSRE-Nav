@@ -78,6 +78,22 @@ Two changes from upstream's copy:
 > moved 4.5–5.2 m in 20 s. The two observations are not reconciled — if you see
 > the crash, it is real and this note is the thing that is wrong.
 
+### Loading the world directly with Gazebo Sim
+
+From this package's `worlds/` directory, add the local models to Gazebo Sim's
+resource search path before loading the world:
+
+```bash
+export GZ_SIM_RESOURCE_PATH="$(realpath ../models)${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
+gz sim limo_complex.world
+```
+
+`GAZEBO_MODEL_PATH`, set by the ROS launch above, is for Gazebo Classic.
+Loading the world in Gazebo Sim does not port the Classic `libmulti_obs.so`
+plugin or start the ROS obstacle controller and Limo spawning workflow. Use
+the ROS launch above in the ROS Noetic / Gazebo Classic environment for that
+complete system.
+
 ## Vendored robot
 
 `xacro/limo/`, `meshes/limo/` and `config/limo_four_diff_control.yaml` are copies
