@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from settings import KINEMATIC_DIM, LOG_STD_MIN, LOG_STD_MAX
+from settings import KINEMATIC_DIM, LOG_STD_MIN, LOG_STD_MAX, RAY_CHANNELS
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@ class StaticObstacleCNN(nn.Module):
     CNN that processes a 2D ray-grid into a compact feature vector.
 
     Architecture (mirrors NavRL, downsampled for the 36×30 cost-ray grid):
-      Conv2d(1→4, kernel=[5,3], pad=[2,1], stride=[1,1]) → ELU   (36,30)
+      Conv2d(C→4, kernel=[5,3], pad=[2,1], stride=[1,1]) → ELU   (36,30)
       Conv2d(4→8, kernel=[5,3], pad=[2,1], stride=[2,2]) → ELU   (18,15)
       Conv2d(8→8, kernel=[5,3], pad=[2,1], stride=[2,2]) → ELU   ( 9, 8)
       Flatten → Linear(→feature_dim) → ELU → LayerNorm
@@ -94,17 +94,18 @@ class CNNActor(nn.Module):
     Actor network (stochastic policy): CNN ray-grid features + kinematic state → (mean, log_std).
 
     Pipeline:
-      ray_grid (B,1,H,V) → StaticObstacleCNN → (B, feature_dim)
+      ray_grid (B,C,H,V) → StaticObstacleCNN → (B, feature_dim)
       concat with kinematic (B, kin_dim)
       → MLP [400 → 300 → action_dim*2] → (mean, log_std)
     """
 
     def __init__(self, kinematic_dim=KINEMATIC_DIM, action_dim=2,
-                 h_beams=36, v_layers=4, cnn_feature_dim=64):
+                 h_beams=36, v_layers=4, cnn_feature_dim=64,
+                 ray_channels=RAY_CHANNELS):
         super().__init__()
 
         self.cnn = StaticObstacleCNN(
-            in_channels=1, h_beams=h_beams, v_layers=v_layers,
+            in_channels=ray_channels, h_beams=h_beams, v_layers=v_layers,
             feature_dim=cnn_feature_dim
         )
 
@@ -174,12 +175,13 @@ class CNNCritic(nn.Module):
     """
 
     def __init__(self, kinematic_dim=KINEMATIC_DIM, action_dim=2,
-                 h_beams=36, v_layers=4, cnn_feature_dim=64):
+                 h_beams=36, v_layers=4, cnn_feature_dim=64,
+                 ray_channels=RAY_CHANNELS):
         super().__init__()
 
         # ---- Shared CNN backbone ----
         self.cnn = StaticObstacleCNN(
-            in_channels=1, h_beams=h_beams, v_layers=v_layers,
+            in_channels=ray_channels, h_beams=h_beams, v_layers=v_layers,
             feature_dim=cnn_feature_dim
         )
 
@@ -244,8 +246,8 @@ class CNNSAC(object):
     stochastic; train() runs the standard soft Bellman backup.
 
     State representation:
-      ray_grid  (1, H, V)  — preprocessed ray-grid from point cloud / cost rays
-      kinematic (4,)        — [distance_to_goal, heading_error, lin_vel, ang_vel]
+      ray_grid  (2, H, V)  — [entry proximity, collision width]
+      kinematic (2,)        — [distance_to_goal, heading_error]
 
     In the replay buffer these are stored as a flat concatenated array.
 
@@ -254,7 +256,8 @@ class CNNSAC(object):
     """
 
     def __init__(self, kinematic_dim=KINEMATIC_DIM, action_dim=2, max_action=1,
-                 h_beams=36, v_layers=4, cnn_feature_dim=64,
+                 h_beams=36, v_layers=4, ray_channels=RAY_CHANNELS,
+                 cnn_feature_dim=64,
                  lr=1e-4, alpha_lr=3e-4, device='cpu',
                  safety_reward_weight=1.0, speed_reward_weight=1.0,
                  tensorboard_min_iters=None):
@@ -262,23 +265,30 @@ class CNNSAC(object):
         self.max_action = max_action
         self.h_beams = h_beams
         self.v_layers = v_layers
+        self.ray_channels = ray_channels
         self.kinematic_dim = kinematic_dim
-        self.ray_grid_flat_dim = h_beams * v_layers
+        self.ray_grid_flat_dim = ray_channels * h_beams * v_layers
         self.safety_reward_weight = safety_reward_weight
         self.speed_reward_weight = speed_reward_weight
 
         # Actor (stochastic) — no actor_target in SAC
         self.actor = CNNActor(
-            kinematic_dim, action_dim, h_beams, v_layers, cnn_feature_dim
+            kinematic_dim=kinematic_dim, action_dim=action_dim,
+            h_beams=h_beams, v_layers=v_layers,
+            cnn_feature_dim=cnn_feature_dim, ray_channels=ray_channels,
         ).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
 
         # Critic (reuses CNNCritic as-is)
         self.critic = CNNCritic(
-            kinematic_dim, action_dim, h_beams, v_layers, cnn_feature_dim
+            kinematic_dim=kinematic_dim, action_dim=action_dim,
+            h_beams=h_beams, v_layers=v_layers,
+            cnn_feature_dim=cnn_feature_dim, ray_channels=ray_channels,
         ).to(device)
         self.critic_target = CNNCritic(
-            kinematic_dim, action_dim, h_beams, v_layers, cnn_feature_dim
+            kinematic_dim=kinematic_dim, action_dim=action_dim,
+            h_beams=h_beams, v_layers=v_layers,
+            cnn_feature_dim=cnn_feature_dim, ray_channels=ray_channels,
         ).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
@@ -314,7 +324,7 @@ class CNNSAC(object):
         Get action from the actor.
 
         Args:
-            ray_grid:  numpy (1, H, V) or (H, V)
+            ray_grid:  numpy (C, H, V), or (H, V) when C == 1
             kinematic: numpy (kinematic_dim,)
             deterministic: if True, return mean action; else sample stochastically
         Returns:
@@ -322,9 +332,11 @@ class CNNSAC(object):
         """
         rg = torch.Tensor(ray_grid).to(self.device)
         if rg.dim() == 2:
-            rg = rg.unsqueeze(0)   # (H,V) → (1,1,H,V)
+            if self.ray_channels != 1:
+                raise ValueError("multi-channel ray_grid must have shape (C,H,V)")
+            rg = rg.unsqueeze(0).unsqueeze(0)  # (H,V) → (1,1,H,V)
         elif rg.dim() == 3:
-            rg = rg.unsqueeze(0)   # (1,H,V) → (1,1,H,V)
+            rg = rg.unsqueeze(0)   # (C,H,V) → (1,C,H,V)
         kn = torch.Tensor(kinematic.reshape(1, -1)).to(self.device)
         with torch.no_grad():
             if deterministic:
@@ -340,12 +352,14 @@ class CNNSAC(object):
         Args:
             batch_states: numpy (B, ray_grid_flat_dim + kinematic_dim)
         Returns:
-            ray_grid:  torch (B, 1, H, V)
+            ray_grid:  torch (B, C, H, V)
             kinematic: torch (B, kinematic_dim)
         """
         rg_flat = batch_states[:, :self.ray_grid_flat_dim]
         kin = batch_states[:, self.ray_grid_flat_dim:]
-        rg = rg_flat.reshape(-1, 1, self.h_beams, self.v_layers)
+        rg = rg_flat.reshape(
+            -1, self.ray_channels, self.h_beams, self.v_layers
+        )
         return (
             torch.Tensor(rg).to(self.device),
             torch.Tensor(kin).to(self.device),
@@ -481,7 +495,7 @@ class CNNSAC(object):
         self.writer.add_scalar("Eval/goal_reached", avg_goal_rate, epoch)
 
     def log_cost_rays(self, step, cost_rays_proc, cost_rays_raw=None):
-        """Visualize cost_rays input as TensorBoard figure (matplotlib-based).
+        """Visualize the two-channel interval-ray input in TensorBoard.
 
         Avoids PIL.Image compatibility issues in older containers.
         No-op before the writer exists (training past the min-iter threshold).
@@ -498,27 +512,40 @@ class CNNSAC(object):
             cr = cost_rays_proc.detach().cpu().numpy()
         else:
             cr = np.array(cost_rays_proc)
-        while cr.ndim > 2:
-            cr = cr.squeeze(0)   # → (H, V)
+        if cr.ndim == 4:
+            cr = cr[0]
+        elif cr.ndim == 2:
+            cr = cr[None]
+        if cr.ndim != 3:
+            raise ValueError("cost_rays_proc must be (N,C,H,V) or (C,H,V)")
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+        entry = cr[0]
+        width = cr[1] if cr.shape[0] > 1 else np.zeros_like(entry)
 
-        # ── Left: 2D heatmap ──
-        im = ax1.imshow(cr.T, aspect='auto', origin='lower',
+        im = axes[0].imshow(entry.T, aspect='auto', origin='lower',
                         cmap='hot', interpolation='nearest')
-        ax1.set_xlabel('beam (0°–360°)')
-        ax1.set_ylabel('theta orientation')
-        ax1.set_title('CostRays (processed)')
-        plt.colorbar(im, ax=ax1, shrink=0.8)
+        axes[0].set_xlabel('beam (0°–360°)')
+        axes[0].set_ylabel('theta orientation')
+        axes[0].set_title('Entry proximity')
+        plt.colorbar(im, ax=axes[0], shrink=0.8)
 
-        # ── Right: horizontal profile ──
-        beam_mean = cr.mean(axis=-1)
-        ax2.plot(range(len(beam_mean)), beam_mean, 'b-', linewidth=1)
-        ax2.fill_between(range(len(beam_mean)), 0, beam_mean, alpha=0.3)
-        ax2.set_xlabel('beam index')
-        ax2.set_ylabel('mean activation')
-        ax2.set_title('θ-averaged horizontal profile')
-        ax2.set_xlim(0, len(beam_mean) - 1)
+        im = axes[1].imshow(width.T, aspect='auto', origin='lower',
+                            cmap='viridis', interpolation='nearest')
+        axes[1].set_xlabel('beam (0°–360°)')
+        axes[1].set_ylabel('theta orientation')
+        axes[1].set_title('Collision width')
+        plt.colorbar(im, ax=axes[1], shrink=0.8)
+
+        entry_mean = entry.mean(axis=-1)
+        width_mean = width.mean(axis=-1)
+        axes[2].plot(entry_mean, label='entry proximity', linewidth=1)
+        axes[2].plot(width_mean, label='collision width', linewidth=1)
+        axes[2].set_xlabel('beam index')
+        axes[2].set_ylabel('theta-averaged value')
+        axes[2].set_title('Horizontal profiles')
+        axes[2].set_xlim(0, len(entry_mean) - 1)
+        axes[2].legend()
 
         fig.tight_layout()
         self.writer.add_figure("CostRays/processed", fig, step, close=True)

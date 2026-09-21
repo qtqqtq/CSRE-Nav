@@ -7,6 +7,7 @@ same debug overlays on top of `Sparrow._render_frame`:
 
     - draw_hud              : instantaneous / cumulative reward + win/collide flags
     - draw_cost_rays        : the NavRL c-space cost rays the CNN consumes
+    - draw_interval_rays    : interval-ray far boundary (exit radius) per beam
     - draw_cspace_projection: RGB XY projection of the 3-D c-space
     - draw_lidar_ogm        : robot-centric occupancy grid rasterised from the lidar
 
@@ -54,8 +55,8 @@ def draw_cost_rays(env, font):
       1. on-map boundary -- a cyan polyline + proximity-coloured dots showing,
          for each beam, the nearest footprint-collision distance
          (min over the nz theta layers) in world coordinates.
-      2. HUD heatmap      -- the exact B×nz processed cost-ray tensor the CNN
-         consumes (near obstacle -> red, free -> green), in the top-right corner.
+      2. HUD heatmaps     -- both B×nz processed channels consumed by the CNN:
+         entry proximity and collision width.
     """
     if env.window is None or getattr(env, "cost_rays_raw", None) is None:
         return
@@ -84,20 +85,104 @@ def draw_cost_rays(env, font):
         pygame.draw.circle(env.window, (int(255 * frac), int(255 * (1 - frac)), 0),
                            p, 2)
 
-    # --- HUD heatmap: processed cost-ray input (B x nz) ---
-    proc = env.cost_rays_proc[env.ri, 0].detach().cpu().numpy()   # (B, nz), near -> high
-    B, L = proc.shape
+    # --- HUD heatmaps: processed interval-ray input (C x B x nz) ---
+    proc = env.cost_rays_proc[env.ri].detach().cpu().numpy()
+    C, B, L = proc.shape
     cell = 5
     W, H = B * cell, L * cell
-    panel = pygame.Surface((W + 4, H + 4 + 16), pygame.SRCALPHA)
+    panel_h = C * (H + 16) + 4
+    panel = pygame.Surface((W + 4, panel_h), pygame.SRCALPHA)
     panel.fill((0, 0, 0, 160))
-    panel.blit(font.render("cost rays", True, (255, 255, 255)), (4, 2))
-    for i in range(B):
-        for j in range(L):
-            v = min(max(proc[i, j] / max_range, 0.0), 1.0)   # 0 free -> 1 near
-            col = (int(255 * v), int(255 * (1 - v)), 40)
-            pygame.draw.rect(panel, col, (2 + i * cell, 16 + j * cell, cell, cell))
+    labels = ("entry proximity", "collision width")
+    for c in range(C):
+        y0 = c * (H + 16)
+        label = labels[c] if c < len(labels) else "interval channel %d" % c
+        panel.blit(font.render(label, True, (255, 255, 255)), (4, y0 + 2))
+        for i in range(B):
+            for j in range(L):
+                v = min(max(proc[c, i, j], 0.0), 1.0)
+                col = (int(255 * v), int(255 * (1 - v)), 40)
+                pygame.draw.rect(
+                    panel, col,
+                    (2 + i * cell, y0 + 16 + j * cell, cell, cell),
+                )
     env.window.blit(panel, (env.window_size - W - 12, 8))
+
+
+def draw_interval_rays(env, font, legend=True):
+    """Overlay the *far* boundary of the interval rays the CNN consumes.
+
+    `draw_cost_rays` traces the near boundary of the radial collision interval
+    (`entry`, the first radius at which the footprint touches an obstacle).  This
+    overlay adds the matching far boundary (`exit`, the radius at which the
+    footprint leaves the obstacle again) as a polyline/ray pair:
+
+      - polyline -- per beam, the nearest collision over all theta layers,
+        `entry.min(-1)` in metres.  Same geometry as the cyan polygon in
+        `draw_cost_rays`, repeated here so the ray lengths can be read against
+        it.
+      - rays     -- per beam, the farthest exit radius over the theta layers
+        that actually collide (`exit > entry`, so the sentinel `(R, R)` of a
+        clear ray is ignored), drawn from the robot centre outwards.  A beam
+        whose theta layers are all clear has no interval and gets no ray.
+
+    The cyan-to-ray gap of a beam is the obstacle's radial "shadow" at the most
+    permissive heading: how far the robot centre would have to travel before the
+    footprint clears that obstacle again.  Ray tips are colour-coded by that
+    distance (red = shadow closes early, green = reaches `max_range`).
+    """
+    if env.window is None:
+        return
+    enter_t = getattr(env, "cost_ray_enter_raw", None)
+    exit_t = getattr(env, "cost_ray_exit_raw", None)
+    if enter_t is None or exit_t is None:
+        return
+
+    enter = enter_t[env.ri].detach().cpu().numpy()          # (B, nz) m
+    exit_dist = exit_t[env.ri].detach().cpu().numpy()       # (B, nz) m
+
+    collide = exit_dist > enter                             # (B, nz) interval exists
+    near = enter.min(axis=1)                                # (B,) nearest entry
+    far = np.where(collide, exit_dist, 0.0).max(axis=1)     # (B,) farthest exit
+    has_ray = collide.any(axis=1)                           # (B,) beams with an interval
+
+    car = env.car_state[env.ri].detach().cpu().numpy()      # (5,) [x_cm, y_cm, heading, ...]
+    x, y, t = float(car[0]), float(car[1]), float(car[2])
+    beams = np.arange(env.cost_ray_num_beams) * np.radians(
+        env.cspace_cfg["cost_ray_h_res_degrees"])           # robot-frame angles
+    world_ang = beams - t                                   # -> world (pygame y-down)
+    dx = np.cos(world_ang)
+    dy = np.sin(world_ang)
+    max_range = env.cspace_cfg["cost_ray_max_range"]        # metres
+
+    # --- near boundary: per-beam min over theta (same as draw_cost_rays) ---
+    pts = [(int(np.floor(x + near[i] * 100.0 * dx[i])),
+            int(np.floor(y + near[i] * 100.0 * dy[i])))
+           for i in range(env.cost_ray_num_beams)]
+    if len(pts) > 2:
+        pygame.draw.polygon(env.window, (0, 220, 220), pts, 2)
+
+    # --- far boundary: one ray per beam that has a collision interval ---
+    centre = (int(np.floor(x)), int(np.floor(y)))
+    for i in range(env.cost_ray_num_beams):
+        if not has_ray[i]:
+            continue
+        end = (int(np.floor(x + far[i] * 100.0 * dx[i])),
+               int(np.floor(y + far[i] * 100.0 * dy[i])))
+        pygame.draw.aaline(env.window, (255, 150, 0), centre, end)
+        frac = min(max(far[i] / max_range, 0.0), 1.0)
+        pygame.draw.circle(env.window,
+                           (int(255 * (1 - frac)), int(255 * frac), 0),
+                           end, 3)
+
+    if legend:
+        txt = font.render("interval rays: cyan polyline = nearest entry, "
+                          "orange ray = farthest exit", True, (220, 220, 220))
+        tag = pygame.Surface((txt.get_width() + 8, txt.get_height() + 4),
+                             pygame.SRCALPHA)
+        tag.fill((0, 0, 0, 160))
+        tag.blit(txt, (4, 2))
+        env.window.blit(tag, (12, 136))
 
 
 def draw_cspace_projection(env, font, size=200):

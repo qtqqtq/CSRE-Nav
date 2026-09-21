@@ -57,8 +57,10 @@ __all__ = [
     "make_footprint_masks",
     "build_cspace",
     "cost_rays_3d",
+    "cost_ray_intervals_3d",
     "compute_cost_rays",
     "preprocess_cost_rays",
+    "preprocess_cost_ray_intervals",
 ]
 
 DEFAULT_CFG = {
@@ -245,6 +247,83 @@ def cost_rays_3d(cspace, robot_cell, num_beams=36, h_res_deg=10.0,
     return result
 
 
+def cost_ray_intervals_3d(cspace, robot_cell, num_beams=36,
+                          h_res_deg=10.0, max_range=5.0,
+                          g_min=0.2, acc=None):
+    """Return the entry and exit distance of the collision interval per ray.
+
+    The map construction used by Sparrow produces at most one contiguous
+    collision interval along each fixed ``(beam, theta)`` ray.  This function
+    therefore records both boundaries of that interval instead of stopping at
+    the first occupied sample as :func:`cost_rays_3d` does.
+
+    The returned interval is half-open, ``[entry, exit)``.  A clear ray is
+    encoded as ``(max_range, max_range)``; an interval continuing past the
+    observation window has ``exit == max_range``.  Sampling starts at zero so
+    an orientation that already collides at the robot centre has ``entry=0``.
+
+    Args are identical to :func:`cost_rays_3d`.
+
+    Returns:
+        ``(N, 2, num_beams, nz)`` in metres. Channel 0 is entry and channel 1
+        is exit.
+    """
+    N, nx, ny, nz = cspace.shape
+    dev = cspace.device
+    acc = g_min / 2.0 if acc is None else acc
+    n_steps = int(math.ceil(max_range / acc))
+
+    beam_ang = torch.arange(num_beams, device=dev).float() \
+        * math.radians(h_res_deg)
+    dx = torch.cos(beam_ang).view(1, num_beams, 1)
+    dy = torch.sin(beam_ang).view(1, num_beams, 1)
+    k_layer = torch.arange(nz, device=dev).view(1, 1, nz)
+
+    ri = robot_cell[:, 0].float().view(N, 1, 1)
+    rj = robot_cell[:, 1].float().view(N, 1, 1)
+    cspace_flat = cspace.to(torch.uint8).reshape(N, nx * ny * nz)
+    stride_ij = ny * nz
+
+    entry = torch.full((N, num_beams, nz), max_range, device=dev)
+    exit_distance = torch.full_like(entry, max_range)
+    # phase: 0 = looking for entry, 1 = looking for exit, 2 = complete
+    phase = torch.zeros((N, num_beams, nz), dtype=torch.uint8, device=dev)
+
+    # max_range is a sentinel/boundary rather than a collision sample.  This
+    # makes (R,R) unambiguously mean no interval within the local window.
+    for s in range(n_steps):
+        t = s * acc
+        if t >= max_range:
+            break
+
+        ci = (ri + torch.round(dx * t / g_min)).long() \
+            .expand(N, num_beams, nz)
+        cj = (rj + torch.round(dy * t / g_min)).long() \
+            .expand(N, num_beams, nz)
+        ck = k_layer.expand(N, num_beams, nz)
+
+        in_bounds = (ci >= 0) & (ci < nx) & (cj >= 0) & (cj < ny)
+        flat = ci * stride_ij + cj * nz + ck
+        flat_safe = flat.clamp(0, nx * ny * nz - 1)
+        occupied = cspace_flat.gather(1, flat_safe.reshape(N, -1))
+        occupied = occupied.reshape(N, num_beams, nz).bool() & in_bounds
+
+        new_entry = (phase == 0) & occupied
+        entry = torch.where(new_entry, torch.full_like(entry, t), entry)
+        phase = torch.where(new_entry, torch.ones_like(phase), phase)
+
+        new_exit = (phase == 1) & ~occupied
+        exit_distance = torch.where(
+            new_exit, torch.full_like(exit_distance, t), exit_distance
+        )
+        phase = torch.where(new_exit, torch.full_like(phase, 2), phase)
+
+        if torch.all(phase == 2):
+            break
+
+    return torch.stack((entry, exit_distance), dim=1)
+
+
 # ---------------------------------------------------------------------------
 # Top-level convenience + preprocessing (mirrors laser_env)
 # ---------------------------------------------------------------------------
@@ -297,6 +376,39 @@ def preprocess_cost_rays(cost_rays, max_range=5.0):
     cr = cost_rays.clamp(LOG_CR_MIN_DIST, max_range)
     cr = torch.log(max_range / cr)
     return cr.unsqueeze(1)  # (N, 1, B, nz)
+
+
+def preprocess_cost_ray_intervals(intervals, max_range=5.0, epsilon=0.05):
+    """Invertibly encode interval rays as entry proximity and radial width.
+
+    Input and output both have shape ``(N, 2, B, nz)``.  Raw channels are
+    ``[entry, exit]`` in metres; processed channels are:
+
+    ``entry_proximity = 1 - log1p(entry/epsilon) / log1p(R/epsilon)``
+    ``collision_width = (exit-entry) / R``
+
+    Thus near collisions have high activation, while the second channel tells
+    the policy how much radial space the collision region occupies.  A clear
+    ray ``(R,R)`` maps exactly to ``(0,0)``.  The mapping is invertible over the
+    sampled interval distances.
+    """
+    if intervals.ndim != 4 or intervals.shape[1] != 2:
+        raise ValueError(
+            "intervals must have shape (N,2,B,nz), got %s" %
+            (tuple(intervals.shape),)
+        )
+    if max_range <= 0 or epsilon <= 0:
+        raise ValueError("max_range and epsilon must be positive")
+
+    entry = intervals[:, 0].clamp(0.0, max_range)
+    exit_distance = intervals[:, 1].clamp(0.0, max_range)
+    if torch.any(exit_distance < entry):
+        raise ValueError("collision interval exit must be >= entry")
+
+    denom = math.log1p(max_range / epsilon)
+    entry_proximity = 1.0 - torch.log1p(entry / epsilon) / denom
+    width = (exit_distance - entry) / max_range
+    return torch.stack((entry_proximity, width), dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -447,4 +559,36 @@ if __name__ == "__main__":
     assert tuple(cr.shape) == (N, DEFAULT_CFG["cost_ray_num_beams"], DEFAULT_CFG["nz"])
     assert torch.all(cr[0, 0] < 2.0), "beam 0 should hit the 2 m wall"
     assert torch.all(cr[0, 18] == max_range), "beam 18 should see no obstacle"
+
+    # Exact interval-ray test on a directly constructed one-theta c-space.
+    # Along beam 0 (+x), cells +3..+5 are occupied: [0.6 m, 1.2 m).
+    interval_cs = torch.zeros(N, G, G, 1, dtype=torch.bool)
+    interval_cs[0, R + 3:R + 6, R, 0] = True
+    intervals = cost_ray_intervals_3d(
+        interval_cs, robot_cell, num_beams=4, h_res_deg=90.0,
+        max_range=max_range, g_min=g_min, acc=g_min,
+    )
+    assert tuple(intervals.shape) == (N, 2, 4, 1)
+    assert torch.isclose(intervals[0, 0, 0, 0], torch.tensor(0.6))
+    assert torch.isclose(intervals[0, 1, 0, 0], torch.tensor(1.2))
+    assert torch.all(intervals[0, :, 2, 0] == max_range)
+
+    proc = preprocess_cost_ray_intervals(
+        intervals, max_range=max_range, epsilon=g_min / 2.0
+    )
+    denom = math.log1p(max_range / (g_min / 2.0))
+    entry_recovered = (g_min / 2.0) * (
+        torch.exp((1.0 - proc[:, 0]) * denom) - 1.0
+    )
+    exit_recovered = entry_recovered + proc[:, 1] * max_range
+    assert torch.allclose(entry_recovered, intervals[:, 0], atol=1e-5)
+    assert torch.allclose(exit_recovered, intervals[:, 1], atol=1e-5)
+
+    radial = torch.arange(0.0, max_range, g_min)
+    reconstructed = (
+        (radial >= intervals[0, 0, 0, 0])
+        & (radial < intervals[0, 1, 0, 0])
+    )
+    expected = (radial >= 0.6) & (radial < 1.2)
+    assert torch.equal(reconstructed, expected)
     print("self-test OK")

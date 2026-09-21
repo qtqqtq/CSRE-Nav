@@ -74,18 +74,19 @@ CSPACE_A = 2 * math.pi / CSPACE_NZ  # θ 分辨率 (rad)，~0.209 = 12°；nz·a
                                     # nz=10 时，第 10 层是第 0 层的拷贝；见 PLANNER_A 注释）
 
 # CNN ray-grid dims (aliases kept — the network / reshape code reads these)
+RAY_CHANNELS = 2                                           # [entry proximity, collision width]
 RAY_H_BEAMS = CSPACE_COST_RAY_NUM_BEAMS                # = 36
 RAY_V_LAYERS = CSPACE_NZ                               # = 30
-RAY_GRID_FLAT_DIM = RAY_H_BEAMS * RAY_V_LAYERS         # 1080 (36 beams × 30 layers)
+RAY_GRID_FLAT_DIM = RAY_CHANNELS * RAY_H_BEAMS * RAY_V_LAYERS  # 2160
 
 # Kinematic block appended to the CNN cost-ray state: [distance_to_goal (m),
 # heading_error (rad)].  故意不再等于 ROBOT_DIM —— 2D 激光 MLP 那条支线的 state
 # 仍然是 [.., linear_vel, angular_vel]，两者维度从此独立。
 # 这里原本还追加了上一帧的动作指令 (v_lin, v_ang) = _action_to_v(current_a)，
-# 已去掉：观测不再包含动作反馈。旧 checkpoint 的 actor 第一层是 feat+4，
-# 因此改前训练的模型都不能再加载，需要重新训练。
+# 已去掉：观测不再包含动作反馈。输入现为双通道区间射线，旧 checkpoint
+# 的第一层卷积仍是单通道，因此改前训练的模型不能加载，需要重新训练。
 KINEMATIC_DIM = 2
-CNN_STATE_DIM = RAY_GRID_FLAT_DIM + KINEMATIC_DIM      # 1082 (CNN state)
+CNN_STATE_DIM = RAY_GRID_FLAT_DIM + KINEMATIC_DIM      # 2162 (CNN state)
 
 # ---------------------------------------------------------------------------
 # Robot footprint (c-space dilation polygon, metres)

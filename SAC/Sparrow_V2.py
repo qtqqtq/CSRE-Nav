@@ -10,11 +10,10 @@ import math
 
 import settings
 from cspace_cost_rays import (
-    LOG_CR_MIN_DIST,
     make_footprint_masks,
     build_cspace,
-    cost_rays_3d,
-    preprocess_cost_rays,
+    cost_ray_intervals_3d,
+    preprocess_cost_ray_intervals,
 )
 from global_planner import (
     GraphPlanner,
@@ -1114,7 +1113,7 @@ observation live in a single module.
 # (`cspace_cost_rays.py`) into ColorDynamic's GPU-vectorized `Sparrow` simulator,
 # replacing the Gazebo/c_space_mapper ROS pipeline.  The observation is exactly the
 # (RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim CNN state consumed by
-# `cnn_network.py` / `train.py` (currently 36×30 + 2 = 1082; geometry comes from
+# `cnn_network.py` / `train.py` (currently 2×36×30 + 2 = 2162; geometry comes from
 # `settings.CSPACE_*`):
 #
 #     state = flatten( preprocess(cost_rays) ) + [distance, heading]
@@ -1171,7 +1170,7 @@ class SparrowCspaceEnv(Sparrow):
     """Sparrow-V2 with a c-space (NavRL) observation.
 
     Use exactly like `Sparrow`, but `reset()`/`step()` return the cost-ray c-space
-    CNN state (B*nz + KINEMATIC_DIM dims, currently 36×30+2 = 1082) instead of the
+    CNN state (2*B*nz + KINEMATIC_DIM dims, currently 2×36×30+2 = 2162) instead of the
     default lidar state.  Defaults to the Continuous action (action_dim=2); set
     `action_type='Discrete'` for the 7-way discrete action (the last two state
     terms are then the mapped `a_state` velocities — discrete mode is *not* part of
@@ -1258,7 +1257,10 @@ class SparrowCspaceEnv(Sparrow):
         # output state dims
         self.cost_ray_num_beams = self.cspace_cfg["cost_ray_num_beams"]
         self.cost_ray_nz = self.cspace_cfg["nz"]
-        self.cspace_state_dim = self.cost_ray_num_beams * self.cost_ray_nz + 4
+        self.cspace_state_dim = (
+            settings.RAY_CHANNELS * self.cost_ray_num_beams * self.cost_ray_nz
+            + settings.KINEMATIC_DIM
+        )
 
     # --------------------------------------------- global-plan helpers
     def _rebuild_planner(self):
@@ -1418,33 +1420,40 @@ class SparrowCspaceEnv(Sparrow):
         return occ_flat.view(self.N, G, G)
 
     def _get_cspace_state(self, current_a):
-        """Build the CNN state (N, B*nz + KINEMATIC_DIM), e.g. (N, 1080 + 2).
+        """Build the interval-ray CNN state, e.g. (N, 2*36*30 + 2).
 
-        The block appended to the cost rays is [distance, heading] only.  It used
-        to also carry the previous action command as [v_lin, v_ang]; that feedback
-        was removed (see settings.KINEMATIC_DIM).  `current_a` is still accepted so
-        the reset/step call sites stay uniform, but it no longer enters the
-        observation.
+        The two ray channels are entry proximity and collision-interval width.
+        The block appended to them is [distance, heading] only. `current_a` is
+        still accepted so reset/step call sites stay uniform, but it does not
+        enter the observation.
         """
         cfg = self.cspace_cfg
         occ = self._build_occ_grid()
         cspace = build_cspace(occ, self._cspace_masks)
-        cost_rays = cost_rays_3d(
+        cost_intervals = cost_ray_intervals_3d(
             cspace, self._robot_cell,
             num_beams=cfg["cost_ray_num_beams"],
             h_res_deg=cfg["cost_ray_h_res_degrees"],
             max_range=cfg["cost_ray_max_range"],
             g_min=cfg["g_min"],
-        )                                                          # (N,B,nz) m
-        # stash raw / processed cost rays + c-space for logging & debugging
-        self.cost_rays_raw = cost_rays.detach()                    # (N,B,nz) m
+        )                                                          # (N,2,B,nz) m
+        # Preserve the legacy first-hit attribute for stuck detection and
+        # rendering, while exposing both raw interval boundaries for debugging.
+        self.cost_ray_enter_raw = cost_intervals[:, 0].detach()    # (N,B,nz) m
+        self.cost_ray_exit_raw = cost_intervals[:, 1].detach()     # (N,B,nz) m
+        self.cost_ray_width_raw = (
+            self.cost_ray_exit_raw - self.cost_ray_enter_raw
+        )
+        self.cost_rays_raw = self.cost_ray_enter_raw
         self.occ_grid = occ.detach()                               # (N,G,G) bool
         self.cspace = cspace.detach()                              # (N,G,G,nz) bool
-        cr_proc = preprocess_cost_rays(
-            cost_rays, max_range=cfg["cost_ray_max_range"]
-        )                                                          # (N,1,B,nz)
+        cr_proc = preprocess_cost_ray_intervals(
+            cost_intervals,
+            max_range=cfg["cost_ray_max_range"],
+            epsilon=cfg["g_min"] / 2.0,
+        )                                                          # (N,2,B,nz)
         self.cost_rays_proc = cr_proc.detach()
-        cr = cr_proc.reshape(self.N, -1)                           # (N, B*nz)
+        cr = cr_proc.reshape(self.N, -1)                           # (N,2*B*nz)
 
         # fresh distance (post AutoReset) + heading
         self.d2target_now = (
@@ -1453,7 +1462,7 @@ class SparrowCspaceEnv(Sparrow):
         distance = (self.d2target_now / 100.0).unsqueeze(-1)       # (N,1) m
         heading = self._heading_error().unsqueeze(-1)              # (N,1) rad
 
-        return torch.cat([cr, distance, heading], dim=1)           # (N, B*nz+2)
+        return torch.cat([cr, distance, heading], dim=1)           # (N,2*B*nz+2)
 
     def is_stuck(self, threshold=0.05):
         """Return (N,) bool: at theta=0 (driving straight, no rotation) even the
@@ -1543,15 +1552,27 @@ class SparrowCspaceEnv(Sparrow):
     def _draw_lidar_rays(self):
         """Replace the base lidar rays with c-space cost rays.
 
-        For each of the 36 beam directions, draw a ray out to the *farthest*
-        distance the robot can reach at any theta layer (`cost_rays_raw.max(dim=-1)`),
-        i.e. the most open route in that direction.  Ray colour goes red (near /
+        For a beam containing collision intervals, draw the farthest entry over
+        the same colliding theta layers used by the orange exit overlay.  This
+        keeps the paired envelope ordered: max(exit) >= max(entry).  A beam
+        clear at every theta is drawn to max range.  Colour goes red (near /
         blocked) -> green (far / open).
         """
-        raw = getattr(self, "cost_rays_raw", None)
-        if raw is None:
+        enter_t = getattr(self, "cost_ray_enter_raw", None)
+        exit_t = getattr(self, "cost_ray_exit_raw", None)
+        if enter_t is None or exit_t is None:
             return
-        max_d = raw[self.ri].max(dim=-1).values   # (B,) metres — farthest reach per beam
+        enter = enter_t[self.ri]
+        exit_distance = exit_t[self.ri]
+        collide = exit_distance > enter
+        max_range = self.cspace_cfg["cost_ray_max_range"]
+        max_entry = torch.where(collide, enter, torch.zeros_like(enter)) \
+            .max(dim=-1).values
+        max_d = torch.where(
+            collide.any(dim=-1),
+            max_entry,
+            torch.full_like(max_entry, max_range),
+        )
         car = self.car_state[self.ri]
         t = float(car[2])
 
@@ -1565,8 +1586,6 @@ class SparrowCspaceEnv(Sparrow):
         ends = sta + (max_d * 100.0).unsqueeze(-1) * dir_wd          # (B,2) world cm
         sta_gd = self._world_2_grid(sta).cpu().numpy()
         ends_gd = self._world_2_grid(ends).cpu().numpy()
-        max_range = self.cspace_cfg["cost_ray_max_range"]
-
         for i in range(self.cost_ray_num_beams):
             frac = max(min(max_d[i].item() / max_range, 1.0), 0.0)
             pygame.draw.aaline(self.canvas,
@@ -1809,15 +1828,11 @@ if __name__ == "__main__":
         ]},
     )
     s, info = env.reset()
-    flat = env.cost_ray_num_beams * env.cost_ray_nz        # B*nz (ray-grid cols)
-    exp_shape = (env.N, flat + settings.KINEMATIC_DIM)      # e.g. (2, 1082)
+    flat = settings.RAY_CHANNELS * env.cost_ray_num_beams * env.cost_ray_nz
+    exp_shape = (env.N, flat + settings.KINEMATIC_DIM)      # e.g. (2, 2162)
     print("reset state shape:", tuple(s.shape), "(expect %s)" % (exp_shape,))
-    expected_ray_max = math.log(
-        env.cspace_cfg["cost_ray_max_range"] / LOG_CR_MIN_DIST)
-    print("cost-ray sub-range: [%.2f, %.2f] (expect [0, %.2f])" % (
-        s[:, :flat].min().item(), s[:, :flat].max().item(),
-        expected_ray_max,
-    ))
+    print("interval-ray sub-range: [%.2f, %.2f] (expect [0, 1])" % (
+        s[:, :flat].min().item(), s[:, :flat].max().item()))
     print("distance col (m):", s[:, flat].tolist(), ">=0:", bool((s[:, flat] >= 0).all()))
     print("heading col (rad):", s[:, flat + 1].tolist())
 

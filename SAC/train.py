@@ -7,8 +7,9 @@ instead of the Gazebo `laser_env.GazeboEnv`, collecting N transitions per step
 batched on the GPU.
 
 State / action conventions:
-    - state  : (N, RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM) = flatten(preprocessed
-               cost_rays) + [dist, heading]   (currently 36×30 + 2 = 1082)
+    - state  : (N, 2×RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM) =
+               flatten([entry proximity, collision width]) + [dist, heading]
+               (currently 2×36×30 + 2 = 2162)
     - action : actor outputs tanh(-1,1); env receives
                a_in = settings.map_continuous_action(action)
                (linear a0 in [-1,1] when settings.ALLOW_REVERSE else [0,1];
@@ -75,7 +76,8 @@ def evaluate(network, env, eval_steps=EVAL_STEPS):
     num_goal = 0
     for _ in range(eval_steps):
         rg = state[:, :settings.RAY_GRID_FLAT_DIM].reshape(
-            env.N, 1, settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
+            env.N, settings.RAY_CHANNELS,
+            settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
         kin = state[:, settings.RAY_GRID_FLAT_DIM:]
         with torch.no_grad():
             action = network.actor.get_mean_action(rg, kin)      # (N,2) in [-1,1]
@@ -133,6 +135,7 @@ network = CNNSAC(
     max_action=settings.MAX_ACTION,
     h_beams=settings.RAY_H_BEAMS,
     v_layers=settings.RAY_V_LAYERS,
+    ray_channels=settings.RAY_CHANNELS,
     cnn_feature_dim=64,
     lr=settings.LR,
     alpha_lr=settings.ALPHA_LR,
@@ -175,7 +178,8 @@ quit_requested = False
 while total_steps < settings.MAX_TIMESTEPS:
     # split flat state into ray-grid + kinematic
     rg = state[:, :settings.RAY_GRID_FLAT_DIM].reshape(
-        N_ENVS, 1, settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
+        N_ENVS, settings.RAY_CHANNELS,
+        settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
     kin = state[:, settings.RAY_GRID_FLAT_DIM:]
 
     # sample stochastic action (SAC reparameterized), tanh(-1,1)

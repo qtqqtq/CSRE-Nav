@@ -11,12 +11,17 @@ Usage (inside the container, with a display / GPU):
     python3 play_cspace.py --ModelName SAC_sparrow_cspace --dvc cuda --global_plan
 
 The model consumes the (RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim c-space state
-(currently 36×30 + 2 = 1082 cost-ray grid + [dist, heading]), so it must have been
+(currently 2×36×30 + 2 = 2162 interval-ray grid + [dist, heading]), so it must have been
 trained on `SparrowCspaceEnv` (e.g. `SAC_sparrow_cspace`).
 
 With `--global_plan`, clicking the map plans a global path in the c-space graph
 (`GraphPlanner`) from the robot to the clicked point and enqueues its waypoints;
 without it, a click adds a single local waypoint as before.
+
+On top of the overlays from `render_utils`, `draw_interval_rays` (on by default,
+disable with `--interval_rays False`) draws the interval-ray far boundary: a cyan
+polyline at each beam's nearest collision (min `entry` over the theta layers) and
+one orange ray per colliding beam out to its farthest `exit` radius.
 """
 import argparse
 import os
@@ -31,7 +36,8 @@ import torch
 import settings
 from Sparrow_V2 import str2bool, Sparrow, SparrowCspacePlayground
 from cnn_network import CNNSAC
-from render_utils import draw_hud, draw_cost_rays, draw_cspace_projection, draw_lidar_ogm
+from render_utils import (draw_hud, draw_cost_rays, draw_interval_rays,
+                          draw_cspace_projection, draw_lidar_ogm)
 
 
 parser = argparse.ArgumentParser()
@@ -74,6 +80,12 @@ parser.add_argument('--stuck_threshold', type=float, default=0.1,
                     help='cost-ray distance (m) below which a beam counts as jammed '
                          '(play default 0.5; training default is settings.SPARROW_STUCK_THRESHOLD)')
 
+# ---- Interval-ray overlay (entry polyline + exit rays) ----
+parser.add_argument('--interval_rays', type=str2bool, default=True,
+                    help='overlay the interval rays: cyan polyline = nearest entry '
+                         '(min over theta), orange ray = farthest exit (max over the '
+                         'colliding theta layers)')
+
 # ---- Global planner (click -> plan a path in c-space, follow waypoints) ----
 parser.add_argument('--global_plan', action='store_true',
                     default=settings.GLOBAL_PLAN_ENABLED,
@@ -115,6 +127,7 @@ def main():
         max_action=settings.MAX_ACTION,
         h_beams=settings.RAY_H_BEAMS,
         v_layers=settings.RAY_V_LAYERS,
+        ray_channels=settings.RAY_CHANNELS,
         cnn_feature_dim=64,
         lr=settings.LR,
         device=opt.dvc,
@@ -135,9 +148,10 @@ def main():
             s, info = env.reset()
             ep_reward = 0.0
 
-        # unpack the flat c-space state -> (1,1,H,V) ray grid + (1,4) kinematic
+        # unpack flat state -> (1,C,H,V) interval rays + (1,2) kinematic
         rg = s[:, :settings.RAY_GRID_FLAT_DIM].reshape(
-            1, 1, settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
+            1, settings.RAY_CHANNELS,
+            settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
         kin = s[:, settings.RAY_GRID_FLAT_DIM:]
 
         with torch.no_grad():
@@ -160,6 +174,8 @@ def main():
         reward_val = float(env.reward_vec.item())
         ep_reward += reward_val
         draw_cost_rays(env, font)
+        if opt.interval_rays:
+            draw_interval_rays(env, font)
         draw_cspace_projection(env, font)
         draw_lidar_ogm(env, font)
         draw_hud(env, font, reward_val, ep_reward, q_pair=q_pair)
