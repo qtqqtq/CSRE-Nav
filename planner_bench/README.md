@@ -35,14 +35,22 @@ or `PLANNER_BENCH_REPORT_DIR`. Previous files are retained with `.prev`.
 - `worlds/limo_complex.world` is a byte-for-byte copy of the currently used
   multi_robot_scenario world. `bench_common.py --selftest` checks its 20 moving
   models and 0.01 s physics step.
-- The targets are hand-written in `config/bench.yaml` under `goals:` — one trial
-  per entry, in the order written, each as `{x, y, yaw?}` or `[x, y, yaw?]`.
-  Both planners run the same list from the same start, `(-3, 0, 0)`, outside the
-  population spawn square. Entries are checked against `arena.bounds` and the
-  world's static obstacle boxes at startup, so a typo fails before Gazebo
-  starts; whether a target is *hard* is the author's call. Point coordinates are
-  hashed into the run report, and `report.py` refuses to compare two runs whose
-  targets differ (`--force` to override).
+- Everything that changes with the map lives in `worlds/<stem>.yaml`, beside the
+  world it describes (`worlds/limo_complex.yaml` for
+  `worlds/limo_complex.world`). `bench.py` derives that path from `--world`, so
+  a run cannot use one map's bounds with another map's targets;
+  `--world-config` overrides it for a world kept elsewhere. It holds `arena`
+  (bounds, start, start_clearance), the `world:` block the self-test asserts,
+  and the hand-written `goals:` — one trial per entry, in the order written,
+  each as `{x, y, yaw?}` or `[x, y, yaw?]`. Both planners run the same list from
+  the same start, `(-3, 0, 0)`, outside the population spawn square. Entries are
+  checked against `arena.bounds` and the world's static obstacle boxes at
+  startup, so a typo fails before Gazebo starts; whether a target is *hard* is
+  the author's call. Point coordinates are hashed into the run report, and
+  `report.py` refuses to compare two runs whose targets differ (`--force` to
+  override).
+- `config/bench.yaml` holds what is true of the harness on any map: the fallback
+  robot footprint, the trial timeouts, the success radius.
 - `bench.py` checks `/clock`, 20 moving model poses, actual obstacle motion,
   `/odom`, `/limo/scan`, planner subscription, and required TF transforms before
   running. Every trial teleports the Limo, publishes its goal, and records the
@@ -69,6 +77,7 @@ are re-randomized every run, and are the reason repetitions are needed.
 
 `run.sh` orchestrates both runs, `start_planner.sh` sets private ROS parameters,
 `bench.py` scores episodes, `bench_common.py` handles geometry and reads the
-targets out of `config/bench.yaml`, and `report.py` compares JSON results.
+targets out of the world config, and `report.py` compares JSON results.
 Config and world data are kept beside them so the scripts can resolve paths from
-their own location.
+their own location. `worlds/` holds one `<stem>.world` + `<stem>.yaml` pair per
+map, and `python3 bench_common.py --selftest` checks the pair without Gazebo.

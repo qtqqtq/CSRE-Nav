@@ -8,6 +8,8 @@ REPORT_DIR=${PLANNER_BENCH_REPORT_DIR:-$BENCH_DIR/reports}
 LOG_DIR=${PLANNER_BENCH_LOG_DIR:-${TMPDIR:-/tmp}/planner_bench}
 WORLD=${PLANNER_BENCH_WORLD:-$BENCH_DIR/worlds/limo_complex.world}
 CONFIG=${PLANNER_BENCH_CONFIG:-$BENCH_DIR/config/bench.yaml}
+# The map's own parameters travel with the map: same directory, same stem.
+WORLD_CONFIG=${PLANNER_BENCH_WORLD_CONFIG:-${WORLD%.*}.yaml}
 GUI=${PLANNER_BENCH_GUI:-true}
 ROS_PORT=${PLANNER_BENCH_ROS_PORT:-11511}
 GAZEBO_PORT=${PLANNER_BENCH_GAZEBO_PORT:-11545}
@@ -24,7 +26,7 @@ if ! command -v roslaunch >/dev/null || ! command -v rosrun >/dev/null; then
     echo "Source /opt/ros/noetic/setup.bash and catkin_ws/devel/setup.bash first." >&2
     exit 2
 fi
-read -r START_X START_Y START_YAW <<< "$(python3 -c 'import yaml,sys; print(*yaml.safe_load(open(sys.argv[1]))["arena"]["start"])' "$BENCH_DIR/config/bench.yaml")"
+read -r START_X START_Y START_YAW <<< "$(python3 -c 'import yaml,sys; print(*yaml.safe_load(open(sys.argv[1]))["arena"]["start"])' "$WORLD_CONFIG")"
 mkdir -p "$REPORT_DIR" "$LOG_DIR"
 
 sim_pid=
@@ -89,7 +91,7 @@ run_one() {
 
     echo "Running $planner against $(basename "$WORLD")"
     python3 "$BENCH_DIR/bench.py" --planner "$planner" --world "$WORLD" \
-        --config "$CONFIG" --out "$out" "$@"
+        --config "$CONFIG" --world-config "$WORLD_CONFIG" --out "$out" "$@"
     echo "Wrote $out"
     cleanup
 }

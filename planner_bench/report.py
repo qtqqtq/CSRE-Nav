@@ -199,7 +199,7 @@ def main(argv):
     w("world     : %s" % os.path.basename(meta["world"]))
     w("            sha1 %s" % (meta.get("world_sha1") or "-")[:16])
     w("targets   : %d point(s) from %s"
-      % (a.n, os.path.basename(meta.get("goal_source", "-"))))
+      % (a.n, os.path.basename(meta.get("world_config", "-"))))
     w("            sha1 %s" % (meta.get("goals_sha1") or "-")[:16])
     w("start     : %s" % (meta.get("start"),))
     w("robot     : %.3f x %.3f m (%s) / %.3f x %.3f m (%s)"
@@ -295,7 +295,7 @@ def main(argv):
     w("")
 
     # ------------------------------------------------------------- by goal
-    w("per goal (indices are the order of `goals:` in bench.yaml)")
+    w("per goal (indices are the order of `goals:` in the world config)")
     w("%-4s %-22s %-22s %-22s" % ("i", "target", a.name, b.name))
     w("-" * 68)
     agree = {"both": 0, "neither": 0, "a_only": 0, "b_only": 0}

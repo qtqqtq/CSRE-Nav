@@ -561,14 +561,46 @@ def footprint_from_urdf(xml_string, root_link="base_footprint"):
 
 
 def load_bench_config(path):
-    """Load bench.yaml.  Imported lazily so the module stays import-cheap."""
+    """Load config/bench.yaml -- the harness parameters.  Lazy import: the module
+    stays import-cheap for callers that only want the geometry helpers."""
     import yaml
     with open(path) as fh:
         return yaml.safe_load(fh) or {}
 
 
+def world_config_path(world_path):
+    """The per-world config that belongs to a world file: same directory, same
+    stem, ``.yaml``.  worlds/limo_complex.world -> worlds/limo_complex.yaml.
+
+    Derived rather than configured so the two cannot drift apart: a run cannot
+    load one map's bounds and start pose while scoring another map's targets.
+    """
+    return os.path.splitext(os.path.abspath(world_path))[0] + ".yaml"
+
+
+def load_world_config(path):
+    """Load a worlds/<stem>.yaml.  Missing is an error, not an empty dict.
+
+    An absent file would otherwise surface as a `KeyError: 'arena'` from deep
+    inside the harness, where the cause (this world has no config authored yet)
+    is nowhere in the message.
+    """
+    import yaml
+    if not os.path.exists(path):
+        raise ValueError(
+            "no world config at %s.  Every world needs one beside it, holding "
+            "`arena` (bounds, start, start_clearance) and the `goals` list; "
+            "copy worlds/limo_complex.yaml as a starting point." % path)
+    with open(path) as fh:
+        cfg = yaml.safe_load(fh) or {}
+    for key in ("arena", "goals"):
+        if key not in cfg:
+            raise ValueError("%s has no `%s` section" % (path, key))
+    return cfg
+
+
 def goals_from_config(cfg, obstacles=None, bounds=None, start=None):
-    """Read the hand-written ``goals:`` list out of bench.yaml.
+    """Read the hand-written ``goals:`` list out of a world config.
 
     Targets are authored, not sampled, so this returns them in file order with
     the list index as ``i`` -- what bench.py reports per trial and what
@@ -587,12 +619,11 @@ def goals_from_config(cfg, obstacles=None, bounds=None, start=None):
     raw = cfg.get("goals")
     if raw is None:
         raise ValueError(
-            "bench.yaml has no `goals:` list.  The benchmark runs one trial per "
-            "entry, so it needs at least one target, e.g.\n"
+            "no `goals:` list.  The benchmark runs one trial per entry, so it "
+            "needs at least one target, e.g.\n"
             "  goals:\n    - {x: 0.0, y: 0.0, yaw: 0.0}")
     if not isinstance(raw, (list, tuple)) or not raw:
-        raise ValueError("bench.yaml `goals:` must be a non-empty list, got %r"
-                         % (raw,))
+        raise ValueError("`goals:` must be a non-empty list, got %r" % (raw,))
 
     goals = []
     for i, entry in enumerate(raw):
@@ -656,10 +687,16 @@ def _selftest(world, cfg_path):
     Runs under a bare python3 -- no master, no Gazebo -- so an authoring mistake
     (a wall too thick, a corridor too narrow, a mis-named model) fails in a
     second instead of showing up as a mysterious planner failure mid-run.
+
+    Which invariants apply is the world's own declaration: a world config with a
+    `world.moving_models` block describes a furniture-free population world and
+    gets the checks that go with one.  Keying this off the filename instead would
+    put the numbers in the code, where changing the world cannot reach them.
     """
-    cfg = load_bench_config(cfg_path) if cfg_path else {}
+    cfg = load_world_config(cfg_path) if cfg_path else {}
     arena = cfg.get("arena", {})
-    if os.path.basename(world) == 'limo_complex.world':
+    declared = cfg.get("world") or {}
+    if declared.get("moving_models"):
         tree = ET.parse(world)
         root = tree.getroot()
         populations = root.findall('./world/population')
@@ -670,13 +707,22 @@ def _selftest(world, cfg_path):
         physics = root.find('./world/physics')
         step = float(physics.findtext('max_step_size', '0')) if physics is not None else 0
         rate = float(physics.findtext('real_time_update_rate', '0')) if physics is not None else 0
-        ok = (count == 20 and step == 0.01 and rate == 100
-              and not parse_world_obstacles(world, margin=0.0)
+        want = int(declared["moving_models"])
+        want_step = float(declared.get("physics_step", 0.01))
+        want_rate = float(declared.get("physics_rate", 100))
+        # Static AABBs must be exactly zero: the goal loader treats an empty
+        # obstacle set as "nothing fixed to avoid", and the whole difficulty of
+        # this world is supposed to come from the moving models.
+        static = parse_world_obstacles(world, margin=0.0)
+        ok = (count == want and step == want_step and rate == want_rate
+              and not static
               and all(moving_obstacle_radius('cross_clone_%d' % i) is not None
-                      for i in range(20))
+                      for i in range(want))
               and len(arena.get('start', [])) == 3)
-        print('limo_complex: %d moving models, physics %.3f/%g, static AABBs %d'
-              % (count, step, rate, len(parse_world_obstacles(world, 0.0))))
+        print('%s: %d moving models (want %d), physics %.3f/%g (want %.3f/%g), '
+              'static AABBs %d'
+              % (os.path.basename(world), count, want, step, rate, want_step,
+                 want_rate, len(static)))
         print('SELFTEST %s' % ('PASSED' if ok else 'FAILED'))
         return 0 if ok else 1
     fails = []
@@ -789,12 +835,13 @@ def _selftest(world, cfg_path):
 def main(argv):
     here = os.path.dirname(os.path.abspath(__file__))
     default_world = os.path.join(here, "worlds", "limo_complex.world")
-    default_cfg = os.path.join(here, "config", "bench.yaml")
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--world", default=default_world)
-    ap.add_argument("--config", default=default_cfg)
+    ap.add_argument("--config", default=None,
+                    help="world config; default: <world stem>.yaml beside the "
+                         "world file")
     ap.add_argument("--urdf", default=None,
                     help="also derive the footprint from this URDF/xacro output")
     args = ap.parse_args(argv)
@@ -808,7 +855,7 @@ def main(argv):
         return 0
 
     if args.selftest:
-        return _selftest(args.world, args.config)
+        return _selftest(args.world, args.config or world_config_path(args.world))
 
     ap.print_help()
     return 0

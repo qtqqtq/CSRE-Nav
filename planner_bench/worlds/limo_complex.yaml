@@ -1,0 +1,40 @@
+# Per-world parameters, named after the world they describe and kept beside it:
+# worlds/limo_complex.yaml belongs to worlds/limo_complex.world.  bench.py
+# derives this path from --world, so a run cannot load one map's geometry with
+# another map's targets.
+#
+# config/bench.yaml holds what is true of the harness rather than of the map:
+# the robot footprint, the trial timeouts, the success radius.
+
+# What the world file must contain.  Asserted by `bench_common.py --selftest`,
+# which is the cheap way to catch a mis-authored world before Gazebo is started.
+world:
+  moving_models: 20
+  # Not free parameters: 1 ms (Gazebo's default) makes ODE blow up and gzserver
+  # die, and a rate below the step size makes the sim run slower than real time
+  # and quietly changes what a 90 s trial means.
+  physics_step: 0.01
+  physics_rate: 100
+
+arena:
+  bounds: [-5.0, 5.0, -5.0, 5.0]
+  # Outside the population spawn square; prevents collisions at time zero.
+  start: [-3.0, 0.0, 0.0]
+  start_clearance: 0.15
+
+# Hand-written targets, one trial per entry, run in the order written.  The
+# robot is teleported to arena.start before each one, so entries do not chain.
+#
+#   goals:
+#     - {x: 0.0, y: 0.0, yaw: 0.0}     # mapping form
+#     - [1.5, -2.0]                    # [x, y] shorthand; yaw defaults to 0
+#
+# `yaw` is the heading published with the goal.  neupan reads it, cspace ignores
+# PoseStamped.orientation entirely, so a non-zero yaw only helps neupan.
+# Every point is checked against arena.bounds and the world's static obstacle
+# boxes when the harness starts -- a point that cannot be a goal is a typo, and
+# it should not cost a Gazebo run to find out.
+goals:
+  - x: 0.0
+    y: 0.0
+    yaw: 0.0

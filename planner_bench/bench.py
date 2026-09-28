@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run one planner through the targets hand-written in bench.yaml, scoring each.
+"""Run one planner through the targets hand-written in the world config.
 
     ./planner_bench/run.sh cspace
     ./planner_bench/run.sh neupan
@@ -46,8 +46,9 @@ import time
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 from bench_common import (footprint_from_urdf, goals_from_config, goals_sha1,
-                          load_bench_config, min_clearance, moving_clearance,
-                          parse_world_obstacles, point_aabb_distance, sha1_of)
+                          load_bench_config, load_world_config, min_clearance,
+                          moving_clearance, parse_world_obstacles,
+                          point_aabb_distance, sha1_of, world_config_path)
 
 import rospy
 import tf
@@ -169,13 +170,18 @@ def local_speed_from_trace(rows):
 
 
 class Bench(object):
-    def __init__(self, args, cfg, obstacles, half_len, half_wid):
+    def __init__(self, args, cfg, wcfg, obstacles, half_len, half_wid):
         self.args = args
+        # Two configs, kept apart on purpose: `cfg` is the harness (timeouts,
+        # success radius, fallback footprint) and `wcfg` is the map (arena
+        # bounds, start pose, targets).  Mixing them is how a trial timeout ends
+        # up needing a world edit.
         self.cfg = cfg
+        self.wcfg = wcfg
         self.obstacles = obstacles
         self.half_len = half_len
         self.half_wid = half_wid
-        self.bounds = tuple(cfg["arena"]["bounds"])
+        self.bounds = tuple(wcfg["arena"]["bounds"])
         self.start_pose = tuple(args.start)
         self.planner = PLANNERS[args.planner]
         self.claimed_arrival = False
@@ -418,8 +424,8 @@ class Bench(object):
         # Start pose sanity: must be inside the arena and clear of obstacles.
         clr = self.clearance(*self.start_pose)
         log("  start clearance %.3f m (bench.yaml requires %.2f)"
-            % (clr, self.cfg["arena"]["start_clearance"]))
-        if clr < self.cfg["arena"]["start_clearance"]:
+            % (clr, self.wcfg["arena"]["start_clearance"]))
+        if clr < self.wcfg["arena"]["start_clearance"]:
             rospy.logwarn("[bench] moving obstacle is near the start pose; "
                           "continuing because it may move away")
 
@@ -534,7 +540,7 @@ class Bench(object):
         # A moving obstacle may pass through the fixed start between trials.
         # Do not teleport the robot into it and credit the planner with a loss.
         wait_until = now_s() + 30.0
-        minimum = self.cfg["arena"]["start_clearance"]
+        minimum = self.wcfg["arena"]["start_clearance"]
         while self.clearance(*self.start_pose) < minimum and now_s() < wait_until:
             rospy.sleep(0.1)
         if self.clearance(*self.start_pose) < minimum:
@@ -780,7 +786,12 @@ def main(argv):
     ap.add_argument("--world", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--config", default=None,
-                    help="default: ../config/bench.yaml relative to this script")
+                    help="harness parameters; default: ../config/bench.yaml "
+                         "relative to this script")
+    ap.add_argument("--world-config", default=None,
+                    help="per-world arena and targets; default: the world file's "
+                         "sibling .yaml (worlds/limo_complex.world -> "
+                         "worlds/limo_complex.yaml)")
     ap.add_argument("--start", type=float, nargs=3, default=None,
                     metavar=("X", "Y", "YAW"))
     ap.add_argument("--timeout", type=float, default=None,
@@ -800,32 +811,38 @@ def main(argv):
     pkg = _HERE
     if args.config is None:
         args.config = os.path.join(pkg, "config", "bench.yaml")
+    if args.world_config is None:
+        args.world_config = world_config_path(args.world)
     cfg = load_bench_config(args.config)
+    try:
+        wcfg = load_world_config(args.world_config)
+    except ValueError as exc:
+        sys.exit("[bench] %s" % exc)
     if args.start is None:
-        args.start = cfg["arena"]["start"]
+        args.start = wcfg["arena"]["start"]
     if args.timeout is not None:
         cfg["trial"]["trial_timeout"] = args.timeout
 
     obstacles = parse_world_obstacles(args.world, margin=0.0)
     try:
-        goals = goals_from_config(cfg, obstacles=obstacles,
-                                  bounds=tuple(cfg["arena"]["bounds"]),
+        goals = goals_from_config(wcfg, obstacles=obstacles,
+                                  bounds=tuple(wcfg["arena"]["bounds"]),
                                   start=args.start)
     except ValueError as exc:
         # Before rospy.init_node, let alone Gazebo: a mistyped target is an
         # authoring mistake, and finding it should not cost a simulation run.
-        sys.exit("[bench] %s" % exc)
+        sys.exit("[bench] %s: %s" % (args.world_config, exc))
     declared = goals
     if args.only is not None:
         goals = [g for g in declared if g["i"] in args.only]
         if not goals:
             sys.exit("[bench] --only %s matched none of the %d goals in %s"
-                     % (args.only, len(declared), args.config))
+                     % (args.only, len(declared), args.world_config))
     args.goals = goals
     actual_goal_sha1 = goals_sha1(goals)
 
     rospy.init_node("bench_harness", anonymous=True, disable_signals=True)
-    log("starting: planner=%s goals=%s" % (args.planner, args.config))
+    log("starting: planner=%s world_config=%s" % (args.planner, args.world_config))
     for g in goals:
         # A target inside the success radius is an instant success and a wasted
         # trial; a legal choice, but almost always a typo in the decimals.
@@ -862,7 +879,7 @@ def main(argv):
                       "(%.3f x %.3f m)"
                       % (type(exc).__name__, exc, 2 * half_len, 2 * half_wid))
 
-    bench = Bench(args, cfg, obstacles, half_len, half_wid)
+    bench = Bench(args, cfg, wcfg, obstacles, half_len, half_wid)
     if not bench.preflight():
         rospy.logfatal("[bench] pre-flight failed; not running any trial")
         return 2
@@ -882,11 +899,11 @@ def main(argv):
             "planner": args.planner,
             "world": os.path.abspath(args.world),
             "world_sha1": actual_world_sha1,
-            # Where the targets came from, and a hash of the points themselves.
-            # report.py refuses to compare two runs with different goals_sha1:
-            # the file may be edited between runs, and a comparison across two
-            # different target lists would be an average of nothing.
-            "goal_source": os.path.abspath(args.config),
+            # The map's own config (arena + targets), and a hash of the points
+            # themselves.  report.py refuses to compare two runs with different
+            # goals_sha1: the file may be edited between runs, and a comparison
+            # across two different target lists would be an average of nothing.
+            "world_config": os.path.abspath(args.world_config),
             "goals_sha1": actual_goal_sha1,
             "start": list(args.start),
             "robot": {"half_length": half_len, "half_width": half_wid},
