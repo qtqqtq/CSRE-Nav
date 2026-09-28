@@ -423,8 +423,9 @@ class Bench(object):
 
         # Start pose sanity: must be inside the arena and clear of obstacles.
         clr = self.clearance(*self.start_pose)
-        log("  start clearance %.3f m (bench.yaml requires %.2f)"
-            % (clr, self.wcfg["arena"]["start_clearance"]))
+        log("  start clearance %.3f m (%s requires %.2f)"
+            % (clr, os.path.basename(self.args.world_config),
+               self.wcfg["arena"]["start_clearance"]))
         if clr < self.wcfg["arena"]["start_clearance"]:
             rospy.logwarn("[bench] moving obstacle is near the start pose; "
                           "continuing because it may move away")
