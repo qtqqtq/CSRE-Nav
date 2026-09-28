@@ -3,7 +3,7 @@
 """Compare two planner_bench runs side by side.
 
     python3 report.py reports/cspace_run.json reports/neupan_run.json
-    python3 report.py                      # both files in ../reports/
+    python3 report.py                      # both files in reports/
 
 Pure stdlib and no ROS on purpose: this reads two JSON reports and prints a
 table, and it has to keep working after the simulation is gone.
@@ -142,10 +142,13 @@ def check_comparable(a, b):
         problems.append("different worlds -- same path, different content "
                         "(%s: %s vs %s: %s)"
                         % (a.name, wa[:12], b.name, wb[:12]))
-    ga = os.path.basename(a.doc["meta"].get("goal_set", ""))
-    gb = os.path.basename(b.doc["meta"].get("goal_set", ""))
-    if ga and gb and ga != gb:
-        problems.append("different goal sets (%s vs %s)" % (ga, gb))
+    # Only the points are compared, not the file they were written in: the
+    # targets now live in bench.yaml beside the trial timeouts, and retuning one
+    # of those must not make two runs over identical targets look incomparable.
+    ha = a.doc["meta"].get("goals_sha1")
+    hb = b.doc["meta"].get("goals_sha1")
+    if ha and hb and ha != hb:
+        problems.append("different goal points (%s vs %s)" % (ha[:12], hb[:12]))
     sa = a.doc["meta"].get("start")
     sb = b.doc["meta"].get("start")
     if sa and sb and any(abs(x - y) > 1e-6 for x, y in zip(sa, sb)):
@@ -164,7 +167,7 @@ def main(argv):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("reports", nargs="*",
                     help="two planner run JSONs; default: every *_run.json in "
-                         "../reports/")
+                         "reports/")
     ap.add_argument("--out", default=None, help="also write the table to a file")
     ap.add_argument("--force", action="store_true",
                     help="print the comparison even if the runs are not comparable")
@@ -173,15 +176,14 @@ def main(argv):
     paths = args.reports
     if not paths:
         here = os.path.dirname(os.path.abspath(__file__))
-        rdir = os.path.normpath(os.path.join(here, os.pardir, "reports"))
+        rdir = os.path.join(here, "reports")
         if os.path.isdir(rdir):
             paths = sorted(os.path.join(rdir, f) for f in os.listdir(rdir)
                            if f.endswith("_run.json"))
         if len(paths) != 2:
             sys.exit("expected exactly 2 reports in %s, found %d.  Run both "
                      "planners first:\n"
-                     "  roslaunch planner_bench bench.launch planner:=cspace\n"
-                     "  roslaunch planner_bench bench.launch planner:=neupan"
+                     "  ./planner_bench/run.sh both"
                      % (rdir, len(paths)))
     if len(paths) != 2:
         sys.exit("expected exactly 2 reports, got %d" % len(paths))
@@ -196,9 +198,9 @@ def main(argv):
     meta = a.doc["meta"]
     w("world     : %s" % os.path.basename(meta["world"]))
     w("            sha1 %s" % (meta.get("world_sha1") or "-")[:16])
-    w("goal set  : %s (seed %s, %d goals)"
-      % (os.path.basename(meta.get("goal_set", "-")),
-         meta.get("goal_set_seed"), a.n))
+    w("targets   : %d point(s) from %s"
+      % (a.n, os.path.basename(meta.get("goal_source", "-"))))
+    w("            sha1 %s" % (meta.get("goals_sha1") or "-")[:16])
     w("start     : %s" % (meta.get("start"),))
     w("robot     : %.3f x %.3f m (%s) / %.3f x %.3f m (%s)"
       % (2 * a.doc["meta"]["robot"]["half_length"],
@@ -293,14 +295,15 @@ def main(argv):
     w("")
 
     # ------------------------------------------------------------- by goal
-    w("per goal")
-    w("%-4s %-8s %-7s %-22s %-22s" % ("i", "band", "dist", a.name, b.name))
+    w("per goal (indices are the order of `goals:` in bench.yaml)")
+    w("%-4s %-22s %-22s %-22s" % ("i", "target", a.name, b.name))
     w("-" * 68)
     agree = {"both": 0, "neither": 0, "a_only": 0, "b_only": 0}
     for i in sorted(set(a.by_i) & set(b.by_i)):
         ta, tb = a.by_i[i], b.by_i[i]
-        band = ta["goal"].get("band", "-")
-        dist = ta["goal"].get("distance", float("nan"))
+        g = ta["goal"]
+        dist = g.get("distance", float("nan"))
+        tgt = "(%.2f, %.2f) %.2fm" % (g["x"], g["y"], dist)
         sa = ta["verdict"] == "success"
         sb = tb["verdict"] == "success"
         if sa and sb:
@@ -318,39 +321,23 @@ def main(argv):
                 else "-")
             return "%-9s %s" % (t["verdict"], extra)
 
-        w("%-4d %-8s %-7s %-22s %-22s"
-          % (i, band, fmt(dist, "%.2f"), cell(ta, sa), cell(tb, sb)))
+        w("%-4d %-22s %-22s %-22s" % (i, tgt, cell(ta, sa), cell(tb, sb)))
     w("")
-    w("%-26s %-18s %-18s" % ("paired outcome", a.name, b.name))
+    w("%-26s %-18s %-18s" % ("same target outcome", a.name, b.name))
     w("%-26s %d" % ("both succeed", agree["both"]))
     w("%-26s %d" % ("both fail", agree["neither"]))
     w("%-26s %d" % ("only %s" % a.name, agree["a_only"]))
     w("%-26s %d" % ("only %s" % b.name, agree["b_only"]))
     w("")
 
-    # ------------------------------------------------------------ by band
-    bands = []
-    for i in sorted(set(a.by_i) & set(b.by_i)):
-        bd = a.by_i[i]["goal"].get("band")
-        if bd and bd not in bands:
-            bands.append(bd)
-    if bands:
-        w("by difficulty band (line-of-sight clearance from the start pose)")
-        w("%-10s %-24s %-24s" % ("band", a.name, b.name))
-        w("-" * 68)
-        for bd in bands:
-            idx = [i for i in a.by_i if a.by_i[i]["goal"].get("band") == bd]
-            sa = sum(1 for i in idx if a.by_i[i]["verdict"] == "success")
-            sb = sum(1 for i in idx if b.by_i[i]["verdict"] == "success")
-            w("%-10s %-24s %-24s"
-              % (bd, "%d/%d  (%.0f%%)" % (sa, len(idx), 100.0 * sa / len(idx)),
-                 "%d/%d  (%.0f%%)" % (sb, len(idx), 100.0 * sb / len(idx))))
-        w("")
-
     # --------------------------------------------------------- the caveats
     w("known asymmetries -- not normalised, and they are not symmetric")
     w("-" * 68)
     for line in [
+        "dynamic obstacles: the two runs use independent RVO trajectories;",
+        "  matching goals do not imply matching obstacle encounters.",
+        "collision: model-pose bounding circles are a proximity proxy,",
+        "  especially for person meshes; they are not Gazebo contact events.",
         "footprint: both planners are scored with the same ground-truth robot,",
         "  but cspace's POLICY was trained to dilate obstacles by a 1.20 x 0.14 m",
         "  footprint while the Limo is 0.29 x 0.22 m.  Changing it would take the",

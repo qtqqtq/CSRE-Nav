@@ -1,35 +1,16 @@
 #!/usr/bin/env python3
 
-"""Geometry and world-parsing helpers shared by the planner_bench tools.
+"""ROS-free geometry and world helpers for the benchmark scripts.
 
-This module is deliberately **ROS-free at import time**: `gen_goals.py` and the
-`--selftest` below must run under a bare `python3`, with no master and no
-`rospy`.  The ROS-facing pieces (`bench.py`) import it, not the other way round.
-
-`parse_world_obstacles` and `check_pos` are vendored verbatim from
-`SAC/laser_env.py` rather than imported.  Importing that module would drag in
-rospy / gazebo_msgs / squaternion / sensor_msgs for what is pure XML geometry,
-which would make the goal set unreproducible without a ROS environment.  The
-copies are kept honest by `--selftest`, which imports the originals when they are
-reachable and asserts the two agree on the bench world.
-
-Everything below that is *not* vendored is new, because the upstream versions do
-not answer the questions the benchmark asks:
-
-  * `infer_bounds`   -- upstream infers the arena from the *margin-inflated*
-                        obstacle list and requires `span_y < 1.0` after a 0.3 m
-                        pad, so it silently returns nothing for any wall thicker
-                        than 0.4 m.  This version keys off wall *thinness*.
-  * `obb_aabb_clearance` -- upstream has no collision geometry at all; it treats
-                        collision as a laser-proximity threshold, which cannot
-                        see the 120 degrees behind a 240-degree lidar.
-  * `segment_clearance`  -- line-of-sight test used to reject goals that sit
-                        behind a concave obstacle (neither planner can solve
-                        those; see the README's fairness contract).
+The current world has 20 moving obstacles. Fixed geometry is parsed from the
+SDF file; moving model positions are read from Gazebo during each trial.
+The standalone self-test checks that the copied world contains the expected
+population and stable physics settings.
 """
 
 import argparse
 import hashlib
+import json
 import math
 import os
 import sys
@@ -96,8 +77,13 @@ def parse_world_obstacles(world_path, margin=0.3):
     root = tree.getroot()
     obstacles = []
 
-    for model in root.iter('model'):
+    # Only world-level static models belong to the fixed collision map. The
+    # migrated Limo world has a population and 10 moving models; their current
+    # positions are read from /gazebo/model_states by bench.py instead.
+    for model in root.findall('./world/model'):
         name = model.get('name', '')
+        if model.findtext('static', '').strip().lower() in ('0', 'false'):
+            continue
         if 'cardboard_box' in name:
             continue
         # Skip ground/floor plates (e.g. ground_plane, asphalt_plane): they are
@@ -350,6 +336,47 @@ def min_clearance(cx, cy, yaw, half_len, half_wid, obstacles):
                for a in obstacles)
 
 
+def moving_obstacle_radius(name):
+    """Bounding circle for a moving model in limo_complex.world, in metres.
+
+    The first ten are cross shaped pairs of cylinders; model 10 is a 5 cm
+    cylinder; models 11-19 use a 0.3-scaled person mesh. Mesh clearance is an
+    approximation and is reported as such in the benchmark documentation.
+    """
+    if not name.startswith('cross_clone_'):
+        return None
+    try:
+        index = int(name.rsplit('_', 1)[1])
+    except ValueError:
+        return None
+    if index < 10:
+        return 0.26
+    if index == 10:
+        return 0.05
+    if index < 20:
+        return 0.25
+    return None
+
+
+def moving_clearance(cx, cy, yaw, half_len, half_wid, models):
+    """Signed clearance from Limo rectangle to moving bounding circles.
+
+    models is an iterable of (name, x, y) ground-truth Gazebo poses.
+    """
+    best = float('inf')
+    c, s = math.cos(yaw), math.sin(yaw)
+    for name, x, y in models:
+        radius = moving_obstacle_radius(name)
+        if radius is None:
+            continue
+        dx, dy = x - cx, y - cy
+        rx, ry = c * dx + s * dy, -s * dx + c * dy
+        ox = max(abs(rx) - half_len, 0.0)
+        oy = max(abs(ry) - half_wid, 0.0)
+        best = min(best, math.hypot(ox, oy) - radius)
+    return best
+
+
 def segment_clearance(p0, p1, obstacles, step=0.05):
     """Minimum distance from the segment ``p0 -> p1`` to any obstacle AABB.
 
@@ -540,6 +567,84 @@ def load_bench_config(path):
         return yaml.safe_load(fh) or {}
 
 
+def goals_from_config(cfg, obstacles=None, bounds=None, start=None):
+    """Read the hand-written ``goals:`` list out of bench.yaml.
+
+    Targets are authored, not sampled, so this returns them in file order with
+    the list index as ``i`` -- what bench.py reports per trial and what
+    ``--only`` filters on.  An entry is either a mapping (``{x, y, yaw?}``) or a
+    ``[x, y]`` / ``[x, y, yaw]`` sequence, because a point reads better written
+    by hand as three numbers on one line.
+
+    A point that cannot be a goal -- outside the arena, inside a static obstacle,
+    or not a number at all -- raises here rather than becoming a mysterious
+    failed trial.  Whether a point is *hard* is not checked: that is the
+    author's call, and the whole reason the list is hand-written.
+
+    ``distance`` is added from ``start`` when one is given.  It is reported, not
+    filtered on.
+    """
+    raw = cfg.get("goals")
+    if raw is None:
+        raise ValueError(
+            "bench.yaml has no `goals:` list.  The benchmark runs one trial per "
+            "entry, so it needs at least one target, e.g.\n"
+            "  goals:\n    - {x: 0.0, y: 0.0, yaw: 0.0}")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError("bench.yaml `goals:` must be a non-empty list, got %r"
+                         % (raw,))
+
+    goals = []
+    for i, entry in enumerate(raw):
+        if isinstance(entry, dict):
+            missing = [k for k in ("x", "y") if k not in entry]
+            if missing:
+                raise ValueError("goals[%d] is missing %s"
+                                 % (i, " and ".join(missing)))
+            x, y, yaw = entry["x"], entry["y"], entry.get("yaw", 0.0)
+        elif isinstance(entry, (list, tuple)) and 2 <= len(entry) <= 3:
+            x, y = entry[0], entry[1]
+            yaw = entry[2] if len(entry) == 3 else 0.0
+        else:
+            raise ValueError("goals[%d] must be {x, y, yaw?} or [x, y, yaw?], "
+                             "got %r" % (i, entry))
+
+        for name, v in (("x", x), ("y", y), ("yaw", yaw)):
+            # bool is an int in Python; `y: true` is a typo, not a coordinate.
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError("goals[%d].%s must be a number, got %r"
+                                 % (i, name, v))
+        x, y, yaw = float(x), float(y), float(yaw)
+
+        if bounds is not None:
+            x_min, x_max, y_min, y_max = bounds
+            if not (x_min <= x <= x_max and y_min <= y <= y_max):
+                raise ValueError(
+                    "goals[%d] = (%.3f, %.3f) is outside arena.bounds "
+                    "x[%.2f %.2f] y[%.2f %.2f]" % (i, x, y, x_min, x_max,
+                                                   y_min, y_max))
+        if obstacles and not check_pos(x, y, obstacles, bounds=bounds, margin=0.0):
+            raise ValueError("goals[%d] = (%.3f, %.3f) is inside a static "
+                             "obstacle in the world file" % (i, x, y))
+
+        g = {"i": i, "x": x, "y": y, "yaw": yaw}
+        if start is not None:
+            g["distance"] = round(math.hypot(x - start[0], y - start[1]), 4)
+        goals.append(g)
+    return goals
+
+
+def goals_sha1(goals):
+    """Canonical hash of the goal points, for report.py's comparability check.
+
+    Hashes the normalized points rather than the config file they came from:
+    reordering a comment or retuning a timeout in bench.yaml must not make two
+    runs look incomparable, while moving a target must.
+    """
+    blob = json.dumps(goals, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()
+
+
 # --------------------------------------------------------------------------
 # Self-test
 # --------------------------------------------------------------------------
@@ -554,6 +659,26 @@ def _selftest(world, cfg_path):
     """
     cfg = load_bench_config(cfg_path) if cfg_path else {}
     arena = cfg.get("arena", {})
+    if os.path.basename(world) == 'limo_complex.world':
+        tree = ET.parse(world)
+        root = tree.getroot()
+        populations = root.findall('./world/population')
+        explicit = root.findall('./world/model')
+        movers = [m for m in explicit if (m.get('name') or '').startswith('cross_clone_')]
+        count = sum(int(p.findtext('model_count', '0')) for p in populations)
+        count += len(movers)
+        physics = root.find('./world/physics')
+        step = float(physics.findtext('max_step_size', '0')) if physics is not None else 0
+        rate = float(physics.findtext('real_time_update_rate', '0')) if physics is not None else 0
+        ok = (count == 20 and step == 0.01 and rate == 100
+              and not parse_world_obstacles(world, margin=0.0)
+              and all(moving_obstacle_radius('cross_clone_%d' % i) is not None
+                      for i in range(20))
+              and len(arena.get('start', [])) == 3)
+        print('limo_complex: %d moving models, physics %.3f/%g, static AABBs %d'
+              % (count, step, rate, len(parse_world_obstacles(world, 0.0))))
+        print('SELFTEST %s' % ('PASSED' if ok else 'FAILED'))
+        return 0 if ok else 1
     fails = []
 
     def check(ok, msg):
@@ -663,10 +788,8 @@ def _selftest(world, cfg_path):
 
 def main(argv):
     here = os.path.dirname(os.path.abspath(__file__))
-    default_world = os.path.normpath(
-        os.path.join(here, os.pardir, "worlds", "bench_arena.world"))
-    default_cfg = os.path.normpath(
-        os.path.join(here, os.pardir, "config", "bench.yaml"))
+    default_world = os.path.join(here, "worlds", "limo_complex.world")
+    default_cfg = os.path.join(here, "config", "bench.yaml")
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--selftest", action="store_true")

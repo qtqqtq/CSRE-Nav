@@ -1,8 +1,0 @@
-# Everything the harness writes.  Ignore the whole directory rather than
-# enumerating suffixes: a driver that parks a previous report as
-# cspace_run.json.prev (so a crashed run can be told from a deleted one) would
-# otherwise slip a stale multi-megabyte run into the commit.
-reports/*
-!reports/.gitkeep
-__pycache__/
-*.pyc

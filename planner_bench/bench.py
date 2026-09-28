@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
-"""Run one planner through the shared goal set and score every trial.
+"""Run one planner through the targets hand-written in bench.yaml, scoring each.
 
-    roslaunch planner_bench bench.launch planner:=cspace
-    roslaunch planner_bench bench.launch planner:=neupan
+    ./planner_bench/run.sh cspace
+    ./planner_bench/run.sh neupan
 
-Started by bench.launch, not by hand.  One planner at a time: the two nodes both
+Started by run.sh. One planner at a time: the two nodes both
 want /cmd_vel and there is one robot.
 
 WHAT IS MEASURED, AND WHY IT IS MEASURED THIS WAY
@@ -43,14 +43,10 @@ import os
 import sys
 import time
 
-# installed, this script sits next to bench_common.py in lib/<pkg>/; run from the
-# source tree, the module is one directory over in src/
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (_HERE, os.path.join(_HERE, os.pardir, "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from bench_common import (footprint_from_urdf, load_bench_config, min_clearance,
+from bench_common import (footprint_from_urdf, goals_from_config, goals_sha1,
+                          load_bench_config, min_clearance, moving_clearance,
                           parse_world_obstacles, point_aabb_distance, sha1_of)
 
 import rospy
@@ -240,6 +236,21 @@ class Bench(object):
         p = msg.pose[msg.name.index(MODEL_NAME)]
         return (p.position.x, p.position.y, yaw_of(p.orientation))
 
+    def moving_models(self):
+        """Live Gazebo positions of the world's moving obstacles."""
+        if self._ms is None:
+            return []
+        return [(name, pose.position.x, pose.position.y)
+                for name, pose in zip(self._ms.name, self._ms.pose)
+                if name.startswith('cross_clone_')]
+
+    def clearance(self, x, y, yaw):
+        fixed = min_clearance(x, y, yaw, self.half_len, self.half_wid,
+                              self.obstacles)
+        moving = moving_clearance(x, y, yaw, self.half_len, self.half_wid,
+                                  self.moving_models())
+        return min(fixed, moving)
+
     def odom(self):
         if self._odom is None:
             return None
@@ -273,7 +284,7 @@ class Bench(object):
         if not rospy.get_param("/use_sim_time", False):
             rospy.logfatal("[bench] /use_sim_time is not set.  Every timeout in "
                            "bench.yaml is in SIM seconds; running on wall time "
-                           "would silently misjudge all of them.  Is sim.launch up?")
+                           "would silently misjudge all of them. Start run.sh first.")
             return False
 
         # Wall-clock deadline, not now_s(): see wall_s().  Computing this from
@@ -303,6 +314,25 @@ class Bench(object):
                 rospy.logfatal("[bench] timed out waiting for %s" % name)
                 return False
             log("  %s OK" % name)
+
+        while len(self.moving_models()) < 20 and wall_s() < deadline:
+            rospy.sleep(0.1)
+        movers = self.moving_models()
+        if len(movers) != 20:
+            rospy.logfatal("[bench] expected 20 moving obstacles, found %d; "
+                           "check limo_complex.world and Gazebo model paths"
+                           % len(movers))
+            return False
+        before = {name: (x, y) for name, x, y in movers}
+        rospy.sleep(2.0)
+        motion = max((math.hypot(x - before[name][0], y - before[name][1])
+                      for name, x, y in self.moving_models() if name in before),
+                     default=0.0)
+        if motion < 0.01:
+            rospy.logfatal("[bench] 20 obstacles loaded but none moved; "
+                           "check rvo_node and set_goals_client")
+            return False
+        log("  20 moving obstacles OK (max 2 s displacement %.3f m)" % motion)
 
         # The planner node must be on the master before anything else matters.
         # rospy.get_master().getSystemState() wraps the XML-RPC call, so it comes
@@ -386,14 +416,12 @@ class Bench(object):
             return False
 
         # Start pose sanity: must be inside the arena and clear of obstacles.
-        clr = min_clearance(self.start_pose[0], self.start_pose[1],
-                            self.start_pose[2], self.half_len, self.half_wid,
-                            self.obstacles)
+        clr = self.clearance(*self.start_pose)
         log("  start clearance %.3f m (bench.yaml requires %.2f)"
             % (clr, self.cfg["arena"]["start_clearance"]))
         if clr < self.cfg["arena"]["start_clearance"]:
-            rospy.logfatal("[bench] start pose is too close to an obstacle")
-            return False
+            rospy.logwarn("[bench] moving obstacle is near the start pose; "
+                          "continuing because it may move away")
 
         nearmiss = self.scan_min()
         if not (nearmiss == nearmiss) or nearmiss > 3.0:
@@ -503,6 +531,15 @@ class Bench(object):
         self._trace = []
         self._active = False
 
+        # A moving obstacle may pass through the fixed start between trials.
+        # Do not teleport the robot into it and credit the planner with a loss.
+        wait_until = now_s() + 30.0
+        minimum = self.cfg["arena"]["start_clearance"]
+        while self.clearance(*self.start_pose) < minimum and now_s() < wait_until:
+            rospy.sleep(0.1)
+        if self.clearance(*self.start_pose) < minimum:
+            raise RuntimeError("start pose stayed blocked by moving obstacles "
+                               "for 30 sim seconds")
         self.teleport(self.start_pose)
 
         msg = self.make_goal(gx, gy, goal.get("yaw", 0.0))
@@ -558,8 +595,7 @@ class Bench(object):
             prev_xy = (x, y)
 
             dist = math.hypot(gx - x, gy - y)
-            clr = min_clearance(x, y, yaw, self.half_len, self.half_wid,
-                                self.obstacles)
+            clr = self.clearance(x, y, yaw)
             if clr < min_clr:
                 min_clr = clr
             smin = self.scan_min()
@@ -569,6 +605,10 @@ class Bench(object):
             speeds.append(abs(v))
 
             if t0 is None:
+                if clr <= 0.0:
+                    outcome = "collision"
+                    reason = "moving obstacle intersected the start area"
+                    break
                 if math.hypot(x - start_xy[0], y - start_xy[1]) > t["motion_epsilon"]:
                     t0 = now
                     last_improve = now
@@ -595,8 +635,8 @@ class Bench(object):
                 # 1. collision -- the robot's true footprint against the true AABBs
                 if clr <= 0.0:
                     outcome = "collision"
-                    reason = ("footprint penetrated an obstacle AABB by %.3f m "
-                              "(ground truth, not the planner's odometry)"
+                    reason = ("robot footprint overlaps an obstacle proxy by %.3f m "
+                              "(Gazebo model poses, not planner odometry)"
                               % -clr)
                     break
 
@@ -699,14 +739,14 @@ class Bench(object):
 
     # ------------------------------------------------------------------ main
     def run(self):
-        goals = self.args.goals_doc["goals"]
+        goals = self.args.goals
         log("planner=%s  goals=%d  world=%s"
             % (self.args.planner, len(goals), os.path.basename(self.args.world)))
         results = []
         for goal in goals:
-            log("trial %d/%d -> (%.2f, %.2f) dist %.2f los %.2f band %s"
+            log("trial %d/%d -> (%.2f, %.2f) dist %.2f yaw %.2f"
                 % (goal["i"] + 1, len(goals), goal["x"], goal["y"],
-                   goal["distance"], goal["los_clearance"], goal["band"]))
+                   goal["distance"], goal["yaw"]))
             r = self.run_trial(goal)
             log("   %-10s %s" % (r["verdict"].upper(), r.get("reason", "")))
             results.append(r)
@@ -737,7 +777,6 @@ def main(argv):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--planner", required=True, choices=sorted(PLANNERS))
-    ap.add_argument("--goals", required=True)
     ap.add_argument("--world", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--config", default=None,
@@ -747,17 +786,18 @@ def main(argv):
     ap.add_argument("--timeout", type=float, default=None,
                     help="override trial.trial_timeout (sim seconds)")
     ap.add_argument("--only", type=int, nargs="*", default=None,
-                    help="run only these goal indices (debugging)")
+                    help="run only these goals, by their index in bench.yaml "
+                         "`goals:` (debugging)")
     # rospy.myargv, not a bare argv: when this node is started by roslaunch,
     # roslaunch appends its own reserved arguments (__name:=, __log:=) to the
     # command line, and a strict argparse rejects them -- "unrecognized
     # arguments: __name:=bench_harness".  myargv strips those and any name:=value
     # remapping, which is the ROS 1 idiom for exactly this.  Without it the
     # harness only ever works when invoked by hand, i.e. every path except the
-    # documented `roslaunch planner_bench bench.launch`.
+    # also permits direct ROS invocation with remapping arguments.
     args = ap.parse_args(rospy.myargv(argv=argv)[1:])
 
-    pkg = os.path.normpath(os.path.join(_HERE, os.pardir))
+    pkg = _HERE
     if args.config is None:
         args.config = os.path.join(pkg, "config", "bench.yaml")
     cfg = load_bench_config(args.config)
@@ -766,16 +806,35 @@ def main(argv):
     if args.timeout is not None:
         cfg["trial"]["trial_timeout"] = args.timeout
 
-    with open(args.goals) as fh:
-        args.goals_doc = json.load(fh)
-    if args.only:
-        args.goals_doc["goals"] = [g for g in args.goals_doc["goals"]
-                                   if g["i"] in args.only]
+    obstacles = parse_world_obstacles(args.world, margin=0.0)
+    try:
+        goals = goals_from_config(cfg, obstacles=obstacles,
+                                  bounds=tuple(cfg["arena"]["bounds"]),
+                                  start=args.start)
+    except ValueError as exc:
+        # Before rospy.init_node, let alone Gazebo: a mistyped target is an
+        # authoring mistake, and finding it should not cost a simulation run.
+        sys.exit("[bench] %s" % exc)
+    declared = goals
+    if args.only is not None:
+        goals = [g for g in declared if g["i"] in args.only]
+        if not goals:
+            sys.exit("[bench] --only %s matched none of the %d goals in %s"
+                     % (args.only, len(declared), args.config))
+    args.goals = goals
+    actual_goal_sha1 = goals_sha1(goals)
 
     rospy.init_node("bench_harness", anonymous=True, disable_signals=True)
-    log("starting: planner=%s goals=%s" % (args.planner, args.goals))
+    log("starting: planner=%s goals=%s" % (args.planner, args.config))
+    for g in goals:
+        # A target inside the success radius is an instant success and a wasted
+        # trial; a legal choice, but almost always a typo in the decimals.
+        if g["distance"] < cfg["trial"]["success_radius"]:
+            rospy.logwarn("[bench] goals[%d] is %.3f m from the start, within "
+                          "the %.2f m success radius -- the trial will succeed "
+                          "without the robot moving"
+                          % (g["i"], g["distance"], cfg["trial"]["success_radius"]))
 
-    obstacles = parse_world_obstacles(args.world, margin=0.0)
     log("world: %d obstacle AABBs from %s"
         % (len(obstacles), os.path.basename(args.world)))
 
@@ -814,41 +873,24 @@ def main(argv):
         log("interrupted")
         return 1
 
-    # Hash the world file this run actually had in front of it, rather than
-    # trusting the goal set's `meta.world_sha1`.  Those are two different
-    # claims and they can disagree: the goal set is a static file that records
-    # what the world hashed to when gen_goals.py ran, so regenerating it after a
-    # run has started leaves that run reporting a hash for a world it never
-    # loaded.  report.py then refuses the comparison -- or worse, passes it --
-    # on the strength of metadata rather than on the thing being compared.
-    # This happened for real: the physics fix landed, the cspace run started a
-    # minute before the goal set was regenerated, and the two runs were
-    # declared incomparable while having used byte-identical worlds.
+    # The hash of the world file this run actually had in front of it.  Not read
+    # from anywhere else: metadata about a world is not the world, and two runs
+    # have to be judged comparable on the file they were scored against.
     actual_world_sha1 = sha1_of(args.world)
-    claimed = args.goals_doc["meta"].get("world_sha1")
-    if claimed and claimed != actual_world_sha1:
-        rospy.logwarn(
-            "[bench] the goal set claims world_sha1 %s but %s hashes to %s.  "
-            "Recording the file's actual hash; the goal set is stale.  If the "
-            "goals were generated against the world this run is using, the "
-            "coordinates are still valid -- only the recorded hash was wrong."
-            % (claimed[:12], os.path.basename(args.world),
-               actual_world_sha1[:12]))
     out = {
         "meta": {
             "planner": args.planner,
             "world": os.path.abspath(args.world),
-            # The hash of the file this run was actually scored against.
             "world_sha1": actual_world_sha1,
-            # What the goal set believes the world hashes to, kept so a
-            # disagreement survives in the artefact and not just in a log line.
-            "goal_set_world_sha1": claimed,
-            "goal_set": os.path.abspath(args.goals),
-            "goal_set_seed": args.goals_doc["meta"].get("seed"),
+            # Where the targets came from, and a hash of the points themselves.
+            # report.py refuses to compare two runs with different goals_sha1:
+            # the file may be edited between runs, and a comparison across two
+            # different target lists would be an average of nothing.
+            "goal_source": os.path.abspath(args.config),
+            "goals_sha1": actual_goal_sha1,
             "start": list(args.start),
             "robot": {"half_length": half_len, "half_width": half_wid},
             "bench_config": os.path.abspath(args.config),
-            "goal_thresholds": cfg["goal"],
             "trial": cfg["trial"],
             "n_goals": len(results),
         },

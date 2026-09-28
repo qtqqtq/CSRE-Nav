@@ -1,0 +1,4 @@
+__pycache__/
+reports/*.json
+reports/*.json.prev
+reports/legacy/

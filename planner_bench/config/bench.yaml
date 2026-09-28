@@ -1,0 +1,42 @@
+# Shared scoring thresholds for the migrated multi_robot_scenario Limo world.
+# The 20 obstacles move independently; static geometry is only the ground plane.
+arena:
+  bounds: [-5.0, 5.0, -5.0, 5.0]
+  # Outside the population spawn square; prevents collisions at time zero.
+  start: [-3.0, 0.0, 0.0]
+  start_clearance: 0.15
+  min_obstacles: 0
+robot:
+  half_length: 0.145
+  half_width: 0.11
+  tolerance: 0.02
+# Hand-written targets, one trial per entry, run in the order written.  The
+# robot is teleported to arena.start before each one, so entries do not chain.
+#
+#   goals:
+#     - {x: 0.0, y: 0.0, yaw: 0.0}     # mapping form
+#     - [1.5, -2.0]                    # [x, y] shorthand; yaw defaults to 0
+#
+# `yaw` is the heading published with the goal.  neupan reads it, cspace ignores
+# PoseStamped.orientation entirely, so a non-zero yaw only helps neupan.
+# Every point is checked against arena.bounds and the world's static obstacle
+# boxes when the harness starts -- a point that cannot be a goal is a typo, and
+# it should not cost a Gazebo run to find out.
+goals:
+  - x: 0.0
+    y: 0.0
+    yaw: 0.0
+trial:
+  success_radius: 0.30
+  success_settle: 0.5
+  motion_epsilon: 0.05
+  teleport_tolerance: 0.05
+  planner_timeout: 120.0
+  start_timeout: 8.0
+  trial_timeout: 90.0
+  stuck_window: 8.0
+  progress_epsilon: 0.10
+  moving_speed: 0.02
+  log_rate: 20.0
+trial_checks:
+  near_miss_distance: 0.15

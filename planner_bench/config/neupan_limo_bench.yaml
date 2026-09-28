@@ -46,9 +46,10 @@ robot:
 ipath:
   interval: 0.09
   waypoints: []         # <-- edit 1.  Empty, so nothing happens before a goal.
-  curve_style: 'line'   # straight line to the goal: this is why gen_goals.py
-                        # rejects goals with no line of sight (see bench.yaml
-                        # goal.los_margin).
+  curve_style: 'line'   # straight line to the goal.  Nothing checks line of
+                        # sight to the target any more: targets are written by
+                        # hand in bench.yaml, so a target behind an obstacle is
+                        # the author's choice and measures this setting.
   min_radius: 0.0
   loop: False           # <-- must stay False; True laps forever
   arrive_threshold: 0.2
