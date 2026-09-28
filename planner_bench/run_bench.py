@@ -61,10 +61,20 @@ class Session(object):
     """The processes this script started, and the promise to kill only those.
 
     Both the simulation and the planner are started with setsid, so each is its
-    own process group.  Killing the group -- not the leader -- is what takes
-    roslaunch's gzserver/gzclient/rosmaster and rosrun's node down with it; a
-    bare kill leaves orphans holding the ROS port, and the next run then fails
-    its "master already running" check.
+    own process group, and the group -- not the leader -- is signalled, because
+    roslaunch's own children share its group until they leave it.
+
+    The group id is captured at spawn rather than looked up at kill time.  With
+    setsid the child is its own group leader, so pgid == pid -- and that is the
+    only moment the mapping is reliable.  Once the leader is reaped
+    ``os.getpgid`` raises, so a lookup at kill time finds nothing to signal.
+
+    This is necessary but NOT sufficient, which is easy to get wrong: roslaunch
+    starts rosmaster and gzserver, and both move themselves into a *new session*
+    (pgid == their own pid, parent becomes init) as they start.  They therefore
+    leave this group, and killing it takes roslaunch down and leaves them alive
+    holding the ROS master port -- which is what makes the next run refuse to
+    start.  ``reap_run()`` finishes that job by command line; see its docstring.
     """
 
     def __init__(self, log_dir):
@@ -80,29 +90,64 @@ class Session(object):
                              preexec_fn=os.setsid)
         p._log = log_path
         p._fh = fh
+        p._pgid = p.pid                          # setsid makes it the leader
         return p
+
+    @staticmethod
+    def _signal_group(pgid, sig):
+        """Signal every member of ``pgid``.  False if the group is empty."""
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except OSError:
+            return False                         # no members left
+
+    @staticmethod
+    def _group_alive(pgid):
+        """Is anyone in ``pgid`` still running?
+
+        Not ``killpg(pgid, 0)``: that succeeds for a group whose members have
+        all exited but not yet been reaped, and this runs *before* ``p.wait()``,
+        so the just-killed leader is still a zombie and every teardown would
+        report a phantom survivor.  A zombie holds no port and cannot block the
+        next run, so it does not count as alive.
+        """
+        for pid, argv in iter_cmdlines():
+            try:
+                with open("/proc/%d/stat" % pid, "rb") as fh:
+                    stat = fh.read().decode("utf-8", "replace")
+            except (OSError, IOError):
+                continue
+            rest = stat.rsplit(")", 1)[-1].split()   # comm may contain spaces
+            if len(rest) < 3:
+                continue
+            state, pgrp = rest[0], rest[2]
+            if state != "Z" and pgrp.isdigit() and int(pgrp) == pgid:
+                return True
+        return False
 
     def _stop(self, p):
         if p is None:
             return
-        if p.poll() is None:
-            try:
-                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-            except OSError:
-                pass
-            for _ in range(50):                      # 5 s to go quietly
-                if p.poll() is not None:
+        pgid = getattr(p, "_pgid", None) or os.getpgid(p.pid)
+        self._signal_group(pgid, signal.SIGTERM)
+        for _ in range(50):                      # 5 s to go quietly
+            if not self._group_alive(pgid):
+                break
+            time.sleep(0.1)
+        if self._group_alive(pgid):              # still someone running
+            self._signal_group(pgid, signal.SIGKILL)
+            for _ in range(20):                  # 2 s for the group to drain
+                if not self._group_alive(pgid):
                     break
                 time.sleep(0.1)
-            if p.poll() is None:
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except OSError:
-                    pass
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            if self._group_alive(pgid):
+                print("[run] warning: pgid %d still alive after SIGKILL" % pgid,
+                      file=sys.stderr)
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
         p._fh.close()
 
     def stop_planner(self):
@@ -122,6 +167,72 @@ class Session(object):
 
 
 ROS_TOOLS = ("roslaunch", "rosrun", "rosparam", "rosservice")
+
+
+def iter_cmdlines():
+    """(pid, argv) for every process we can read, via /proc.  No external tool:
+    ``ss`` is not installed in the bench container, so a port-based probe would
+    silently find nothing and report success."""
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % entry, "rb") as fh:
+                argv = fh.read().decode("utf-8", "replace").split("\0")
+        except (OSError, IOError):
+            continue
+        argv = [a for a in argv if a]
+        if argv:
+            yield int(entry), argv
+
+
+def orphan_pids(ros_port, world):
+    """PIDs of a dead run's leftovers, matched on their command lines.
+
+    A process group is not enough to reap a ROS run.  roslaunch starts rosmaster
+    and gzserver, but both put themselves in a *new session* (pgid == own pid,
+    parent becomes init), so they leave roslaunch's group as they start.  Killing
+    that group takes roslaunch down and leaves those two alive -- which is the
+    orphan that then blocks the next run with "master already running".
+
+    Matched on the *basename* of each argv token, not the raw token: roslaunch
+    spawns these by absolute path (``/opt/ros/noetic/bin/rosmaster``) or through
+    a shell (``/bin/sh /opt/ros/noetic/lib/gazebo_ros/gzserver``), and only the
+    grandchild appears as a bare ``gzserver``.  The second condition is still an
+    exact argv token -- this run's port for the master, this run's world file for
+    Gazebo -- so a process that merely mentions ROS cannot be caught.
+    """
+    pids = []
+    for pid, argv in iter_cmdlines():
+        if pid == os.getpid():
+            continue
+        names = set(os.path.basename(a) for a in argv)
+        if "rosmaster" in names and ros_port in argv:
+            pids.append(pid)
+        elif names & {"gzserver", "gzclient"} and world in argv:
+            pids.append(pid)
+    return pids
+
+
+def reap_run(ros_port, world):
+    """Kill what the group teardown could not reach.  Returns the PIDs killed."""
+    pids = orphan_pids(ros_port, world)
+    if not pids:
+        return []
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        for _ in range(50):
+            if not orphan_pids(ros_port, world):
+                return pids
+            time.sleep(0.1)
+    left = orphan_pids(ros_port, world)
+    if left:
+        print("[run] warning: could not reap %s" % left, file=sys.stderr)
+    return pids
 
 
 def missing_ros_tools():
@@ -149,8 +260,16 @@ def run_one(mode, args, cfg_path, world, world_config, start):
     for sig in (signal.SIGINT, signal.SIGTERM):
         old[sig] = signal.signal(sig, bail)
     try:
-        # A master already on this port means an earlier run's Gazebo survived,
-        # and this run would attach to it and score the wrong world.
+        # A master already on this port means an earlier run's Gazebo survived
+        # (SIGKILL, a crash, a killed container), and this run would attach to it
+        # and score the wrong world.  Leftovers from that run are necessarily
+        # ours -- the port is dedicated to the bench -- so clear them and carry
+        # on rather than making the operator hunt them down.
+        stale = reap_run(ros_port, world)
+        if stale:
+            say("cleared %d leftover process(es) from a previous run: %s"
+                % (len(stale), stale))
+            time.sleep(1)
         if subprocess.call(["rosparam", "get", "/run_id"],
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL) == 0:
@@ -203,6 +322,13 @@ def run_one(mode, args, cfg_path, world, world_config, start):
         return rc
     finally:
         session.stop_all()
+        # The group teardown above cannot reach rosmaster/gzserver once they have
+        # put themselves in their own sessions, so finish the job by command line.
+        # This is what keeps the "master already running" guard from firing on the
+        # next run.
+        reaped = reap_run(ros_port, world)
+        if reaped:
+            say("reaped %d orphan(s) from the teardown: %s" % (len(reaped), reaped))
         for sig, handler in old.items():
             signal.signal(sig, handler)
 

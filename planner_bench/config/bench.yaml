@@ -3,12 +3,54 @@
 # and the targets -- lives in worlds/<world stem>.yaml next to the world file,
 # and bench.py picks it up from --world.
 robot:
-  # Fallback footprint, used only when /robot_description cannot be read.  The
-  # live URDF wins, because a collision verdict is a physical claim and has to
-  # be made against the robot that is actually in the simulation.
-  half_length: 0.145
-  half_width: 0.11
-  tolerance: 0.02
+  # The robot's shape, as a polygon of connected points in the robot frame
+  # (base_footprint; +x forward, +y left, centred on the origin).  This is SAC
+  # training's own footprint -- SAC/settings.py:
+  #
+  #     ROBOT_FOOTPRINT = rectangular_footprint(1.20, 0.14)
+  #
+  # -- so the harness and the policy mean the same shape by "the robot".  It is
+  # a vertex list rather than a length x width box because that is how training
+  # carries it (SAC/cspace_cost_rays.py consumes it as a generic (V, 2) array),
+  # and because a polygon is what the laser test below is expressed against.
+  #
+  # Note there are three different shapes in play and they do not agree:
+  #   * this 1.20 x 0.14 m polygon -- cspace's *observation* footprint, the
+  #     c-space dilation its cost rays are computed against;
+  #   * the real chassis, 0.13 x 0.12 m -- the cspace_footprint marker box in
+  #     limo_four_diff.xacro is drawn above the robot to compare the two;
+  #   * the 14 cm circle that actually terminated episodes in SAC training
+  #     (SAC/Sparrow_V2.py: collision_trsd = car_radius + 5 cm).
+  # This choice decides what a "collision" means.  Both planners are scored
+  # against this one polygon so the comparison stays like-for-like.  Run
+  # `python3 bench_common.py --footprint` to see the threshold it implies.
+  footprint: [[0.6, 0.07], [0.6, -0.07], [-0.6, -0.07], [-0.6, 0.07]]
+  # Where the laser sits in that same frame.  limo_four_diff.xacro mounts
+  # laser_link at xyz 0.103 0 -0.034 on base_link, and base_footprint ->
+  # base_link is a pure z offset, so this XY pair is the whole story.
+  laser_xyz: [0.103, 0.0]
+  # The PHYSICAL chassis, as a polygon in the same frame, INFLATED by 2 cm to
+  # absorb the laser's own range noise (sigma = 0.01 m).  Used only to work out
+  # which returns are the robot looking at itself.  This is not optional
+  # bookkeeping: the footprint above is 0.140 m wide while the real body is
+  # 0.220 m wide, so the robot sticks out past its own scored silhouette and the
+  # laser sees its own chassis sitting just *outside* it -- a centimetre or so of
+  # margin on nearly every bearing.  Without this mask that artefact is the
+  # smallest margin on almost every scan, and the first slightly-closer
+  # self-return ends the trial.
+  #
+  # The inflation is not cosmetic either.  The uninflated silhouette has only
+  # ~5 mm of headroom over the self-returns actually measured (0.105 m at +-90
+  # deg against 0.110), and dead ahead it is 0.042 m -- exactly the chassis
+  # front -- so a single noisy reading there would read as an obstacle 4 cm
+  # inside the robot.  Two centimetres is two sigma, and it costs nothing where
+  # it matters: masked returns ahead are under 0.062 m while the scored envelope
+  # only fires at 0.497 m, so no obstacle that could change a verdict is hidden.
+  # The one real cost is abeam, where obstacles closer than 0.130 m become
+  # invisible; the scored envelope abeam is 0.070 m, so that is a 6 cm shell.
+  # Base values are the union of the URDF's collision primitives (wheels
+  # included), 0.29 x 0.22 m; this polygon is that union inflated to 0.33 x 0.26.
+  body: [[0.165, 0.13], [0.165, -0.13], [-0.165, -0.13], [-0.165, 0.13]]
 trial:
   success_radius: 0.30
   success_settle: 0.5
@@ -22,4 +64,13 @@ trial:
   moving_speed: 0.02
   log_rate: 20.0
 trial_checks:
+  # Collision is read straight off the laser: a beam that comes back shorter
+  # than the footprint's own radius in that direction hit the robot's body
+  # rather than an obstacle.  No world pose is involved, so the verdict does not
+  # depend on odometry or on the ground-truth model list.
+  # `scan_margin` is the slack allowed before that counts as contact.
+  scan_margin: 0.0
+  # Counts samples whose *margin* to the footprint was under this, i.e. how often
+  # the robot came close to its own declared body -- not the raw range, which was
+  # dominated by the self-returns the `body` mask above removes.
   near_miss_distance: 0.15

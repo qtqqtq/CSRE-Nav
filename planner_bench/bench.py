@@ -46,11 +46,11 @@ import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-from bench_common import (footprint_from_urdf, goals_from_config, goals_sha1,
-                          load_bench_config, load_world_config, min_clearance,
-                          moving_clearance, parse_world_obstacles,
-                          point_aabb_distance, sha1_of, trial_plan,
-                          world_config_path)
+from bench_common import (footprint_clearance, goals_from_config, goals_sha1,
+                          load_bench_config, load_world_config, parse_footprint,
+                          parse_world_obstacles, point_aabb_distance,
+                          point_in_polygon, polygon_extent, polygon_ray_exit,
+                          sha1_of, trial_plan, world_config_path)
 
 import rospy
 import tf
@@ -172,17 +172,23 @@ def local_speed_from_trace(rows):
 
 
 class Bench(object):
-    def __init__(self, args, cfg, wcfg, obstacles, half_len, half_wid):
+    def __init__(self, args, cfg, wcfg, obstacles, footprint, body, laser_xy):
         self.args = args
         # Two configs, kept apart on purpose: `cfg` is the harness (timeouts,
-        # success radius, fallback footprint) and `wcfg` is the map (arena
-        # bounds, start pose, targets).  Mixing them is how a trial timeout ends
-        # up needing a world edit.
+        # success radius, footprint) and `wcfg` is the map (arena bounds, start
+        # pose, targets).  Mixing them is how a trial timeout ends up needing a
+        # world edit.
         self.cfg = cfg
         self.wcfg = wcfg
         self.obstacles = obstacles
-        self.half_len = half_len
-        self.half_wid = half_wid
+        # The robot's shape and where its laser sits inside it.  Both are in the
+        # robot frame, which is what makes the collision test below need no
+        # world pose at all.  `footprint` is what a collision is scored against;
+        # `body` is the physical chassis, used only to recognise the laser's own
+        # returns -- see scan_verdict().
+        self.footprint = footprint
+        self.body = body
+        self.laser_xy = laser_xy
         self.bounds = tuple(wcfg["arena"]["bounds"])
         self.start_pose = tuple(args.start)
         self.planner = PLANNERS[args.planner]
@@ -252,24 +258,103 @@ class Bench(object):
                 for name, pose in zip(self._ms.name, self._ms.pose)
                 if name.startswith('cross_clone_')]
 
-    def clearance(self, x, y, yaw):
-        fixed = min_clearance(x, y, yaw, self.half_len, self.half_wid,
-                              self.obstacles)
-        moving = moving_clearance(x, y, yaw, self.half_len, self.half_wid,
-                                  self.moving_models())
-        return min(fixed, moving)
+    def scan_verdict(self):
+        """Collision, read directly off the laser.
+
+        The robot's footprint and the beam bearings are both expressed in the
+        robot frame -- the laser is bolted to it -- so for each beam the only
+        question is whether the return came back shorter than the footprint's
+        own radius in that direction.  A shorter one terminated *inside* the
+        robot, so what it hit was the robot's body, not an obstacle.  No world
+        pose, no odometry and no obstacle list take part, which is the whole
+        point: the verdict is a sensor reading, not a geometric reconstruction.
+
+        Returns a dict, or ``None`` before the first scan arrives:
+
+            collision  bool    a beam returned at or inside the footprint
+            margin     float   distance from the footprint edge to the nearest
+                               return, negative when a beam ended inside it
+            bearing    float   that beam's bearing, degrees, robot frame
+            range      float   its raw range
+            self_d     float   the footprint radius it was compared against
+            n_used     int     beams that took part
+            n_skipped  int     beams dropped as the robot seeing its own body
+
+        A beam whose return lands inside the physical chassis (`robot.body`) is
+        dropped first: that is the laser looking at the robot, not at the world.
+        It is not a nicety.  The scored footprint is 0.140 m wide and the real
+        body 0.220 m, so the robot sticks out past its own silhouette and its
+        chassis sits a centimetre or so *outside* it on nearly every bearing --
+        left in, that artefact is the smallest margin on almost every scan and
+        the first slightly-closer self-return ends the trial.  `body` is the
+        union of the URDF's collision primitives, so the real chassis is inside
+        it and every genuine obstacle is outside it.
+
+        The scan is published at 8 Hz and this runs at the trial log rate, so the
+        sample may be up to ~0.12 s old, i.e. ~6 cm of travel at 0.5 m/s.
+        """
+        msg = self._scan
+        if msg is None:
+            return None
+
+        checks = self.cfg["trial_checks"]
+        slack = float(checks.get("scan_margin", 0.0) or 0.0)
+        ox, oy = self.laser_xy
+
+        worst = None
+        n_used = n_skipped = 0
+        for i, r in enumerate(msg.ranges):
+            if not (r == r) or r < msg.range_min or r > msg.range_max:
+                continue                      # NaN, or off the sensor's scale
+            theta = msg.angle_min + i * msg.angle_increment
+            body = polygon_ray_exit(ox, oy, theta, self.body)
+            if body is not None and r <= body:
+                n_skipped += 1
+                continue                      # the robot's own chassis
+            d = polygon_ray_exit(ox, oy, theta, self.footprint)
+            if d is None:
+                continue                      # laser outside the footprint
+            n_used += 1
+            if worst is None or r - d < worst[0]:
+                worst = (r - d, math.degrees(theta), r, d)
+
+        if worst is None:
+            return None
+        return {
+            "collision": worst[0] <= slack,
+            "margin": worst[0],
+            "bearing": worst[1],
+            "range": worst[2],
+            "self_d": worst[3],
+            "n_used": n_used,
+            "n_skipped": n_skipped,
+        }
+
+    def start_clearance(self):
+        """Signed clearance from the footprint, at the start pose, to the moving
+        obstacles.  A world-frame question the laser cannot answer: it is still
+        mounted on a robot that has not been teleported to that pose yet."""
+        return footprint_clearance(self.start_pose[0], self.start_pose[1],
+                                   self.start_pose[2], self.footprint,
+                                   self.moving_models())
+
+    def scan_min(self):
+        """Raw minimum return, unfiltered -- a diagnostic, not the verdict.
+
+        Kept in the trial log because it is what shows the self-returns: on a
+        clean run it sits at the sensor floor for a large fraction of samples
+        while `scan_margin` stays comfortably positive.
+        """
+        if self._scan is None:
+            return float("nan")
+        r = [x for x in self._scan.ranges if x == x and 0.05 < x < 50.0]
+        return min(r) if r else float("nan")
 
     def odom(self):
         if self._odom is None:
             return None
         p = self._odom.pose.pose
         return (p.position.x, p.position.y, yaw_of(p.orientation))
-
-    def scan_min(self):
-        if self._scan is None:
-            return float("nan")
-        r = [x for x in self._scan.ranges if x == x and 0.05 < x < 50.0]
-        return min(r) if r else float("nan")
 
     def cmd(self):
         if self._cmd is None:
@@ -424,8 +509,11 @@ class Bench(object):
                 "than the world AABBs expect." % drift)
             return False
 
-        # Start pose sanity: must be inside the arena and clear of obstacles.
-        clr = self.clearance(*self.start_pose)
+        # Start pose sanity: must be clear of the moving obstacles.  This is the
+        # one place the laser cannot answer -- it is mounted on a robot that is
+        # not at the start pose yet -- so it stays a world-frame calculation,
+        # from the obstacle poses and the configured footprint.
+        clr = self.start_clearance()
         log("  start clearance %.3f m (%s requires %.2f)"
             % (clr, os.path.basename(self.args.world_config),
                self.wcfg["arena"]["start_clearance"]))
@@ -545,9 +633,9 @@ class Bench(object):
         # Do not teleport the robot into it and credit the planner with a loss.
         wait_until = now_s() + 30.0
         minimum = self.wcfg["arena"]["start_clearance"]
-        while self.clearance(*self.start_pose) < minimum and now_s() < wait_until:
+        while self.start_clearance() < minimum and now_s() < wait_until:
             rospy.sleep(0.1)
-        if self.clearance(*self.start_pose) < minimum:
+        if self.start_clearance() < minimum:
             raise RuntimeError("start pose stayed blocked by moving obstacles "
                                "for 30 sim seconds")
         self.teleport(self.start_pose)
@@ -606,19 +694,22 @@ class Bench(object):
             prev_xy = (x, y)
 
             dist = math.hypot(gx - x, gy - y)
-            clr = self.clearance(x, y, yaw)
-            if clr < min_clr:
+            sv = self.scan_verdict()
+            clr = sv["margin"] if sv else float("nan")
+            if clr == clr and clr < min_clr:
                 min_clr = clr
-            smin = self.scan_min()
-            if smin == smin and smin < self.cfg["trial_checks"]["near_miss_distance"]:
+            if sv and clr < self.cfg["trial_checks"]["near_miss_distance"]:
                 n_near_miss += 1
+            smin = self.scan_min()
             v, w = self.cmd()
             speeds.append(abs(v))
 
             if t0 is None:
-                if clr <= 0.0:
+                if sv and sv["collision"]:
                     outcome = "collision"
-                    reason = "moving obstacle intersected the start area"
+                    reason = ("laser: a beam returned %.3f m inside the robot's "
+                              "footprint at %.0f deg before the trial started"
+                              % (-clr, sv["bearing"]))
                     break
                 if math.hypot(x - start_xy[0], y - start_xy[1]) > t["motion_epsilon"]:
                     t0 = now
@@ -638,17 +729,25 @@ class Bench(object):
                 rows.append({
                     "t": round(elapsed, 3), "x": round(x, 4), "y": round(y, 4),
                     "yaw": round(yaw, 4), "dist": round(dist, 4),
-                    "clearance": round(clr, 4),
+                    "scan_margin": round(clr, 4) if clr == clr else None,
                     "scan_min": round(smin, 4) if smin == smin else None,
+                    # Which beam produced the margin.  Kept because the smallest
+                    # margin is what decides the verdict, and "how close did it
+                    # come, and where" is the first question asked of a collision:
+                    # a worst beam that never leaves one bearing, at a range that
+                    # barely changes, is the signature of the robot's own body
+                    # rather than of traffic.
+                    "scan_bearing": round(sv["bearing"], 1) if sv else None,
+                    "scan_range": round(sv["range"], 4) if sv else None,
                     "v": round(v, 4), "w": round(w, 4),
                 })
 
-                # 1. collision -- the robot's true footprint against the true AABBs
-                if clr <= 0.0:
+                # 1. collision -- read off the laser, against the robot's footprint
+                if sv and sv["collision"]:
                     outcome = "collision"
-                    reason = ("robot footprint overlaps an obstacle proxy by %.3f m "
-                              "(Gazebo model poses, not planner odometry)"
-                              % -clr)
+                    reason = ("laser: beam at %.0f deg returned %.3f m, %.3f m "
+                              "inside the robot's footprint"
+                              % (sv["bearing"], sv["range"], -clr))
                     break
 
                 # 2. success -- inside the radius AND actually stopped there
@@ -723,7 +822,7 @@ class Bench(object):
             "duration": round(duration, 3),
             "final_error": round(final_err, 4) if final_err == final_err else None,
             "path_length": round(self.path_length(t0), 4),
-            "min_clearance": round(min_clr, 4) if min_clr < float("inf") else None,
+            "min_scan_margin": round(min_clr, 4) if min_clr < float("inf") else None,
             "n_near_miss": n_near_miss,
             "stuck_detected_at": round(stuck_at, 3) if stuck_at is not None else None,
             # Two different quantities that used to share one name.  `speeds`
@@ -882,31 +981,47 @@ def main(argv):
     log("world: %d obstacle AABBs from %s"
         % (len(obstacles), os.path.basename(args.world)))
 
-    # The footprint that scores collisions comes from the live URDF, not from
-    # bench.yaml: a collision verdict is a physical claim, and it should be made
-    # against the robot that is actually in the simulation.
-    half_len, half_wid = cfg["robot"]["half_length"], cfg["robot"]["half_width"]
+    # The shape that scores collisions is the polygon in bench.yaml, which is
+    # deliberately NOT derived from the URDF.  The URDF describes the physical
+    # chassis (0.29 x 0.22 m including its wheels); the benchmark scores both
+    # planners against the 1.20 x 0.14 m envelope cspace was trained to perceive,
+    # so the two legitimately disagree and deriving one from the other would
+    # silently change what a "collision" means.  See config/bench.yaml.
     try:
-        urdf = rospy.get_param("/robot_description")
-        hl, hw, ncol = footprint_from_urdf(urdf)
-        tol = cfg["robot"]["tolerance"]
-        if abs(hl - half_len) > tol or abs(hw - half_wid) > tol:
-            rospy.logwarn(
-                "[bench] /robot_description footprint is %.3f x %.3f m but "
-                "bench.yaml says %.3f x %.3f m; using the URDF.  Collision "
-                "verdicts would otherwise be made against a robot that is not "
-                "in the simulation." % (2 * hl, 2 * hw, 2 * half_len, 2 * half_wid))
-        else:
-            log("footprint from URDF: %.4f x %.4f m (%d collision primitives) "
-                "- agrees with bench.yaml" % (2 * hl, 2 * hw, ncol))
-        half_len, half_wid = hl, hw
-    except Exception as exc:
-        rospy.logwarn("[bench] could not derive the footprint from "
-                      "/robot_description (%s: %s); falling back to bench.yaml "
-                      "(%.3f x %.3f m)"
-                      % (type(exc).__name__, exc, 2 * half_len, 2 * half_wid))
+        footprint = parse_footprint(cfg["robot"]["footprint"], "robot.footprint")
+    except (KeyError, TypeError, ValueError) as exc:
+        rospy.logfatal("[bench] %s: %s" % (args.config, exc))
+        return 2
+    laser_xy = tuple(cfg["robot"].get("laser_xyz", (0.0, 0.0)))[:2]
+    flen, fwid = polygon_extent(footprint)
+    if not point_in_polygon(laser_xy[0], laser_xy[1], footprint):
+        # The collision test compares each return against the footprint's radius
+        # from the laser, so a laser outside the polygon has no radius and every
+        # beam would be skipped -- a silent "no collision ever" benchmark.
+        rospy.logfatal("[bench] robot.laser_xyz %s is outside robot.footprint; "
+                       "the laser collision test cannot work.  Check %s."
+                       % (laser_xy, args.config))
+        return 2
+    # The physical chassis, for recognising the laser's own returns.  Required,
+    # not defaulted: without it the robot's own body reads as an obstacle and the
+    # trial ends on the first scan -- see scan_verdict().
+    try:
+        body = parse_footprint(cfg["robot"]["body"], "robot.body")
+    except (KeyError, TypeError, ValueError) as exc:
+        rospy.logfatal("[bench] %s: %s" % (args.config, exc))
+        return 2
+    blen, bwid = polygon_extent(body)
+    if not point_in_polygon(laser_xy[0], laser_xy[1], body):
+        rospy.logfatal("[bench] robot.laser_xyz %s is outside robot.body; a laser "
+                       "mounted off its own chassis cannot mask its self-returns."
+                       % (laser_xy,))
+        return 2
+    log("footprint: %d point(s), %.3f x %.3f m, laser at (%.3f, %.3f)"
+        % (len(footprint), flen, fwid, laser_xy[0], laser_xy[1]))
+    log("body mask: %d point(s), %.3f x %.3f m -- returns inside this are the "
+        "robot seeing itself" % (len(body), blen, bwid))
 
-    bench = Bench(args, cfg, wcfg, obstacles, half_len, half_wid)
+    bench = Bench(args, cfg, wcfg, obstacles, footprint, body, laser_xy)
     if not bench.preflight():
         rospy.logfatal("[bench] pre-flight failed; not running any trial")
         return 2
@@ -933,7 +1048,11 @@ def main(argv):
             "world_config": os.path.abspath(args.world_config),
             "goals_sha1": actual_goal_sha1,
             "start": list(args.start),
-            "robot": {"half_length": half_len, "half_width": half_wid},
+            "robot": {"footprint": [list(p) for p in footprint],
+                      "extent": [flen, fwid],
+                      "body": [list(p) for p in body],
+                      "body_extent": [blen, bwid],
+                      "laser_xyz": list(laser_xy)},
             "bench_config": os.path.abspath(args.config),
             "trial": cfg["trial"],
             # The schedule, kept so a reader can see which target each trial

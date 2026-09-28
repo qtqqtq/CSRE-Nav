@@ -188,7 +188,79 @@ def check_comparable(a, b):
     if ga != gb:
         problems.append("different targets exercised (%s vs %s)"
                         % (sorted(ga), sorted(gb)))
+    # The footprint is what a collision verdict is measured against, so two runs
+    # that used different ones did not score collisions the same way.  Comparing
+    # them would put a "collision" from one rule beside a "collision" from
+    # another, which is exactly the kind of difference that cannot be attributed
+    # to the planners.
+    fa, fb = footprint_of(a.doc), footprint_of(b.doc)
+    if fa is not None and fb is not None and fa != fb:
+        problems.append("different robot footprints (%s vs %s)"
+                        % (footprint_desc(a.doc), footprint_desc(b.doc)))
+    elif (fa is None) != (fb is None):
+        # A pre-footprint report scored against a URDF-derived box, not the SAC
+        # polygon, so the two are not the same shape however the header reads.
+        old = a if fa is None else b
+        problems.append("different robot footprints (%s vs %s)"
+                        % (footprint_desc(a.doc), footprint_desc(b.doc)))
+    # The body mask decides which returns are the robot seeing itself, so two
+    # runs with different masks did not apply the same collision rule either.
+    ba, bb = body_of(a.doc), body_of(b.doc)
+    if ba is not None and bb is not None and ba != bb:
+        problems.append("different robot body masks (%s vs %s)"
+                        % (body_desc(a.doc), body_desc(b.doc)))
+    elif (ba is None) != (bb is None):
+        old = a if ba is None else b
+        problems.append("%s predates the self-return body mask, so it scored the "
+                        "robot's own chassis as an obstacle" % old.name)
     return problems
+
+
+def body_of(doc):
+    """The self-return mask polygon a report was scored with, or None if it
+    predates the mask (those runs read the robot's own chassis as an obstacle)."""
+    bp = (doc["meta"].get("robot") or {}).get("body")
+    if not bp:
+        return None
+    return tuple((round(float(p[0]), 6), round(float(p[1]), 6)) for p in bp)
+
+
+def body_desc(doc):
+    bp = body_of(doc)
+    if bp is None:
+        return "none"
+    xs = [p[0] for p in bp]
+    ys = [p[1] for p in bp]
+    return "%.3f x %.3f m, %d-pt polygon" % (
+        max(xs) - min(xs), max(ys) - min(ys), len(bp))
+
+
+def footprint_of(doc):
+    """The footprint polygon a report was scored against, or None if it predates
+    footprint scoring (those reports carry a half_length/half_width box)."""
+    fp = (doc["meta"].get("robot") or {}).get("footprint")
+    if not fp:
+        return None
+    return tuple((round(float(p[0]), 6), round(float(p[1]), 6)) for p in fp)
+
+
+def footprint_desc(doc):
+    """Short human-readable shape string for the header and the refusal text."""
+    fp = footprint_of(doc)
+    if fp is None:
+        r = doc["meta"].get("robot") or {}
+        if "half_length" in r:
+            return "%.3f x %.3f m box (pre-footprint report)" % (
+                2 * r["half_length"], 2 * r["half_width"])
+        return "unknown"
+    xs = [p[0] for p in fp]
+    ys = [p[1] for p in fp]
+    return "%.3f x %.3f m, %d-pt polygon" % (
+        max(xs) - min(xs), max(ys) - min(ys), len(fp))
+
+
+def robot_line(run):
+    return "%s (%s)" % (footprint_desc(run.doc), run.name)
 
 
 def balance_note(run):
@@ -245,11 +317,7 @@ def main(argv):
       % (meta.get("goal_sample", "one trial per target"),
          meta.get("trial_seed") if meta.get("trial_seed") is not None else "none"))
     w("start     : %s" % (meta.get("start"),))
-    w("robot     : %.3f x %.3f m (%s) / %.3f x %.3f m (%s)"
-      % (2 * a.doc["meta"]["robot"]["half_length"],
-         2 * a.doc["meta"]["robot"]["half_width"], a.name,
-         2 * b.doc["meta"]["robot"]["half_length"],
-         2 * b.doc["meta"]["robot"]["half_width"], b.name))
+    w("robot     : %s / %s" % (robot_line(a), robot_line(b)))
     w("")
 
     if problems and not args.force:
@@ -319,7 +387,7 @@ def main(argv):
 
     w("%-26s %-18s %-18s" % ("outcome quality", a.name, b.name))
     both("final error (median m)", "final_error", "%.3f")
-    both("min clearance (worst m)", "min_clearance", "%.3f", pick=min)
+    both("min scan margin (worst m)", "min_scan_margin", "%.3f", pick=min)
     both("path length (median m)", "path_length", "%.2f")
     # Speed is shown twice on purpose.  Achieved is the robot; commanded is the
     # planner.  When they diverge the planner is asking for motion it is not
@@ -390,16 +458,30 @@ def main(argv):
     for line in [
         "dynamic obstacles: the two runs use independent RVO trajectories;",
         "  matching goals do not imply matching obstacle encounters.",
-        "collision: model-pose bounding circles are a proximity proxy,",
-        "  especially for person meshes; they are not Gazebo contact events.",
-        "footprint: both planners are scored with the same ground-truth robot,",
-        "  but cspace's POLICY was trained to dilate obstacles by a 1.20 x 0.14 m",
-        "  footprint while the Limo is 0.29 x 0.22 m.  Changing it would take the",
-        "  checkpoint off its training distribution, so it stands: cspace keeps",
-        "  ~0.6 m of fore/aft clearance and is genuinely handicapped in tight",
-        "  gaps.  This is the one asymmetry config alone cannot remove.",
+        "collision: read off the laser, not from Gazebo contacts.  A beam that",
+        "  returns inside the robot's footprint counts as a hit, so this is a",
+        "  line-of-sight test: it sees only what the 240 deg scan sees, and an",
+        "  obstacle that touches the body without entering a beam's path is missed.",
+        "footprint: both planners are scored against the same polygon, taken from",
+        "  SAC training (settings.ROBOT_FOOTPRINT, 1.20 x 0.14 m).  That is",
+        "  cspace's OBSERVATION footprint -- the c-space dilation its cost rays",
+        "  use -- not the physical chassis (0.13 x 0.12 m) and not what ended",
+        "  episodes in training (a 14 cm circle).  Scoring against it is the",
+        "  deliberate choice that keeps the two planners on one rule; it also",
+        "  means 'collision' fires while ~0.5 m of open space is still ahead, so",
+        "  read the collision counts as envelope violations, not as contact.",
+        "self-returns: the scored footprint is thinner (0.14 m) than the robot",
+        "  (0.22 m), so the laser sees the robot's own chassis just outside its",
+        "  scored silhouette on nearly every bearing.  Returns inside the physical",
+        "  body -- as a polygon, inflated 2 cm for range noise -- are dropped as",
+        "  the robot looking at itself.  Left in, that artefact is the smallest",
+        "  margin on almost every scan and decides the verdict instead of traffic.",
+        "  Its cost is a blind shell: abeam, an obstacle closer than 0.130 m is",
+        "  masked, while the scored envelope starts at 0.070 m.",
         "lidar FOV: the Limo scans 240 deg; cspace trained on 360 deg and has",
-        "  allow_reverse enabled, so its rear 120 deg is blind here.",
+        "  allow_reverse enabled, so its rear 120 deg is blind here -- and this is",
+        "  now also blind to collisions behind the robot.  Beam-end masking is gone",
+        "  with the self-return test above, so the sweep is used whole.",
         "control rate: cspace 10 Hz, neupan 50 Hz.  Reported, not equalised.",
         "speed caps: cspace +/-0.5 m/s; neupan ref_speed 0.3.",
         "stop thresholds: cspace stops at 0.3 m, neupan at 0.2 m.  Both are",

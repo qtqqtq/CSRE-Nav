@@ -293,56 +293,144 @@ def aabb_gap(a, b):
     return math.hypot(dx, dy)
 
 
-def obb_aabb_clearance(cx, cy, yaw, half_len, half_wid, aabb):
-    """Signed clearance between a yaw-rotated rectangle and an axis-aligned box.
+# ------------------------------------------------------------------ footprint
+# The robot's shape is a polygon of connected points, not a length x width box.
+# That is how SAC training carries it: ``SAC/settings.py`` builds
+# ``ROBOT_FOOTPRINT = rectangular_footprint(1.20, 0.14)`` as a list of ``[x, y]``
+# vertices, and ``SAC/cspace_cost_rays.py`` consumes it as a generic ``(V, 2)``
+# array, so neither side assumes four vertices or axis alignment.  Keeping the
+# same representation here means a non-rectangular shape can be scored without
+# inventing a second one, and it is what the laser collision test is expressed
+# against: the polygon *is* the robot for scoring purposes.
+#
+# Points are in the robot frame (``base_footprint``), +x forward and +y left,
+# centred on the origin -- the same convention as SAC's.
+def parse_footprint(spec, what="footprint"):
+    """Validate a footprint vertex list read from YAML -> [(x, y), ...]."""
+    if not isinstance(spec, (list, tuple)) or len(spec) < 3:
+        raise ValueError("%s needs at least 3 [x, y] points, got %r"
+                         % (what, spec))
+    pts = []
+    for i, v in enumerate(spec):
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            raise ValueError("%s[%d] is %r; expected [x, y]" % (what, i, v))
+        pts.append((float(v[0]), float(v[1])))
+    if len(set(pts)) < 3:
+        raise ValueError("%s has fewer than 3 distinct points: %r" % (what, pts))
+    return pts
 
-    Negative means penetration, and its magnitude is the penetration depth;
-    positive is the true Euclidean separation.  Exact for two convex polygons:
-    the separating-axis theorem says the distance is the largest projection gap
-    over the face normals of both shapes, which for a rectangle is its two body
-    axes plus the AABB's two world axes.
+
+def polygon_extent(poly):
+    """(length, width) of the polygon's axis-aligned bounding box, in metres."""
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return (max(xs) - min(xs), max(ys) - min(ys))
+
+
+def point_in_polygon(px, py, poly):
+    """Even-odd ray cast: is (px, py) inside the closed polygon?
+
+    The boundary counts as outside only in the sense that a point exactly on an
+    edge may fall either way; nothing here depends on that case, because the
+    silhouette below is continuous through it.
     """
-    c = math.cos(yaw)
-    s = math.sin(yaw)
-    axes = ((1.0, 0.0), (0.0, 1.0), (c, s), (-s, c))
-
-    corners = []
-    for sx, sy in ((1, 1), (1, -1), (-1, -1), (-1, 1)):
-        px = sx * half_len
-        py = sy * half_wid
-        corners.append((cx + px * c - py * s, cy + px * s + py * c))
-    box = ((aabb[0], aabb[2]), (aabb[1], aabb[2]),
-           (aabb[1], aabb[3]), (aabb[0], aabb[3]))
-
-    gaps = []
-    for nx, ny in axes:
-        ra = [p[0] * nx + p[1] * ny for p in corners]
-        rb = [p[0] * nx + p[1] * ny for p in box]
-        # > 0 when the projections are disjoint, and then the gap is the distance
-        # along this axis; <= 0 when they overlap.
-        gaps.append(max(min(rb) - max(ra), min(ra) - max(rb)))
-
-    separated = [g for g in gaps if g > 0.0]
-    if separated:
-        return max(separated)
-    # Overlapping on every axis: the shallowest push-out is the penetration depth.
-    return max(gaps)
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        if (y0 > py) != (y1 > py):
+            if px < x0 + (py - y0) * (x1 - x0) / (y1 - y0):
+                inside = not inside
+    return inside
 
 
-def min_clearance(cx, cy, yaw, half_len, half_wid, obstacles):
-    """Signed clearance from the robot rectangle to the nearest obstacle AABB."""
-    if not obstacles:
-        return float("inf")
-    return min(obb_aabb_clearance(cx, cy, yaw, half_len, half_wid, a)
-               for a in obstacles)
+def polygon_ray_exit(px, py, theta, poly):
+    """Distance from an interior point to the polygon boundary along ``theta``.
+
+    This is the robot's own silhouette radius in that direction: how far a beam
+    has to travel from ``(px, py)`` to leave its own footprint.  A laser return
+    shorter than this terminated inside the robot, so what the beam hit was the
+    footprint rather than an obstacle.
+
+    Returns ``None`` when the ray never meets the boundary, which means the
+    origin is outside the polygon; callers treat that as "no self-occlusion",
+    since a laser that is not inside the footprint cannot be blocked by it.
+    """
+    dx, dy = math.cos(theta), math.sin(theta)
+    best = None
+    n = len(poly)
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        ex, ey = x1 - x0, y1 - y0
+        den = dx * ey - dy * ex
+        if abs(den) < 1e-12:                      # ray parallel to this edge
+            continue
+        # p + t*d == v0 + u*e, solved by Cramer's rule for t along the ray and
+        # u along the edge; the crossing is real only for t > 0 and u in [0, 1].
+        wx, wy = x0 - px, y0 - py
+        t = (wx * ey - wy * ex) / den
+        u = (wx * dy - wy * dx) / den
+        if t > 0.0 and -1e-9 <= u <= 1.0 + 1e-9:
+            if best is None or t < best:
+                best = t
+    return best
+
+
+def point_polygon_distance(px, py, poly):
+    """Distance from a point to a closed polygon: 0.0 when inside, else the
+    distance to the nearest edge."""
+    if point_in_polygon(px, py, poly):
+        return 0.0
+    n = len(poly)
+    best = float("inf")
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        ex, ey = x1 - x0, y1 - y0
+        den = ex * ex + ey * ey
+        if den <= 0.0:
+            t = 0.0
+        else:
+            t = ((px - x0) * ex + (py - y0) * ey) / den
+            t = min(1.0, max(0.0, t))
+        best = min(best, math.hypot(px - (x0 + t * ex), py - (y0 + t * ey)))
+    return best
+
+
+def footprint_clearance(cx, cy, yaw, poly, models):
+    """Signed clearance from the footprint, placed at ``(cx, cy, yaw)`` in the
+    world, to the moving obstacles' bounding circles.
+
+    ``models`` is an iterable of ``(name, x, y)`` ground-truth Gazebo poses.
+    The obstacles are points in the world and the footprint is a polygon in the
+    robot frame, so each obstacle is rotated into that frame and measured
+    against the polygon there -- no second copy of the shape is needed.
+
+    This is for questions asked *before* a teleport, like "is the start pose
+    free right now": the laser cannot answer those, because it is still mounted
+    on a robot that is somewhere else.
+    """
+    c, s = math.cos(yaw), math.sin(yaw)
+    best = float("inf")
+    for name, x, y in models:
+        radius = moving_obstacle_radius(name)
+        if radius is None:
+            continue
+        dx, dy = x - cx, y - cy
+        # World -> robot frame is a rotation by -yaw; (c, s) is +yaw.
+        rx = c * dx + s * dy
+        ry = -s * dx + c * dy
+        best = min(best, point_polygon_distance(rx, ry, poly) - radius)
+    return best
 
 
 def moving_obstacle_radius(name):
     """Bounding circle for a moving model in limo_complex.world, in metres.
 
     The first ten are cross shaped pairs of cylinders; model 10 is a 5 cm
-    cylinder; models 11-19 use a 0.3-scaled person mesh. Mesh clearance is an
-    approximation and is reported as such in the benchmark documentation.
+    cylinder; models 11-19 use a 0.3-scaled person mesh.
     """
     if not name.startswith('cross_clone_'):
         return None
@@ -357,25 +445,6 @@ def moving_obstacle_radius(name):
     if index < 20:
         return 0.25
     return None
-
-
-def moving_clearance(cx, cy, yaw, half_len, half_wid, models):
-    """Signed clearance from Limo rectangle to moving bounding circles.
-
-    models is an iterable of (name, x, y) ground-truth Gazebo poses.
-    """
-    best = float('inf')
-    c, s = math.cos(yaw), math.sin(yaw)
-    for name, x, y in models:
-        radius = moving_obstacle_radius(name)
-        if radius is None:
-            continue
-        dx, dy = x - cx, y - cy
-        rx, ry = c * dx + s * dy, -s * dx + c * dy
-        ox = max(abs(rx) - half_len, 0.0)
-        oy = max(abs(ry) - half_wid, 0.0)
-        best = min(best, math.hypot(ox, oy) - radius)
-    return best
 
 
 def segment_clearance(p0, p1, obstacles, step=0.05):
@@ -406,159 +475,6 @@ def segment_clearance(p0, p1, obstacles, step=0.05):
                     return 0.0
     return best
 
-
-def _rot_rpy(rpy):
-    """URDF rpy (roll, pitch, yaw) -> 3x3 rotation matrix as a tuple of rows.
-
-    URDF convention is R = Rz(yaw) * Ry(pitch) * Rx(roll).
-    """
-    r, p, y = rpy
-    cr, sr = math.cos(r), math.sin(r)
-    cp, sp = math.cos(p), math.sin(p)
-    cy, sy = math.cos(y), math.sin(y)
-    return (
-        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
-        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
-        (-sp,     cp * sr,                cp * cr),
-    )
-
-
-def _mat_mul(a, b):
-    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3))
-                 for i in range(3))
-
-
-def _mat_vec(a, v):
-    return tuple(sum(a[i][k] * v[k] for k in range(3)) for i in range(3))
-
-
-def _primitive_points(geom):
-    """Sample a URDF collision primitive's extreme 3D points (local frame).
-
-    Sampling rather than solving for the AABB analytically is what makes a
-    rotated cylinder come out right: a Limo wheel is ``<cylinder length=.045
-    radius=.045>`` under ``rpy="1.57 0 0"``, so its axis lies along Y and its XY
-    footprint is a 0.09 x 0.045 *rectangle*.  Treating it as a bounding square
-    (the convention parse_world_obstacles uses for SDF, and the convention
-    training used) would inflate the robot's half-width from 0.11 to 0.155.
-
-    Returns (points, inflate) where `inflate` is an isotropic pad to apply after
-    projecting -- a sphere projects to a point plus its radius.
-    """
-    box = geom.find('box')
-    cyl = geom.find('cylinder')
-    sph = geom.find('sphere')
-    if box is not None:
-        sx, sy, sz = [float(v) for v in box.get('size', '0 0 0').split()]
-        return ([(sx / 2.0 * i, sy / 2.0 * j, sz / 2.0 * k)
-                 for i in (-1, 1) for j in (-1, 1) for k in (-1, 1)], 0.0)
-    if cyl is not None:
-        r = float(cyl.get('radius', '0'))
-        L = float(cyl.get('length', '0'))
-        pts = []
-        for k in (-1, 1):
-            for i in range(24):
-                t = 2.0 * math.pi * i / 24.0
-                pts.append((r * math.cos(t), r * math.sin(t), k * L / 2.0))
-        return (pts, 0.0)
-    if sph is not None:
-        return ([(0.0, 0.0, 0.0)], float(sph.get('radius', '0')))
-    return (None, 0.0)
-
-
-def footprint_from_urdf(xml_string, root_link="base_footprint"):
-    """Derive the robot's (half_length, half_width) from a URDF string.
-
-    Composes every joint at its zero configuration -- exact for fixed joints, and
-    for revolute/continuous ones at rest (a wheel's spin does not move its XY
-    footprint) -- then unions every collision primitive's projected XY extent
-    into one AABB in the ``root_link`` frame.
-
-    Derived rather than hardcoded so the collision ground truth matches Gazebo's
-    own collision primitives, which is what makes ``clearance <= 0`` mean "the
-    robot is actually touching something" rather than "someone's guess about the
-    robot says so".  ``urdf_parser_py`` is not installed in this image, hence the
-    stdlib walk; note URDF puts geometry in *attributes* (``<box size="..."/>``)
-    where SDF uses child elements, which is why this cannot share code with
-    ``parse_world_obstacles``.
-
-    Returns ``(half_length, half_width, n_collisions)``.
-    """
-    root = ET.fromstring(xml_string)
-
-    def _floats(text, n):
-        vals = [float(v) for v in (text or '').split()]
-        while len(vals) < n:
-            vals.append(0.0)
-        return vals[:n]
-
-    def _origin(elem):
-        o = elem.find('origin')
-        if o is None:
-            return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
-        return _floats(o.get('xyz'), 3), _floats(o.get('rpy'), 3)
-
-    # link -> (parent, xyz, rpy) for every joint, whatever its type.
-    joints = {}
-    for j in root.findall('joint'):
-        parent = j.find('parent')
-        child = j.find('child')
-        if parent is None or child is None:
-            continue
-        xyz, rpy = _origin(j)
-        joints[child.get('link')] = (parent.get('link'), xyz, rpy)
-
-    resolved = {}
-
-    def resolve(link, seen):
-        """-> (R, t) taking points in `link` into the root link's frame."""
-        if link in resolved:
-            return resolved[link]
-        if link in seen:
-            raise ValueError("joint cycle through link '%s'" % link)
-        if link not in joints:
-            resolved[link] = (((1.0, 0, 0), (0, 1.0, 0), (0, 0, 1.0)), (0.0, 0.0, 0.0))
-            return resolved[link]
-        parent, xyz, rpy = joints[link]
-        pr, pt = resolve(parent, seen | {link})
-        cr = _rot_rpy(rpy)
-        resolved[link] = (_mat_mul(pr, cr),
-                          tuple(pt[i] + _mat_vec(pr, xyz)[i] for i in range(3)))
-        return resolved[link]
-
-    xs, ys, count = [], [], 0
-    for link in root.findall('link'):
-        name = link.get('name')
-        if name not in joints and name != root_link:
-            continue                      # not part of the root's tree
-        lr, lt = resolve(name, frozenset())
-
-        for coll in link.findall('collision'):
-            geom = coll.find('geometry')
-            if geom is None:
-                continue
-            pts, inflate = _primitive_points(geom)
-            if pts is None:
-                continue
-
-            xyz, rpy = _origin(coll)
-            cr = _rot_rpy(rpy)
-            # collision origin in root frame, then each sampled point in root frame
-            base = tuple(lt[i] + _mat_vec(lr, xyz)[i] for i in range(3))
-            m = _mat_mul(lr, cr)
-            for pt in pts:
-                w = _mat_vec(m, pt)
-                xs.append(base[0] + w[0])
-                ys.append(base[1] + w[1])
-            if inflate:
-                xs.extend([base[0] - inflate, base[0] + inflate])
-                ys.extend([base[1] - inflate, base[1] + inflate])
-            count += 1
-
-    if not xs:
-        raise ValueError("no collision geometry found in the URDF")
-
-    return (max(abs(min(xs)), abs(max(xs))), max(abs(min(ys)), abs(max(ys))), count)
 
 
 def load_bench_config(path):
@@ -888,6 +804,60 @@ def _selftest(world, cfg_path):
     return 0
 
 
+def footprint_report(cfg):
+    """Print the configured polygons and the silhouette they imply for the laser.
+
+    The collision test asks whether a beam came back shorter than the footprint's
+    own radius in that direction, so ``d_self`` *is* the threshold, per beam.
+    Printing it is the quickest way to see what a footprint change would do --
+    a thin polygon has a large threshold only in a narrow forward cone, and that
+    is not obvious from the vertex list.
+
+    The body mask is printed the same way, because the two have to agree in the
+    right direction: where ``d_body`` exceeds ``d_self`` the robot's own chassis
+    sticks out past its scored silhouette, and the beams between the two radii
+    are exactly the ones that would otherwise be read as an obstacle sitting on
+    the robot's flank.
+    """
+    robot = cfg.get("robot") or {}
+    poly = parse_footprint(robot.get("footprint"), "robot.footprint")
+    lx, ly = (robot.get("laser_xyz") or (0.0, 0.0))[:2]
+    length, width = polygon_extent(poly)
+
+    print("footprint: %d point(s), extent %.3f x %.3f m"
+          % (len(poly), length, width))
+    print("  " + "  ".join("(%.3f, %.3f)" % p for p in poly))
+    inside = point_in_polygon(lx, ly, poly)
+    print("laser at (%.3f, %.3f): %s"
+          % (lx, ly, "inside" if inside else "OUTSIDE -- test is meaningless"))
+
+    body = None
+    if robot.get("body"):
+        body = parse_footprint(robot["body"], "robot.body")
+        blen, bwid = polygon_extent(body)
+        print("body mask: %d point(s), extent %.3f x %.3f m"
+              % (len(body), blen, bwid))
+        print("  " + "  ".join("(%.3f, %.3f)" % p for p in body))
+        print("laser at (%.3f, %.3f): %s"
+              % (lx, ly, "inside" if point_in_polygon(lx, ly, body)
+                 else "OUTSIDE -- cannot mask its own returns"))
+
+    print("\n  bearing   d_self   d_body   note")
+    for deg, note in ((0, "straight ahead"), (8, "forward-cone edge"),
+                      (45, ""), (90, "abeam"), (120, "FOV end"),
+                      (180, "astern, no beam")):
+        for sign in ((1,) if deg in (0, 180) else (1, -1)):
+            theta = math.radians(deg * sign)
+            d = polygon_ray_exit(lx, ly, theta, poly)
+            b = polygon_ray_exit(lx, ly, theta, body) if body else None
+            print("  %+6.1f   %s   %s   %s"
+                  % (deg * sign,
+                     "  none" if d is None else "%6.3f" % d,
+                     "  none" if b is None else "%6.3f" % b,
+                     note if sign > 0 else ""))
+    return 0
+
+
 def main(argv):
     here = os.path.dirname(os.path.abspath(__file__))
     default_world = os.path.join(here, "worlds", "limo_complex.world")
@@ -898,17 +868,17 @@ def main(argv):
     ap.add_argument("--config", default=None,
                     help="world config; default: <world stem>.yaml beside the "
                          "world file")
-    ap.add_argument("--urdf", default=None,
-                    help="also derive the footprint from this URDF/xacro output")
+    ap.add_argument("--bench-config",
+                    default=os.path.join(here, "config", "bench.yaml"),
+                    help="harness config holding the footprint; --footprint "
+                         "reads it")
+    ap.add_argument("--footprint", action="store_true",
+                    help="print the configured footprint polygon and the laser "
+                         "silhouette distance it implies per bearing")
     args = ap.parse_args(argv)
 
-    if args.urdf:
-        with open(args.urdf) as fh:
-            hl, hw, n = footprint_from_urdf(fh.read())
-        print("footprint from %s: half_length=%.4f half_width=%.4f (%d collisions)"
-              % (args.urdf, hl, hw, n))
-        print("  -> %.4f x %.4f m" % (2 * hl, 2 * hw))
-        return 0
+    if args.footprint:
+        return footprint_report(load_bench_config(args.bench_config))
 
     if args.selftest:
         return _selftest(args.world, args.config or world_config_path(args.world))
