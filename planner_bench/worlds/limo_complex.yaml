@@ -22,12 +22,29 @@ arena:
   start: [-3.0, 0.0, 0.0]
   start_clearance: 0.15
 
-# Hand-written targets, one trial per entry, run in the order written.  The
-# robot is teleported to arena.start before each one, so entries do not chain.
-#
-#   goals:
-#     - {x: 0.0, y: 0.0, yaw: 0.0}     # mapping form
-#     - [1.5, -2.0]                    # [x, y] shorthand; yaw defaults to 0
+# How many trials to run.  Each trial draws a target from `goals` below, so
+# this is the number of Gazebo episodes, not the number of targets.  Omit it to
+# run each target exactly once.
+trials: 10
+
+# How each trial draws its target:
+#   cycle  -- walk a fresh random permutation of `goals`, reshuffling whenever it
+#             runs out.  Every target gets used the same number of times (to
+#             within one), which is what makes the per-target table worth
+#             reading; only the order is random.
+#   random -- pick uniformly with replacement, the literal reading of "pick one
+#             at random".  With few trials this can leave a target unused and
+#             another used twice as often, which the per-target table will show.
+goal_sample: cycle
+
+# Optional: seed for the target order, so the same list of (trial -> target)
+# can be reproduced.  The moving obstacles are re-randomized by Gazebo either
+# way, so this fixes the schedule, not the run.
+# trial_seed: 0
+
+# The targets to draw from.  Each is {x, y, yaw?} or the [x, y] / [x, y, yaw]
+# shorthand; add as many as you want.  The robot is teleported to arena.start
+# before every trial, so targets do not chain into a route.
 #
 # `yaw` is the heading published with the goal.  neupan reads it, cspace ignores
 # PoseStamped.orientation entirely, so a non-zero yaw only helps neupan.
@@ -35,6 +52,4 @@ arena:
 # boxes when the harness starts -- a point that cannot be a goal is a typo, and
 # it should not cost a Gazebo run to find out.
 goals:
-  - x: 0.0
-    y: 0.0
-    yaw: 0.0
+  - {x: 5.0, y: 0.0, yaw: 0.0}

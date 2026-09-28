@@ -2,10 +2,11 @@
 
 """Run one planner through the targets hand-written in the world config.
 
-    ./planner_bench/run.sh cspace
-    ./planner_bench/run.sh neupan
+    ./planner_bench/run_bench.py cspace
+    ./planner_bench/run_bench.py neupan
 
-Started by run.sh. One planner at a time: the two nodes both
+Started by run_bench.py, which owns the simulation; this file assumes a live
+Gazebo and a loaded planner. One planner at a time: the two nodes both
 want /cmd_vel and there is one robot.
 
 WHAT IS MEASURED, AND WHY IT IS MEASURED THIS WAY
@@ -48,7 +49,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 from bench_common import (footprint_from_urdf, goals_from_config, goals_sha1,
                           load_bench_config, load_world_config, min_clearance,
                           moving_clearance, parse_world_obstacles,
-                          point_aabb_distance, sha1_of, world_config_path)
+                          point_aabb_distance, sha1_of, trial_plan,
+                          world_config_path)
 
 import rospy
 import tf
@@ -290,7 +292,8 @@ class Bench(object):
         if not rospy.get_param("/use_sim_time", False):
             rospy.logfatal("[bench] /use_sim_time is not set.  Every timeout in "
                            "bench.yaml is in SIM seconds; running on wall time "
-                           "would silently misjudge all of them. Start run.sh first.")
+                           "would silently misjudge all of them. Start the sim "
+                           "with run_bench.py first.")
             return False
 
         # Wall-clock deadline, not now_s(): see wall_s().  Computing this from
@@ -555,7 +558,8 @@ class Bench(object):
 
         if not self.await_goal_accepted(msg):
             return {
-                "i": goal["i"], "goal": goal, "verdict": "no_planner",
+                "i": goal["i"], "goal_i": goal["goal_i"], "goal": goal,
+                "verdict": "no_planner",
                 "reason": "planner never published /cmd_vel within %g s of the "
                           "goal -- it is not tracking goals at all"
                           % t["planner_timeout"],
@@ -702,6 +706,10 @@ class Bench(object):
 
         return {
             "i": goal["i"],
+            # Which entry of the world config's `goals:` this trial drew.  The
+            # same target is drawn by several trials, so this -- not `i` -- is
+            # the key to group by.
+            "goal_i": goal["goal_i"],
             "goal": goal,
             "verdict": verdict,
             "reason": reason,
@@ -746,14 +754,16 @@ class Bench(object):
 
     # ------------------------------------------------------------------ main
     def run(self):
-        goals = self.args.goals
-        log("planner=%s  goals=%d  world=%s"
-            % (self.args.planner, len(goals), os.path.basename(self.args.world)))
+        # `args.goals` is the trial plan, not the target list: one entry per
+        # episode run, each naming the target it drew (`goal_i`).
+        plan = self.args.goals
+        log("planner=%s  trials=%d  world=%s"
+            % (self.args.planner, len(plan), os.path.basename(self.args.world)))
         results = []
-        for goal in goals:
-            log("trial %d/%d -> (%.2f, %.2f) dist %.2f yaw %.2f"
-                % (goal["i"] + 1, len(goals), goal["x"], goal["y"],
-                   goal["distance"], goal["yaw"]))
+        for goal in plan:
+            log("trial %d/%d  target %d -> (%.2f, %.2f) dist %.2f yaw %.2f"
+                % (goal["i"] + 1, len(plan), goal["goal_i"], goal["x"],
+                   goal["y"], goal["distance"], goal["yaw"]))
             r = self.run_trial(goal)
             log("   %-10s %s" % (r["verdict"].upper(), r.get("reason", "")))
             results.append(r)
@@ -798,8 +808,11 @@ def main(argv):
     ap.add_argument("--timeout", type=float, default=None,
                     help="override trial.trial_timeout (sim seconds)")
     ap.add_argument("--only", type=int, nargs="*", default=None,
-                    help="run only these goals, by their index in bench.yaml "
-                         "`goals:` (debugging)")
+                    help="run only these trial numbers, 0-based, as they appear "
+                         "in the plan (debugging)")
+    ap.add_argument("--only-goal", type=int, nargs="*", default=None,
+                    help="run only the trials that drew these targets, by their "
+                         "index in `goals:` (debugging a single target)")
     # rospy.myargv, not a bare argv: when this node is started by roslaunch,
     # roslaunch appends its own reserved arguments (__name:=, __log:=) to the
     # command line, and a strict argparse rejects them -- "unrecognized
@@ -829,22 +842,35 @@ def main(argv):
         goals = goals_from_config(wcfg, obstacles=obstacles,
                                   bounds=tuple(wcfg["arena"]["bounds"]),
                                   start=args.start)
+        plan = trial_plan(goals, trials=wcfg.get("trials"),
+                          sample=wcfg.get("goal_sample", "cycle"),
+                          seed=wcfg.get("trial_seed"))
     except ValueError as exc:
         # Before rospy.init_node, let alone Gazebo: a mistyped target is an
         # authoring mistake, and finding it should not cost a simulation run.
         sys.exit("[bench] %s: %s" % (args.world_config, exc))
-    declared = goals
+    declared = plan
     if args.only is not None:
-        goals = [g for g in declared if g["i"] in args.only]
-        if not goals:
-            sys.exit("[bench] --only %s matched none of the %d goals in %s"
+        plan = [t for t in declared if t["i"] in args.only]
+        if not plan:
+            sys.exit("[bench] --only %s matched none of the %d trials in %s"
                      % (args.only, len(declared), args.world_config))
-    args.goals = goals
+    if args.only_goal is not None:
+        plan = [t for t in plan if t["goal_i"] in args.only_goal]
+        if not plan:
+            sys.exit("[bench] --only-goal %s matched none of the %d targets in "
+                     "%s" % (args.only_goal, len(goals), args.world_config))
+    args.goals = plan
+    # The targets, not the schedule: report.py must refuse to compare two runs
+    # scored against different points, but must not object to the same points
+    # drawn in a different order -- that is what re-running looks like.
     actual_goal_sha1 = goals_sha1(goals)
 
     rospy.init_node("bench_harness", anonymous=True, disable_signals=True)
     log("starting: planner=%s world_config=%s" % (args.planner, args.world_config))
-    for g in goals:
+    log("  %d target(s) -> %d trial(s), sample=%s"
+        % (len(goals), len(plan), wcfg.get("goal_sample", "cycle")))
+    for g in plan:
         # A target inside the success radius is an instant success and a wasted
         # trial; a legal choice, but almost always a typo in the decimals.
         if g["distance"] < cfg["trial"]["success_radius"]:
@@ -910,7 +936,14 @@ def main(argv):
             "robot": {"half_length": half_len, "half_width": half_wid},
             "bench_config": os.path.abspath(args.config),
             "trial": cfg["trial"],
-            "n_goals": len(results),
+            # The schedule, kept so a reader can see which target each trial
+            # drew without re-deriving it from the seed.
+            "n_trials": len(results),
+            "n_targets": len(goals),
+            "goal_sample": wcfg.get("goal_sample", "cycle"),
+            "trial_seed": wcfg.get("trial_seed"),
+            "plan": [{"i": t["i"], "goal_i": t["goal_i"],
+                      "x": t["x"], "y": t["y"]} for t in args.goals],
         },
         "summary": args.summary,
         "trials": results,

@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import sys
 import xml.etree.ElementTree as ET
 
@@ -595,7 +596,9 @@ def load_world_config(path):
         cfg = yaml.safe_load(fh) or {}
     for key in ("arena", "goals"):
         if key not in cfg:
-            raise ValueError("%s has no `%s` section" % (path, key))
+            # No path: both callers (bench.py, run_bench.py) name the config
+            # file when they print this, and repeating it reads as two files.
+            raise ValueError("no `%s` section in the world config" % key)
     return cfg
 
 
@@ -663,6 +666,59 @@ def goals_from_config(cfg, obstacles=None, bounds=None, start=None):
             g["distance"] = round(math.hypot(x - start[0], y - start[1]), 4)
         goals.append(g)
     return goals
+
+
+def trial_plan(goals, trials=None, sample="cycle", seed=None):
+    """Expand the target list into the trials to run, one target per trial.
+
+    Returns a list of copies of the goals -- one per trial -- in the order they
+    will be run, each carrying the trial number as ``i`` and the target's index
+    in the config as ``goal_i``.  Every other field (x, y, yaw, distance) is the
+    target's, so a caller can treat a plan entry exactly like a goal.
+
+    `trials` defaults to one trial per target.  `sample`:
+      cycle  -- shuffle the target list and walk it, reshuffling each time it is
+                exhausted.  Every target is used within one of the same number
+                of times, which is the point of repeating: a target that drew
+                three trials against a target that drew one cannot be compared,
+                and with obstacles re-randomized every trial the extra
+                repetitions are the only thing that separates the two.
+      random -- uniform with replacement, the literal reading of "pick one at
+                random".  Allowed, and reported, but it can starve a target.
+
+    The order is random but its *schedule* is reproducible when `seed` is given.
+    The trials themselves are not: Gazebo re-randomizes the moving obstacles on
+    every run, so a seed fixes which target comes when, not what happens.
+    """
+    if not goals:
+        raise ValueError("no goals to draw trials from")
+    if trials is None:
+        trials = len(goals)
+    if isinstance(trials, bool) or not isinstance(trials, int):
+        raise ValueError("`trials:` must be a whole number, got %r" % (trials,))
+    if trials < 1:
+        raise ValueError("`trials:` must be at least 1, got %d" % trials)
+    if sample not in ("cycle", "random"):
+        raise ValueError("`goal_sample:` must be 'cycle' or 'random', got %r"
+                         % (sample,))
+
+    rng = random.Random(seed)
+    order = []
+    if sample == "random":
+        order = [rng.randrange(len(goals)) for _ in range(trials)]
+    else:
+        while len(order) < trials:
+            cycle = list(range(len(goals)))
+            rng.shuffle(cycle)
+            order.extend(cycle[:trials - len(order)])
+
+    plan = []
+    for n, k in enumerate(order):
+        t = dict(goals[k])
+        t["goal_i"] = k
+        t["i"] = n
+        plan.append(t)
+    return plan
 
 
 def goals_sha1(goals):

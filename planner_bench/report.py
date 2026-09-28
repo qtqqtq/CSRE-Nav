@@ -10,7 +10,7 @@ table, and it has to keep working after the simulation is gone.
 
 Two rules the report follows, because both change what the numbers mean:
 
-  * It refuses to compare runs whose world or goal set differ.  A success rate
+  * It refuses to compare runs whose world or target set differ.  A success rate
     against a different set of goals is not a comparison, it is two unrelated
     measurements that happen to be printed next to each other.
 
@@ -18,6 +18,13 @@ Two rules the report follows, because both change what the numbers mean:
     censored -- a planner that never arrives has no arrival time, and dropping
     those trials while averaging the rest flatters whichever planner failed
     more.  The denominator is printed so the censoring is visible.
+
+  * Results are grouped by TARGET, not by trial.  Each trial draws a target at
+    random, so trial 3 of one run and trial 3 of the other are unrelated
+    episodes against unrelated targets; pairing them would be an invention.
+    Trials of the same target are not paired either -- the moving obstacles are
+    re-randomized for every trial -- so a per-target row compares distributions,
+    and the count of trials behind each row is printed to keep that honest.
 """
 
 import argparse
@@ -30,8 +37,9 @@ import sys
 def wilson(k, n, z=1.96):
     """Wilson score interval for a binomial proportion.
 
-    Not the normal approximation: with n ~ 11 goals and rates near 0 or 1 that
-    interval runs outside [0, 1] and reads as precision the run does not have.
+    Not the normal approximation: with a handful of trials and rates near 0 or 1
+    that interval runs outside [0, 1] and reads as precision the run does not
+    have.
     """
     if n == 0:
         return (float("nan"), float("nan"))
@@ -71,10 +79,28 @@ class Run(object):
         self.path = path
         self.name = self.doc["meta"]["planner"]
         self.trials = self.doc["trials"]
-        self.by_i = {t["i"]: t for t in self.trials}
+        # Group by the target each trial drew, which is the only meaningful
+        # grouping once one target can be drawn by several trials.  Reports
+        # written before trials were sampled have no goal_i and ran one target
+        # per trial, where i == goal_i, so falling back to i groups them right.
+        self.by_goal = {}
+        for t in self.trials:
+            self.by_goal.setdefault(t.get("goal_i", t["i"]), []).append(t)
 
     def count(self, verdict):
         return sum(1 for t in self.trials if t["verdict"] == verdict)
+
+    def target(self, gi):
+        """The point behind a target index, taken from the trials that ran it."""
+        t = self.by_goal[gi][0]
+        g = t.get("goal") or {}
+        return {"i": gi, "x": g.get("x"), "y": g.get("y"),
+                "yaw": g.get("yaw", 0.0), "distance": g.get("distance")}
+
+    def success_rate(self, gi):
+        ts = self.by_goal[gi]
+        k = sum(1 for t in ts if t["verdict"] == "success")
+        return k, len(ts)
 
     @property
     def n(self):
@@ -143,8 +169,8 @@ def check_comparable(a, b):
                         "(%s: %s vs %s: %s)"
                         % (a.name, wa[:12], b.name, wb[:12]))
     # Only the points are compared, not the file they were written in: the
-    # targets now live in bench.yaml beside the trial timeouts, and retuning one
-    # of those must not make two runs over identical targets look incomparable.
+    # targets live in a config beside the trial timeouts, and retuning one of
+    # those must not make two runs over identical targets look incomparable.
     ha = a.doc["meta"].get("goals_sha1")
     hb = b.doc["meta"].get("goals_sha1")
     if ha and hb and ha != hb:
@@ -153,13 +179,27 @@ def check_comparable(a, b):
     sb = b.doc["meta"].get("start")
     if sa and sb and any(abs(x - y) > 1e-6 for x, y in zip(sa, sb)):
         problems.append("different start poses (%s vs %s)" % (sa, sb))
-    if a.n != b.n:
-        problems.append("different trial counts (%d vs %d)" % (a.n, b.n))
-    ia, ib = set(a.by_i), set(b.by_i)
-    if ia != ib:
-        problems.append("different goal indices (%s vs %s)"
-                        % (sorted(ia), sorted(ib)))
+    # The targets actually exercised, not the trials run.  The trial numbering
+    # is a schedule -- which target happened to come up first -- and two runs of
+    # the same targets in a different order are the same experiment.  A run that
+    # only touched some of the targets (`--only-goal`) is a different one, and
+    # its per-target rows would sit beside rows the other run never measured.
+    ga, gb = set(a.by_goal), set(b.by_goal)
+    if ga != gb:
+        problems.append("different targets exercised (%s vs %s)"
+                        % (sorted(ga), sorted(gb)))
     return problems
+
+
+def balance_note(run):
+    """Trials per target, for the reader to judge how thin a per-target row is.
+
+    Not a comparability problem: both runs come from the same `trials:` count,
+    so a mismatch here is the random draw, not a different experiment.  It is
+    printed because a target scored 2/2 and one scored 2/4 read very differently
+    and the table alone does not say which is which across the two runs.
+    """
+    return [len(run.by_goal[gi]) for gi in sorted(run.by_goal)]
 
 
 def main(argv):
@@ -183,7 +223,7 @@ def main(argv):
         if len(paths) != 2:
             sys.exit("expected exactly 2 reports in %s, found %d.  Run both "
                      "planners first:\n"
-                     "  ./planner_bench/run.sh both"
+                     "  ./planner_bench/run_bench.py both"
                      % (rdir, len(paths)))
     if len(paths) != 2:
         sys.exit("expected exactly 2 reports, got %d" % len(paths))
@@ -199,8 +239,11 @@ def main(argv):
     w("world     : %s" % os.path.basename(meta["world"]))
     w("            sha1 %s" % (meta.get("world_sha1") or "-")[:16])
     w("targets   : %d point(s) from %s"
-      % (a.n, os.path.basename(meta.get("world_config", "-"))))
+      % (len(a.by_goal), os.path.basename(meta.get("world_config", "-"))))
     w("            sha1 %s" % (meta.get("goals_sha1") or "-")[:16])
+    w("draw      : %s, seed %s"
+      % (meta.get("goal_sample", "one trial per target"),
+         meta.get("trial_seed") if meta.get("trial_seed") is not None else "none"))
     w("start     : %s" % (meta.get("start"),))
     w("robot     : %.3f x %.3f m (%s) / %.3f x %.3f m (%s)"
       % (2 * a.doc["meta"]["robot"]["half_length"],
@@ -214,10 +257,11 @@ def main(argv):
         for p in problems:
             w("  * %s" % p)
         w("")
-        w("These runs do not share a world, a goal set and a start pose, so a "
-          "difference between them")
-        w("cannot be attributed to the planners.  Re-run both, or pass --force "
-          "to print anyway.")
+        w("These runs do not share a world, a target set, a start pose and the "
+          "targets they")
+        w("exercised, so a difference between them cannot be attributed to the "
+          "planners.")
+        w("Re-run both, or pass --force to print anyway.")
         text = "\n".join(out)
         print(text)
         if args.out:
@@ -232,6 +276,7 @@ def main(argv):
     w("%-26s %-18s %-18s" % ("", a.name, b.name))
     w("-" * 68)
     w("%-26s %-18s %-18s" % ("trials", a.n, b.n))
+    w("%-26s %-18s %-18s" % ("targets", len(a.by_goal), len(b.by_goal)))
 
     for v in VERDICTS:
         ca, cb = a.count(v), b.count(v)
@@ -294,40 +339,49 @@ def main(argv):
     both("near-miss samples (med)", "n_near_miss", "%.0f")
     w("")
 
-    # ------------------------------------------------------------- by goal
-    w("per goal (indices are the order of `goals:` in the world config)")
-    w("%-4s %-22s %-22s %-22s" % ("i", "target", a.name, b.name))
+    # ------------------------------------------------------------ by target
+    # One row per point in the world config, not per trial.  The cell is k/n and
+    # the median arrival time of the trials that made it -- reported with its n
+    # because with a handful of draws per target the difference between 1/3 and
+    # 2/3 is not a difference.
+    w("per target (indices are the order of `goals:` in the world config)")
+    w("%-4s %-20s %-21s %-21s" % ("i", "target", a.name, b.name))
     w("-" * 68)
-    agree = {"both": 0, "neither": 0, "a_only": 0, "b_only": 0}
-    for i in sorted(set(a.by_i) & set(b.by_i)):
-        ta, tb = a.by_i[i], b.by_i[i]
-        g = ta["goal"]
-        dist = g.get("distance", float("nan"))
-        tgt = "(%.2f, %.2f) %.2fm" % (g["x"], g["y"], dist)
-        sa = ta["verdict"] == "success"
-        sb = tb["verdict"] == "success"
-        if sa and sb:
-            agree["both"] += 1
-        elif sa:
-            agree["a_only"] += 1
-        elif sb:
-            agree["b_only"] += 1
+    solved = {"both": 0, "neither": 0, "a_only": 0, "b_only": 0}
+    for gi in sorted(set(a.by_goal) & set(b.by_goal)):
+        g = a.target(gi)
+        tgt = "(%.2f, %.2f) %.1fm" % (g["x"], g["y"], g.get("distance") or 0.0)
+
+        def cell(run):
+            k, n = run.success_rate(gi)
+            ts = run.by_goal[gi]
+            durs = [t["duration"] for t in ts if t["verdict"] == "success"]
+            extra = ("%.1fs med" % med(durs)) if durs else "-"
+            return "%d/%d  %s" % (k, n, extra)
+
+        ka = a.success_rate(gi)[0]
+        kb = b.success_rate(gi)[0]
+        if ka and kb:
+            solved["both"] += 1
+        elif ka:
+            solved["a_only"] += 1
+        elif kb:
+            solved["b_only"] += 1
         else:
-            agree["neither"] += 1
-
-        def cell(t, ok):
-            extra = ("%.1fs" % t["duration"]) if ok else (
-                "%.2fm off" % t["final_error"] if t.get("final_error") is not None
-                else "-")
-            return "%-9s %s" % (t["verdict"], extra)
-
-        w("%-4d %-22s %-22s %-22s" % (i, tgt, cell(ta, sa), cell(tb, sb)))
+            solved["neither"] += 1
+        w("%-4d %-20s %-21s %-21s" % (gi, tgt, cell(a), cell(b)))
     w("")
-    w("%-26s %-18s %-18s" % ("same target outcome", a.name, b.name))
-    w("%-26s %d" % ("both succeed", agree["both"]))
-    w("%-26s %d" % ("both fail", agree["neither"]))
-    w("%-26s %d" % ("only %s" % a.name, agree["a_only"]))
-    w("%-26s %d" % ("only %s" % b.name, agree["b_only"]))
+    w("%-26s %-18s %-18s" % ("trials per target", a.name, b.name))
+    w("%-26s %-18s %-18s" % ("  in this order",
+                             str(balance_note(a)), str(balance_note(b))))
+    w("")
+    w("same target, unpaired -- targets each planner was scored on, by whether")
+    w("it ever solved them.  Trials are not matched: the moving obstacles are")
+    w("re-randomized per trial, so nothing below is a paired result.")
+    w("%-26s %d" % ("solved by both", solved["both"]))
+    w("%-26s %d" % ("solved by neither", solved["neither"]))
+    w("%-26s %d" % ("only %s" % a.name, solved["a_only"]))
+    w("%-26s %d" % ("only %s" % b.name, solved["b_only"]))
     w("")
 
     # --------------------------------------------------------- the caveats
