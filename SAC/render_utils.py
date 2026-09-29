@@ -55,8 +55,8 @@ def draw_cost_rays(env, font):
       1. on-map boundary -- a cyan polyline + proximity-coloured dots showing,
          for each beam, the nearest footprint-collision distance
          (min over the nz theta layers) in world coordinates.
-      2. HUD heatmaps     -- both B×nz processed channels consumed by the CNN:
-         entry proximity and collision width.
+      2. HUD heatmaps     -- the configured B×nz normalized distance channels
+         consumed by the CNN.
     """
     if env.window is None or getattr(env, "cost_rays_raw", None) is None:
         return
@@ -93,10 +93,14 @@ def draw_cost_rays(env, font):
     panel_h = C * (H + 16) + 4
     panel = pygame.Surface((W + 4, panel_h), pygame.SRCALPHA)
     panel.fill((0, 0, 0, 160))
-    labels = ("entry proximity", "collision width")
     for c in range(C):
         y0 = c * (H + 16)
-        label = labels[c] if c < len(labels) else "interval channel %d" % c
+        if c == 0:
+            label = "first entry distance"
+        elif c % 2:
+            label = "obstacle width %d" % ((c + 1) // 2)
+        else:
+            label = "free gap %d" % (c // 2)
         panel.blit(font.render(label, True, (255, 255, 255)), (4, y0 + 2))
         for i in range(B):
             for j in range(L):
@@ -188,10 +192,9 @@ def draw_interval_rays(env, font, legend=True):
 def draw_cspace_projection(env, font, size=200):
     """Overlay the c-space XY projection (like getXYProjectionImage).
 
-    Colour encodes which theta orientation(s) collide at each cell (red = small
-    theta, green = middle, blue = large; grey = free or all theta).  The grid is
-    robot-centric with forward up and left left; the robot is the centre dot +
-    forward arrow.
+    Grayscale brightness is the fraction of theta orientations that are usable
+    at each XY cell (black = none, white = all). The grid is robot-centric with
+    forward up and left left; the robot is the centre dot + forward arrow.
     """
     if env.window is None or getattr(env, "cspace", None) is None:
         return
@@ -201,13 +204,15 @@ def draw_cspace_projection(env, font, size=200):
     surf = pygame.image.frombuffer(rgb.tobytes(), (G, G), "RGB")
     surf = pygame.transform.scale(surf, (size, size))
 
-    panel = pygame.Surface((size + 4, size + 4 + 16), pygame.SRCALPHA)
+    panel = pygame.Surface((size + 4, size + 4 + 34), pygame.SRCALPHA)
     panel.fill((0, 0, 0, 160))
     panel.blit(font.render("c-space XY", True, (255, 255, 255)), (4, 2))
-    panel.blit(surf, (2, 18))
+    panel.blit(font.render("usable θ: black 0%  →  white 100%",
+                           True, (220, 220, 220)), (4, 18))
+    panel.blit(surf, (2, 34))
 
     c = 2 + size // 2
-    cy = 18 + size // 2
+    cy = 34 + size // 2
     pygame.draw.circle(panel, (255, 255, 255), (c, cy), 3)
     pygame.draw.line(panel, (0, 255, 255), (c, cy), (c, cy - size // 4), 2)
 

@@ -2,14 +2,14 @@
 
 ## Project Structure & Module Organization
 
-`SAC/` contains the active reinforcement-learning implementation. `train.py` is the CNN-SAC training entry point; `cnn_network.py`, `replay_buffer.py`, and `settings.py` define the agent, storage, and shared configuration. `Sparrow_V2.py` provides the vectorized simulator, while `cspace_cost_rays.py` and `global_planner.py` implement configuration-space perception and optional planning. Use `play_cspace.py` for interactive evaluation. ROS/Gazebo packages, messages, worlds, URDF/Xacro files, and C++ mapper code live under `catkin_ws/src/`. Root `config/` contains mapper settings. Treat `SAC/runs/`, `SAC/results/`, and `SAC/pytorch_models/` as generated artifacts.
+`SAC/` contains the active reinforcement-learning implementation. `train.py` is the CNN-SAC training entry point; `cnn_network.py`, `replay_buffer.py`, and `settings.py` define the agent, storage, and shared configuration. `Sparrow_V2.py` provides the vectorized simulator, while `cspace_cost_rays.py` and `global_planner.py` implement configuration-space perception and optional planning. Use `play_cspace.py` for interactive evaluation. Standalone testing, profiling, and sweep scripts live in `SAC/script/`. ROS/Gazebo packages, messages, worlds, and URDF/Xacro files live under `catkin_ws/src/`. Treat `SAC/runs/`, `SAC/results/`, and `SAC/pytorch_models/` as generated artifacts.
 
 ## Build, Test, and Development Commands
 
 Run Python commands from `SAC/` because modules use local imports:
 
 ```bash
-pip3 install -r requirements.txt
+# Build the project container with bash build.bash; Python dependencies are in dockerfile.
 cd catkin_ws && source /opt/ros/noetic/setup.bash && catkin_make
 cd ../SAC && python3 train.py
 python3 play_cspace.py --ModelName dense_sample_cspace_1 --dvc cuda
@@ -26,7 +26,7 @@ Use four-space indentation and PEP 8 conventions for new Python code. Prefer `sn
 
 ## Testing Guidelines
 
-There is no centralized pytest suite or coverage threshold. Run the relevant executable self-test after each change. For simulator changes, also run `python3 Sparrow_V2.py`; for ROS mapper changes, launch `roslaunch c_space_mapper test_costray.launch` after sourcing `catkin_ws/devel/setup.bash`. Record device, seed, and key settings when reporting training regressions.
+There is no centralized pytest suite or coverage threshold. Run the relevant executable self-test after each change. For simulator changes, also run `python3 Sparrow_V2.py`. Record device, seed, and key settings when reporting training regressions.
 
 ## Commit & Pull Request Guidelines
 

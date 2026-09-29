@@ -61,32 +61,35 @@ def map_continuous_action(action, allow_reverse=None):
 # 之前 nz/a 有两份拷贝(settings 的 RAY_V_LAYERS 与 env 的 cspace_cfg["nz"])，只改
 # 一处就会维度错位(改 RAY_V_LAYERS=30 而观测仍 10 层 → reshape/load 报错)。
 # 现在观测管线与网络形状都从这里派生，想调 θ 分辨率只改 CSPACE_NZ 一处。
-# 注意: cspace_cost_rays.DEFAULT_CFG 仍是 Gazebo/C++ 参考配置(0.44 m 车 / 5 m 量程，
+# 注意: cspace_cost_rays.DEFAULT_CFG 仍是旧版参考配置(0.44 m 车 / 5 m 量程，
 # a=0.698/nz=10)，仅供该模块 --bench / verify 使用；实际训练评测走下面的值。
 # ---------------------------------------------------------------------------
 CSPACE_G_MIN = 0.1                  # c-space 网格分辨率 (m)
 CSPACE_COST_RAY_MAX_RANGE = 3.0     # cost-ray 最大探测范围 (m)（= 观测局部窗口半径）
 CSPACE_COST_RAY_NUM_BEAMS = 36      # 水平波束数（0°–360°）
 CSPACE_COST_RAY_H_RES_DEGREES = 360.0 / CSPACE_COST_RAY_NUM_BEAMS  # 10 deg
+CSPACE_COST_RAY_NUM_INTERVALS = 3   # 连续径向区间数：首次命中距离、障碍宽度、空闲宽度……
 CSPACE_NZ = 30                      # 观测 θ 朝向层数（cost-ray 第三维, = nz_）
 CSPACE_A = 2 * math.pi / CSPACE_NZ  # θ 分辨率 (rad)，~0.209 = 12°；nz·a=2π -> nz 个
                                     # 朝向唯一、无重复拷贝（旧观测 a=0.698≈2π/9 配
                                     # nz=10 时，第 10 层是第 0 层的拷贝；见 PLANNER_A 注释）
 
 # CNN ray-grid dims (aliases kept — the network / reshape code reads these)
-RAY_CHANNELS = 2                                           # [entry proximity, collision width]
+RAY_CHANNELS = CSPACE_COST_RAY_NUM_INTERVALS             # 每个径向区间对应一个 CNN 通道
 RAY_H_BEAMS = CSPACE_COST_RAY_NUM_BEAMS                # = 36
 RAY_V_LAYERS = CSPACE_NZ                               # = 30
-RAY_GRID_FLAT_DIM = RAY_CHANNELS * RAY_H_BEAMS * RAY_V_LAYERS  # 2160
+RAY_GRID_FLAT_DIM = RAY_CHANNELS * RAY_H_BEAMS * RAY_V_LAYERS
 
-# Kinematic block appended to the CNN cost-ray state: [distance_to_goal (m),
-# heading_error (rad)].  故意不再等于 ROBOT_DIM —— 2D 激光 MLP 那条支线的 state
-# 仍然是 [.., linear_vel, angular_vel]，两者维度从此独立。
-# 这里原本还追加了上一帧的动作指令 (v_lin, v_ang) = _action_to_v(current_a)，
-# 已去掉：观测不再包含动作反馈。输入现为双通道区间射线，旧 checkpoint
-# 的第一层卷积仍是单通道，因此改前训练的模型不能加载，需要重新训练。
-KINEMATIC_DIM = 2
-CNN_STATE_DIM = RAY_GRID_FLAT_DIM + KINEMATIC_DIM      # 2162 (CNN state)
+# Kinematic block appended to the CNN cost-ray state:
+# [distance_to_goal (m), heading_error (rad), normalized_linear_velocity,
+#  normalized_angular_velocity].  The velocity terms are the simulator's
+# post-filter *actual* velocities, not the previous action command:
+# car_state[:, 3:5] / [v_linear_max, v_angular_max], clipped to [-1, 1].
+# This keeps the observation Markov under Sparrow's first-order actuator model.
+# The input is also a three-channel ray-segment grid, so checkpoints trained with
+# the old one-/two-channel rays or the old 2-D kinematic block are incompatible.
+KINEMATIC_DIM = 4
+CNN_STATE_DIM = RAY_GRID_FLAT_DIM + KINEMATIC_DIM      # CNN state
 
 # ---------------------------------------------------------------------------
 # Robot footprint (c-space dilation polygon, metres)
@@ -115,10 +118,13 @@ WARMUP_STEPS = 5e3    # collect this many steps (fill replay buffer) before trai
 # ---------------------------------------------------------------------------
 # SAC hyper-parameters (shared defaults; batch/buffer size are per-script)
 # ---------------------------------------------------------------------------
-DISCOUNT = 0.995       # gamma — discounted future reward
+DISCOUNT = 0.95       # gamma — discounted future reward
 TAU = 0.005           # soft target update rate
-LR = 1e-4             # actor & critic learning rate
-ALPHA_LR = 3e-4       # temperature (entropy) learning rate
+LR = 1e-4             # actor & critic learning rate (pre-debug baseline)
+ACTOR_LR = 5e-5       # keep separate-rate API aligned with the baseline
+CRITIC_LR = 5e-5      # keep separate-rate API aligned with the baseline
+ALPHA_LR = 3e-4       # temperature (entropy) learning rate (pre-debug baseline)
+SAC_INITIAL_ALPHA = 1.0  # original SAC temperature initialization
 EVAL_FREQ = 5e3       # steps between evaluations
 EVAL_EP = 3           # number of episodes per evaluation
 MAX_TIMESTEPS = 5e6   # total training steps
@@ -128,10 +134,11 @@ MAX_TIMESTEPS = 5e6   # total training steps
 # ---------------------------------------------------------------------------
 SAFETY_REWARD_WEIGHT = 0.0
 SPEED_REWARD_WEIGHT = 0.0
-SPARROW_DISTANCE_REWARD_WEIGHT = 2.0  # R_distance: normalized progress toward the target
-SPARROW_FORWARD_REWARD_WEIGHT = 1.5   # full-speed forward motion: +1.5 per step
+SPARROW_DISTANCE_REWARD_WEIGHT = 8.0  # tuned goal-progress weight
+SPARROW_FORWARD_REWARD_WEIGHT = 3.0   # tuned forward-motion reward
 SPARROW_REVERSE_PENALTY_WEIGHT = 1.5  # full-speed reverse motion: -1.5 per step
 SPARROW_ANGULAR_VEL_PENALTY = 0.1     # full angular command: -0.1 per step
+SPARROW_STEP_PENALTY = 3.0            # tuned constant per-step penalty
 
 # ---------------------------------------------------------------------------
 # Sparrow c-space environment (Sparrow_V2 / train.py)

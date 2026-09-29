@@ -10,8 +10,10 @@ Usage (inside the container, with a display / GPU):
     python3 play_cspace.py --ModelName SAC_sparrow_cspace --dvc cuda
     python3 play_cspace.py --ModelName SAC_sparrow_cspace --dvc cuda --global_plan
 
-The model consumes the (RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim c-space state
-(currently 2×36×30 + 2 = 2162 interval-ray grid + [dist, heading]), so it must have been
+The model consumes the
+(RAY_CHANNELS×RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim c-space state
+(by default 3×36×30 + 4 = 3244 ray-segment grid +
+[dist, heading, normalized actual v, normalized actual w]), so it must have been
 trained on `SparrowCspaceEnv` (e.g. `SAC_sparrow_cspace`).
 
 With `--global_plan`, clicking the map plans a global path in the c-space graph
@@ -43,7 +45,7 @@ from render_utils import (draw_hud, draw_cost_rays, draw_interval_rays,
 parser = argparse.ArgumentParser()
 
 # ---- Model / agent ----
-parser.add_argument('--ModelName', type=str, default='dense_sample_cspace_3',
+parser.add_argument('--ModelName', type=str, default='interval_cspace_1',
                     help='model basename in pytorch_models (e.g. SAC_sparrow_cspace)')
 parser.add_argument('--ModelDir', type=str, default=settings.MODEL_DIR,
                     help='directory holding *_actor.pth / *_critic.pth')
@@ -130,6 +132,9 @@ def main():
         ray_channels=settings.RAY_CHANNELS,
         cnn_feature_dim=64,
         lr=settings.LR,
+        actor_lr=settings.ACTOR_LR,
+        critic_lr=settings.CRITIC_LR,
+        initial_alpha=settings.SAC_INITIAL_ALPHA,
         device=opt.dvc,
     )
     network.load(opt.ModelName, opt.ModelDir)
@@ -148,7 +153,7 @@ def main():
             s, info = env.reset()
             ep_reward = 0.0
 
-        # unpack flat state -> (1,C,H,V) interval rays + (1,2) kinematic
+        # unpack flat state -> (1,C,H,V) interval rays + (1,4) kinematic
         rg = s[:, :settings.RAY_GRID_FLAT_DIM].reshape(
             1, settings.RAY_CHANNELS,
             settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)

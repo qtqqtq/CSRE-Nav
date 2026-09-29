@@ -71,12 +71,9 @@ Two changes from upstream's copy:
   the launch file sets to this package's `models/` plus
   `/usr/share/gazebo-11/models`.
 
-> **On upstream's `rvo_node` segfault.** `planner_bench/launch/sim.launch` and
-> its README record that `rvo_node` exits `-11`, which is why that package runs a
-> static arena instead. That does not reproduce here: `rvo_node` ran 60 s at
-> state `Rsl` with a live publisher on `/obstacles_velocity`, and the obstacles
-> moved 4.5–5.2 m in 20 s. The two observations are not reconciled — if you see
-> the crash, it is real and this note is the thing that is wrong.
+The root `evaluate/` scripts reuse this launch file with a copied
+`limo_complex.world`. They check that all 20 obstacles appear and move before
+scoring a planner.
 
 ### Loading the world directly with Gazebo Sim
 

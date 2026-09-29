@@ -1,0 +1,81 @@
+# NeuPAN planner profile for the thin rectangular "sparrow" footprint.
+#
+# The same robot as cnav_ros/config/cnav_sparrow.yaml: the Gazebo LIMO
+# interpreted with the 1.20 x 0.14 m footprint of SAC/settings.py
+# (ROBOT_FOOTPRINT_LENGTH / ROBOT_FOOTPRINT_WIDTH), i.e. the body the CNN-SAC
+# c-space policy is trained for.  Use it to run NeuPAN on that same robot.
+#
+# DUNE encodes the robot's convex hull, so the `robot` section below and the
+# checkpoint named in the launch file must always describe the same polygon.
+# This one pairs with pretrain_sparrow_thin/model_5000.pth, trained from
+# NeuPAN/example/dune_train/dune_train_sparrow.yaml (`name: sparrow_thin`).
+#
+# Use with: launch/neupan_gazebo_sparrow.launch
+
+# mpc
+receding: 5
+step_time: 0.1
+ref_speed: 0.5
+device: 'cpu'
+time_print: False
+collision_threshold: 0.01
+
+# robot
+robot:
+  kinematics: 'diff'
+  length: 1.2             # m, long axis, = ROBOT_FOOTPRINT_LENGTH
+  width: 0.14             # m, lateral,   = ROBOT_FOOTPRINT_WIDTH
+  max_speed: [0.5, 2.0]   # [m/s, rad/s] = Sparrow_V2 v_linear_max / v_angular_max
+  max_acce: [1.0, 4.0]    # [m/s^2, rad/s^2]
+
+# initial path
+ipath:
+  interval: 0.09
+  waypoints: [[5, 0, 0]]
+  curve_style: 'line'   # 'dubins' or reeds or line
+  min_radius: 0.0
+  loop: True           # stop at the goal, as the c-space policy does
+  arrive_threshold: 0.3 # m, = Sparrow_V2 target_area (30 cm)
+  close_threshold: 0.1
+  arrive_index_threshold: 1
+
+# proximal alternating minimization network
+pan:
+  iter_num: 2
+  dune_max_num: 100
+  nrmp_max_num: 10
+  dune_checkpoint: None   # the launch file supplies it
+  iter_threshold: 0.1
+
+# adjust parameters
+#
+# These come from a measured sweep, not from the library defaults.  In
+# neupan/robot/robot.py:142 the path-following cost is
+#
+#     C0 = sum_squares(q_s * indep_s - gamma_a) + sum_squares(p_u * indep_u - gamma_b)
+#
+# so q_s weights the STATE residual and p_u the CONTROL residual against PAN's
+# proximal targets, while eta is the slack gain in C1 = -eta * sum(indep_dis)
+# that pays the QP to hold its safety distance near d_max.
+#
+# eta is the decisive one, and 10 is badly wrong for a 1.2 m body.  At eta 10 this
+# robot reaches only obstacles needing ~0.1 m of swerve and stops short of
+# anything more; at eta 1 it clears every test scenario.  Measured, same q_s/p_u:
+#
+#     eta 10, q_s 0.3 -> collides in 5 of 12 scenarios
+#     eta  1, q_s 0.3 -> passes all 12 (the wall case correctly stopping)
+#
+# q_s 0.3 / p_u 2.5 are neupan_planner_limo.yaml's values and they do transfer;
+# p_u above ~5 changes nothing (5/8/10/20 give identical results), and d_max is
+# nearly inert once eta is right (0.05..0.15 all behave the same), which is why
+# d_min/d_max sit near the limo's rather than the library defaults.
+#
+# Caveat, measured under the Gazebo lidar's own 1 cm noise: the hardest case (an
+# obstacle dead ahead on the goal line) passes with only ~1 cm of clearance, so
+# treat it as marginal rather than reliable.  See README_sparrow.md.
+adjust:
+  q_s: 0.3
+  p_u: 2.5
+  eta: 1.0
+  d_max: 0.08
+  d_min: 0.01

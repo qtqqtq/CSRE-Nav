@@ -6,18 +6,17 @@ cnav_core -- ROS 1 wrapper for the CNN-SAC c-space (NavRL) navigation policy.
 The policy is the cost-ray CNN actor trained on `Sparrow_V2.SparrowCspaceEnv`.
 Its observation is
 
-    state = flatten( preprocess(cost_rays) ) + [distance, heading]
-              |__ num_beams x nz cost rays __|  |_____ 2 _____|
+    state = flatten(normalize(ray_segments))
+            + [distance, heading, normalized_actual_v, normalized_actual_w]
 
 where the cost rays are built from the robot's line-of-sight lidar hits, exactly
 as `SparrowCspaceEnv._build_occ_grid()` does.  This node rebuilds that observation
 from live ROS sensor data using the same pure-numpy/torch helpers in
-`SAC/cspace_cost_rays.py`, so it needs neither Gazebo nor the C++ c_space_mapper.
+`SAC/cspace_cost_rays.py`, using live laser scans and odometry.
 
-The kinematic block is `[distance (m), heading_error (rad)]`.  It previously also
-carried the previous action command (v_lin, v_ang); that feedback was removed from
-the training env, so checkpoints trained before the change (feat+4 in `layer_1`)
-cannot load here and must be retrained -- see `_load_actor`.
+The kinematic block contains goal-relative geometry and normalized velocity from
+odometry.  These are measured velocities, not the previous actor command, matching
+the post-filter `car_state[:, 3:5]` values used during Sparrow training.
 
 THREE things differ between the checkpoint families in `SAC/pytorch_models/`, and
 each is a knob here:
@@ -33,16 +32,14 @@ each is a knob here:
   3. `ray_frame` + `preprocess` + velocity scale -- the Sparrow-trained models read
      a robot-centric grid whose 2nd axis runs to the robot's RIGHT
      (`_build_occ_grid` uses `rel_y = dx*sin(t) + dy*cos(t)`, the mirror of the
-     standard ROS body frame) with a log-encoded ray magnitude and a 0.5 m/s /
+     standard ROS body frame) with configurable normalized distance channels and a 0.5 m/s /
      2 rad/s action scale; the older Gazebo models read ROS-frame rays from the C++
      mapper with a linear `max_range - d` encoding and the actor output published
      to /cmd_vel unscaled.
 
-Config profiles shipped:
-
-    dense_sample_cspace_*    -> config/cnav_sparrow.yaml        (36x30)
-    SAC_sparrow_cspace_*     -> config/cnav_legacy_sparrow.yaml (36x10)
-    SAC_cspace_*             -> config/cnav_legacy_gazebo.yaml  (36x10, see caveats)
+The current deployment profile is `config/cnav_sparrow.yaml` for the
+one-channel, 36x30 first-entry model. Legacy profiles are retained
+as geometry references but are intentionally rejected by this build.
 
 Developed for the DRL-robot-navigation workspace.
 """
@@ -207,9 +204,9 @@ def wrap_to_pi(angle):
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
-# Size of the kinematic block appended to the cost rays: [distance, heading].
-# Kept in sync with SAC/settings.py KINEMATIC_DIM.
-KINEMATIC_DIM = 2
+# Default observation layout for the current cnav_sparrow.yaml profile.
+RAY_CHANNELS = 1
+KINEMATIC_DIM = 4
 
 
 def _kin_dim_of(state_dict, feature_dim, name=None):
@@ -217,8 +214,10 @@ def _kin_dim_of(state_dict, feature_dim, name=None):
 
     The block is concatenated with the CNN features and goes into `layer_1`, so
     that layer's input width is the checkpoint's only remaining trace of it.
-    Checkpoints trained before the previous-action feedback was removed carried
-    `[dist, heading, v_lin, v_ang]` and can no longer be loaded.
+    The current four values are `[distance, heading, normalized_actual_v,
+    normalized_actual_w]`.  A matching width alone does not make older
+    previous-command checkpoints semantically compatible; their one-channel
+    convolution is rejected separately by `_ray_channels_of`.
 
     Returns the width, or raises ValueError with a readable message.  Shared by
     the node and check_models.py so the two cannot disagree about the layout.
@@ -227,12 +226,25 @@ def _kin_dim_of(state_dict, feature_dim, name=None):
     if kin_dim != KINEMATIC_DIM:
         raise ValueError(
             "%swas trained with a %d-dim kinematic block (layer_1 expects "
-            "feature_dim+%d), but this build uses %d ([distance, heading]). "
-            "Checkpoints predating the removal of the previous-action feedback "
-            "carried [dist, heading, v_lin, v_ang] and must be retrained."
+            "feature_dim+%d), but this build uses %d ([distance, heading, "
+            "normalized_actual_v, normalized_actual_w]). Retrain the model "
+            "with the current observation layout."
             % ("checkpoint '%s' " % name if name else "", kin_dim, kin_dim,
                KINEMATIC_DIM))
     return kin_dim
+
+
+def _ray_channels_of(state_dict, expected_channels, name=None):
+    """Validate the configured ray channel count against the first conv."""
+    ray_channels = state_dict["cnn.conv1.weight"].shape[1]
+    if ray_channels != expected_channels:
+        raise ValueError(
+            "%swas trained with %d ray channel(s), but this build uses %d "
+            "from the configured interval count. Select the matching model "
+            "and cost_ray_num_intervals setting."
+            % ("checkpoint '%s' " % name if name else "", ray_channels,
+               expected_channels))
+    return ray_channels
 
 
 class CnavCore(object):
@@ -242,9 +254,11 @@ class CnavCore(object):
         rospy.init_node("cnav_node", anonymous=True)
 
         # ---- model ------------------------------------------------------
-        self.model_name = rospy.get_param("~model_name", "dense_sample_cspace_3")
+        self.model_name = rospy.get_param(
+            "~model_name", "interval_1_2000000steps")
         self.sac_dir = rospy.get_param("~sac_dir", "/DRL-robot-navigation/SAC")
-        self.model_dir = rospy.get_param("~model_dir", None)
+        self.model_dir = rospy.get_param(
+            "~model_dir", "pytorch_models/interval_sweep_2m")
         self.device = torch.device(rospy.get_param("~device", "cuda"))
         self.stochastic = bool(rospy.get_param("~stochastic", False))
 
@@ -281,6 +295,10 @@ class CnavCore(object):
         self.max_range = float(rospy.get_param("~cost_ray_max_range", 3.0))
         self.num_beams = int(rospy.get_param("~cost_ray_num_beams", 36))
         self.h_res_deg = float(rospy.get_param("~cost_ray_h_res_degrees", 10.0))
+        self.num_intervals = int(rospy.get_param(
+            "~cost_ray_num_intervals", RAY_CHANNELS))
+        if self.num_intervals < 1:
+            raise ValueError("~cost_ray_num_intervals must be >= 1")
         self.footprint = [[float(x), float(y)] for x, y in rospy.get_param(
             "~footprint", [[0.6, 0.07], [0.6, -0.07], [-0.6, -0.07], [-0.6, 0.07]])]
 
@@ -293,12 +311,11 @@ class CnavCore(object):
             raise ValueError("~ray_frame must be 'env' or 'ros', got %r" % self.ray_frame)
         self.mirror_y = (self.ray_frame == "env")
 
-        # `log`      : p = ln(max_range / clamp(d, 0.1, max_range))   (Sparrow)
-        # `subtract` : p = max_range - max(d, 0.1)                    (old Gazebo)
-        self.preprocess = rospy.get_param("~preprocess", "log")
-        if self.preprocess not in ("log", "subtract"):
-            raise ValueError("~preprocess must be 'log' or 'subtract', got %r"
-                             % self.preprocess)
+        # `interval`: metric radial segments, each divided by max_range.
+        self.preprocess = rospy.get_param("~preprocess", "interval")
+        if self.preprocess != "interval":
+            raise ValueError("~preprocess must be 'interval' for the current "
+                             "observation, got %r" % self.preprocess)
 
         # ---- action scaling ---------------------------------------------
         # Sparrow: v_phys = continuous_scale * a with (50 cm/s, 2 rad/s).  The
@@ -307,6 +324,9 @@ class CnavCore(object):
         self.allow_reverse = bool(rospy.get_param("~allow_reverse", True))
         self.v_linear_max = float(rospy.get_param("~v_linear_max", 0.5))
         self.v_angular_max = float(rospy.get_param("~v_angular_max", 2.0))
+        if self.v_linear_max <= 0.0 or self.v_angular_max <= 0.0:
+            raise ValueError("velocity limits must be positive, got (%.3f, %.3f)"
+                             % (self.v_linear_max, self.v_angular_max))
 
         # Match Sparrow's first-order actuator model:
         #   velocity = K * previous_velocity + (1 - K) * target_velocity
@@ -333,8 +353,10 @@ class CnavCore(object):
 
         # ---- state ------------------------------------------------------
         self.robot_state = None        # np.array([x, y, yaw]) in `map_frame`
+        self.robot_velocity = np.zeros(2, dtype=np.float64)  # [m/s, rad/s]
         self.goal = None               # np.array([x, y])
         self.occ_grid = None
+        self.known_free_grid = None
         self.arrived = False
 
         self.vel_pub = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
@@ -355,7 +377,7 @@ class CnavCore(object):
                       "-> ray_grid=%dx%d, occ_grid=%dx%d, state_dim=%d",
                       self.nz, self.a, self.g_min, self.max_range, self.num_beams,
                       self.num_beams, self.nz, self.G, self.G,
-                      self.num_beams * self.nz + KINEMATIC_DIM)
+                      self.num_intervals * self.num_beams * self.nz + KINEMATIC_DIM)
         rospy.loginfo("cnav: ray_frame=%s preprocess=%s scale=(%.2f m/s, %.2f rad/s) "
                       "filter_k=(%.2f, %.2f) rate=%.1f Hz",
                       self.ray_frame, self.preprocess,
@@ -370,41 +392,44 @@ class CnavCore(object):
         if self.sac_dir not in sys.path:
             sys.path.insert(0, self.sac_dir)
         try:
-            from cspace_cost_rays import (build_cspace, cost_rays_3d,
+            from cspace_cost_rays import (build_cspace,
+                                          cost_ray_intervals_3d,
                                           make_footprint_masks,
-                                          preprocess_cost_rays)
+                                          preprocess_cost_ray_intervals)
         except ImportError as exc:
             raise ImportError(
                 "cannot import cspace_cost_rays from sac_dir='%s' (%s). Set the "
                 "~sac_dir parameter to the DRL-robot-navigation/SAC directory."
                 % (self.sac_dir, exc))
         self._build_cspace = build_cspace
-        self._cost_rays_3d = cost_rays_3d
+        self._cost_ray_intervals_3d = cost_ray_intervals_3d
         self._make_masks = make_footprint_masks
-        self._preprocess = preprocess_cost_rays
+        self._preprocess_intervals = preprocess_cost_ray_intervals
 
     def _load_actor(self):
         """Load <model_name>_actor.pth, building a network to match its shapes."""
         if self.model_dir is None:
-            self.model_dir = os.path.join(self.sac_dir, "pytorch_models")
+            self.model_dir = os.path.join(
+                self.sac_dir, "pytorch_models", "interval_sweep_2m")
+        elif not os.path.isabs(self.model_dir):
+            self.model_dir = os.path.join(self.sac_dir, self.model_dir)
         path = os.path.join(self.model_dir, "%s_actor.pth" % self.model_name)
         if not os.path.exists(path):
             raise IOError("actor checkpoint not found: %s" % path)
 
-        state = torch.load(path, map_location="cpu")
+        state = torch.load(path, map_location="cpu", weights_only=True)
         self.backbone, self.action_head, self.feature_dim = _arch_of(state)
 
         backbone_cls = _BackboneNew if self.backbone == "new" else _BackboneOld
         actor_cls = (_ActorStochastic if self.action_head == "stochastic"
                      else _ActorDeterministic)
         actor = actor_cls(
-            backbone_cls(in_channels=1, h_beams=self.num_beams, v_layers=self.nz,
+            backbone_cls(in_channels=self.num_intervals, h_beams=self.num_beams,
+                         v_layers=self.nz,
                          feature_dim=self.feature_dim),
             self.feature_dim, KINEMATIC_DIM, 2)
 
-        # Same idea for the kinematic block: a checkpoint from before the
-        # previous-action feedback was removed expects feature_dim + 4, and would
-        # otherwise fail with an opaque shape mismatch on layer_1.
+        _ray_channels_of(state, self.num_intervals, self.model_name)
         _kin_dim_of(state, self.feature_dim, self.model_name)
 
         # The ray grid comes from the config; the checkpoint pins only the fc
@@ -444,6 +469,10 @@ class CnavCore(object):
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                          1.0 - 2.0 * (q.z * q.z + q.y * q.y))
         self.robot_state = np.array([p.x, p.y, yaw], dtype=np.float64)
+        self.robot_velocity[:] = (
+            msg.twist.twist.linear.x,
+            msg.twist.twist.angular.z,
+        )
 
     def goal_callback(self, msg):
         self.goal = np.array([msg.pose.position.x, msg.pose.position.y],
@@ -454,11 +483,11 @@ class CnavCore(object):
             self._publish_goal_marker()
 
     def scan_callback(self, msg):
-        """Rasterise line-of-sight lidar hits into the robot-centric occ grid.
+        """Build occupied and observed-free robot-centric lidar grids.
 
-        Mirrors `SparrowCspaceEnv._build_occ_grid`: only a ray's *endpoint* cell is
-        marked occupied (there is no ray-traced clearing), and a ray that reaches
-        the horizon hit nothing and is dropped.
+        Cells crossed by each usable beam are known free up to its return; a
+        finite obstacle return marks the endpoint occupied. Cells beyond returns
+        and outside the scan field of view remain unknown.
         """
         if self.robot_state is None:
             return
@@ -470,12 +499,15 @@ class CnavCore(object):
 
         lo = max(msg.range_min, self.scan_min_range)
         hi = min(msg.range_max, self.scan_max_range)
-        hit = np.isfinite(ranges) & (ranges > lo) & (ranges < hi)
-        if not np.any(hit):
+        usable = (~np.isnan(ranges)) & (ranges > lo)
+        if not np.any(usable):
             self.occ_grid = None
+            self.known_free_grid = None
             return
 
-        r, th = ranges[hit], angles[hit]
+        r_all, th_all = np.minimum(ranges[usable], hi), angles[usable]
+        hit = np.isfinite(r_all) & (r_all < hi)
+        r, th = r_all[hit], th_all[hit]
 
         # lidar -> base_link (this is what carries the robot's heading)
         try:
@@ -504,22 +536,42 @@ class CnavCore(object):
         j = -rel_y if self.mirror_y else rel_y
         cj = R + np.round(j / g).astype(np.int64)
 
-        inb = (ci >= 0) & (ci < G) & (cj >= 0) & (cj < G)
-        if not np.any(inb):
-            self.occ_grid = None
-            return
-
         occ = np.zeros((G, G), dtype=bool)
+        inb = (ci >= 0) & (ci < G) & (cj >= 0) & (cj < G)
         occ[ci[inb], cj[inb]] = True
+
+        known_free = np.zeros((G, G), dtype=bool)
+        th_valid = th_all + lyaw
+        # ROS body frame is converted into the selected c-space frame. The
+        # learned env frame mirrors y; the ROS frame keeps y pointing left.
+        dir_x = np.cos(th_valid)
+        dir_y = np.sin(th_valid)
+        if self.mirror_y:
+            dir_y = -dir_y
+        radial_step = self.g_min / 2.0
+        radial = np.arange(0.0, hi, radial_step)
+        free_limit = r_all.copy()
+        free_limit[np.isfinite(r_all) & (r_all < hi)] = np.maximum(
+            0.0, free_limit[np.isfinite(r_all) & (r_all < hi)] - radial_step
+        )
+        free_mask = radial[None, :] < free_limit[:, None]
+        free_x = trans[0] + dir_x[:, None] * radial[None, :]
+        free_y = trans[1] + dir_y[:, None] * radial[None, :]
+        free_i = R + np.round(free_x / g).astype(np.int64)
+        free_j = R + np.round(free_y / g).astype(np.int64)
+        free_inb = free_mask & (free_i >= 0) & (free_i < G) \
+            & (free_j >= 0) & (free_j < G)
+        known_free[free_i[free_inb], free_j[free_inb]] = True
         self.occ_grid = occ
+        self.known_free_grid = known_free
 
     # ------------------------------------------------------------- inference
     def _build_perception(self):
-        """Scan -> occupancy -> c-space -> cost rays -> processed grid.
+        """Scan -> occupancy -> c-space -> ray segments -> processed grid.
 
-        Returns `(rays, cr3)`: the raw `(1, B, nz)` cost-ray distances in
-        metres, and the `(1, B, nz)` *processed* grid the CNN actually consumes
-        (kept un-flattened for the debug image).
+        Returns `(entry_rays, cr4)`: raw first-collision distances `(1,B,nz)`
+        in metres and the processed `(1,C,B,nz)` ray grid consumed by the
+        CNN.  The raw entry channel is retained for the RViz polar profile.
 
         Deliberately goal-free, which is what lets `run()` publish the debug
         topics before any goal has been set.  A viewer opened before the first
@@ -527,35 +579,36 @@ class CnavCore(object):
         from startup, so it looks like a dead publisher rather than a policy
         that is simply not driving anywhere yet.
         """
-        if self.occ_grid is None:
-            # No usable return: the world is free within the horizon, which is
-            # exactly what an empty occupancy grid encodes.
+        if self.occ_grid is None or self.known_free_grid is None:
+            # Without a scan, every cell is unknown and every pose is invalid.
             occ = torch.zeros((1, self.G, self.G), dtype=torch.bool, device=self.device)
+            known_free = torch.zeros_like(occ)
         else:
             occ = torch.as_tensor(self.occ_grid[None, ...], dtype=torch.bool,
                                   device=self.device)
+            known_free = torch.as_tensor(
+                self.known_free_grid[None, ...], dtype=torch.bool,
+                device=self.device)
 
-        cspace = self._build_cspace(occ, self.masks)
-        rays = self._cost_rays_3d(
+        cspace = self._build_cspace(occ, self.masks, known_free)
+        intervals = self._cost_ray_intervals_3d(
             cspace, self.robot_cell,
             num_beams=self.num_beams, h_res_deg=self.h_res_deg,
-            max_range=self.max_range, g_min=self.g_min)          # (1, B, nz) m
+            max_range=self.max_range, g_min=self.g_min,
+            num_intervals=self.num_intervals)                # (1,C,B,nz) m
+        cr4 = self._preprocess_intervals(
+            intervals, max_range=self.max_range,
+            epsilon=self.g_min / 2.0).float()                  # (1,C,B,nz)
+        return intervals[:, 0], cr4
 
-        if self.preprocess == "log":
-            cr = self._preprocess(rays, max_range=self.max_range)
-        else:
-            cr = (self.max_range - rays.clamp(min=0.1)).unsqueeze(1)
-        cr3 = cr.reshape(1, self.num_beams, self.nz).float()   # for the debug image
-        return rays, cr3
-
-    def _build_state(self, rays, cr3):
-        """Assemble the (1, B*nz + KINEMATIC_DIM) observation.
+    def _build_state(self, rays, cr4):
+        """Assemble the (1, C*B*nz + KINEMATIC_DIM) observation.
 
         Takes the perception half as an argument rather than recomputing it, so
         that `run()` can build it once and still publish it on the ticks where
         no goal exists.  Returns `(state, distance)`.
         """
-        cr = cr3.reshape(1, -1)
+        cr = cr4.reshape(1, -1)
 
         dx = self.goal[0] - self.robot_state[0]
         dy = self.goal[1] - self.robot_state[1]
@@ -564,7 +617,12 @@ class CnavCore(object):
         # atan2(robot - goal) + pi/2 - yaw formulation.
         heading = wrap_to_pi(math.atan2(dy, dx) - self.robot_state[2])
 
-        kin = torch.tensor([[distance, heading]],
+        normalized_velocity = np.clip(
+            self.robot_velocity
+            / np.array([self.v_linear_max, self.v_angular_max]),
+            -1.0, 1.0)
+        kin = torch.tensor([[distance, heading,
+                             normalized_velocity[0], normalized_velocity[1]]],
                            dtype=torch.float32, device=self.device)
         return torch.cat([cr, kin], dim=1), distance
 
@@ -599,7 +657,7 @@ class CnavCore(object):
                 rate.sleep()
                 continue
 
-            rays, cr3 = self._build_perception()
+            rays, cr4 = self._build_perception()
 
             # Published before the goal check on purpose, in both directions:
             # a stopped robot is exactly when "what does the policy perceive
@@ -608,7 +666,7 @@ class CnavCore(object):
             # silent until the first goal and again once it was reached.
             if self.publish_debug:
                 self._publish_cost_ray_path(rays)
-                self._publish_cost_ray_image(cr3)
+                self._publish_cost_ray_image(cr4)
 
             if self.goal is None:
                 rospy.logwarn_throttle(
@@ -617,12 +675,13 @@ class CnavCore(object):
                 rate.sleep()
                 continue
 
-            state, distance = self._build_state(rays, cr3)
+            state, distance = self._build_state(rays, cr4)
 
             with torch.no_grad():
-                rg = state[:, :self.num_beams * self.nz].reshape(
-                    1, 1, self.num_beams, self.nz)
-                kin = state[:, self.num_beams * self.nz:]
+                ray_dim = self.num_intervals * self.num_beams * self.nz
+                rg = state[:, :ray_dim].reshape(
+                    1, self.num_intervals, self.num_beams, self.nz)
+                kin = state[:, ray_dim:]
                 if self.stochastic:
                     action = self.actor.sample(rg, kin)
                 else:
@@ -681,28 +740,21 @@ class CnavCore(object):
             path.poses.append(ps)
         self.plan_pub.publish(path)
 
-    def _publish_cost_ray_image(self, cr3):
-        """Render the processed (B, nz) grid the actor consumes as an rgb8 image.
+    def _publish_cost_ray_image(self, cr4):
+        """Render normalized first-entry distance as an rgb8 debug image.
 
-        This is the heatmap `SAC/render_utils.py:draw_cost_rays` paints for
-        play_cspace.py, republished for rviz: columns are the 36 beams (10 deg
-        apart), rows are the nz heading layers, and the colour is the same
-        log-encoded value the actor sees -- v = clamp(proc/max_range, 0, 1) ->
-        (255v, 255(1-v), 40), so free space is green and a near obstacle is red.
-        The encoding is the point: log compresses the far field and magnifies
-        near range (|dp/dd| = 1/d), so what goes red here is what the policy
-        actually reacts to.  This is NOT the mono8/linear/unwrapped image
-        c_space_mapper's cost_ray_image publishes -- same idea, different
-        mapping, deliberately kept separate.
+        The actor consumes the configured ray-segment channels. This RViz
+        image displays channel 0 only: columns are beams, rows are theta layers,
+        red means a nearby entry and green means clear/far.
         """
         cell = self.cost_ray_image_cell
-        proc = cr3[0].detach().cpu().numpy()                    # (B, nz)
-        v = np.clip(proc / self.max_range, 0.0, 1.0)            # (B, nz)
+        proc = cr4[0, 0].detach().cpu().numpy()                 # (B, nz)
+        v = np.clip(proc, 0.0, 1.0)                             # (B, nz)
         # Transposing to (nz, B, 3) puts the beam on the image x axis and the
         # heading layer on y, the orientation play_cspace draws it in.
         rgb = np.empty((self.nz, self.num_beams, 3), dtype=np.uint8)
-        rgb[:, :, 0] = (255.0 * v.T).astype(np.uint8)
-        rgb[:, :, 1] = (255.0 * (1.0 - v.T)).astype(np.uint8)
+        rgb[:, :, 0] = (255.0 * (1.0 - v.T)).astype(np.uint8)
+        rgb[:, :, 1] = (255.0 * v.T).astype(np.uint8)
         rgb[:, :, 2] = 40
         # Nearest-neighbour upscale; no PIL or cv_bridge needed for that.
         big = np.repeat(np.repeat(rgb, cell, axis=0), cell, axis=1)

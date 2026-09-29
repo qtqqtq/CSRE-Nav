@@ -6,7 +6,7 @@
     ROS 1 wrapper for the CNN-SAC c-space (cost-ray) navigation policy trained in
     DRL-robot-navigation/SAC.  Rebuilds the training observation (36 x nz cost rays
     + distance/heading) from live LaserScan + Odometry and publishes velocity
-    commands, without needing Gazebo or the C++ c_space_mapper node.
+    commands.
   </description>
 
   <maintainer email="qtqqtq@todo.todo">qtqqtq</maintainer>

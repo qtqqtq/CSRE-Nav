@@ -1,0 +1,49 @@
+<launch>
+    <!--
+      NeuPAN on the thin rectangular "sparrow" footprint: the same Gazebo LIMO
+      as neupan_gazebo_limo.launch, planned as the 1.20 x 0.14 m body that the
+      CNN-SAC c-space policy (cnav_ros/config/cnav_sparrow.yaml) is trained for.
+
+      scan_range starts at 0.1, not 0.0: the laser clips the robot's own body at
+      0.05-0.09 m on the beams at the ends of its FOV (measured in cnav_ros/
+      config/cnav_sparrow.yaml).  Those points sit inside or within a centimetre
+      of the 1.2 x 0.14 m hull, so DUNE scores them as a near-zero or negative
+      distance and the planner declares a collision and stops on the spot at
+      startup.  0.1 clears the whole self-return band; 0.09 would not, since
+      the node keeps `distance >= scan_range[0]` and a surviving 0.09 m return
+      still lands ~8 mm outside the hull, under collision_threshold.  Filtering
+      by range (rather than by beam index) also makes this independent of where
+      the lidar is mounted.
+    -->
+
+    <arg name="config_file" default='$(find neupan_ros)/example/gazebo_limo/config/neupan_planner_sparrow.yaml'/>
+    <arg name="map_frame" default='odom'/>
+    <arg name="base_frame" default='base_link'/>
+    <arg name="lidar_frame" default='laser_link'/>
+    <arg name="scan_range" default='0.1 5.0'/>
+    <arg name="scan_angle_range" default='-3.14 3.14'/>
+    <arg name="marker_size" default='0.05'/>
+    <arg name="marker_z" default='0.3'/>
+    <arg name="scan_downsample" default='6'/>
+    <arg name="dune_checkpoint" default='$(find neupan_ros)/example/gazebo_limo/pretrain_sparrow_thin/model_5000.pth'/>
+    <arg name="refresh_initial_path" default='false'/>
+
+    <node name='neupan_control' pkg="neupan_ros" type="neupan_node.py" output="screen">
+        <param name="config_file" value="$(arg config_file)"/>
+        <param name="map_frame" value="$(arg map_frame)"/>
+        <param name="base_frame" value="$(arg base_frame)"/>
+        <param name="lidar_frame" value="$(arg lidar_frame)"/>
+        <param name="scan_range" value="$(arg scan_range)"/>
+        <param name="scan_angle_range" value="$(arg scan_angle_range)"/>
+        <param name="marker_size" value="$(arg marker_size)"/>
+        <param name="scan_downsample" value="$(arg scan_downsample)"/>
+        <param name="dune_checkpoint" value="$(arg dune_checkpoint)"/>
+        <param name="refresh_initial_path" value="$(arg refresh_initial_path)"/>
+        <remap from="/scan" to="/limo/scan"/>
+        <remap from="/neupan_cmd_vel" to="/cmd_vel"/>
+        <remap from="/neupan_goal" to="/move_base_simple/goal"/>
+    </node>
+
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find neupan_ros)/example/gazebo_limo/rviz/limo_gazebo.rviz" />
+
+</launch>

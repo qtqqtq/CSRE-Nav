@@ -7,7 +7,7 @@
     Limo through the vendored copy under xacro/limo/ and meshes/limo/, and
     carries the 20-obstacle moving-obstacle arena under worlds/ so the scenario
     does not depend on another checkout staying put.  The Pioneer 3-DX files
-    are still here and still used by SAC/laser_env.py.
+    remain available for the older Pioneer scenario.
   </description>
 
   <!-- One maintainer tag required, multiple allowed, one person per tag -->

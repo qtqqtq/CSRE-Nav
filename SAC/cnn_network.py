@@ -10,6 +10,8 @@ Mirrors NavRL's LiDAR CNN architecture:
 Reference: NavRL (Xu et al., IEEE RA-L 2025)
 """
 
+import json
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -246,8 +248,9 @@ class CNNSAC(object):
     stochastic; train() runs the standard soft Bellman backup.
 
     State representation:
-      ray_grid  (2, H, V)  — [entry proximity, collision width]
-      kinematic (2,)        — [distance_to_goal, heading_error]
+      ray_grid  (C, H, V)  — [first entry, occupied width, free width, ...]
+      kinematic (4,)        — [distance_to_goal, heading_error,
+                                  normalized_actual_v, normalized_actual_w]
 
     In the replay buffer these are stored as a flat concatenated array.
 
@@ -259,8 +262,10 @@ class CNNSAC(object):
                  h_beams=36, v_layers=4, ray_channels=RAY_CHANNELS,
                  cnn_feature_dim=64,
                  lr=1e-4, alpha_lr=3e-4, device='cpu',
+                 actor_lr=None, critic_lr=None,
+                 initial_alpha=1.0,
                  safety_reward_weight=1.0, speed_reward_weight=1.0,
-                 tensorboard_min_iters=None):
+                 tensorboard_min_iters=None, tensorboard_hparams=None):
         self.device = device
         self.max_action = max_action
         self.h_beams = h_beams
@@ -277,7 +282,15 @@ class CNNSAC(object):
             h_beams=h_beams, v_layers=v_layers,
             cnn_feature_dim=cnn_feature_dim, ray_channels=ray_channels,
         ).to(device)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        actor_lr = lr if actor_lr is None else actor_lr
+        critic_lr = lr if critic_lr is None else critic_lr
+        self.actor_lr = actor_lr
+        self.critic_lr = critic_lr
+        self.alpha_lr = alpha_lr
+        self.initial_alpha = initial_alpha
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(), lr=actor_lr
+        )
 
         # Critic (reuses CNNCritic as-is)
         self.critic = CNNCritic(
@@ -291,11 +304,17 @@ class CNNSAC(object):
             cnn_feature_dim=cnn_feature_dim, ray_channels=ray_channels,
         ).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(), lr=critic_lr
+        )
 
         # Auto-tune temperature alpha
         self.target_entropy = -action_dim
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        if initial_alpha <= 0:
+            raise ValueError("initial_alpha must be positive")
+        self.log_alpha = torch.tensor(
+            [math.log(initial_alpha)], requires_grad=True, device=device
+        )
         self.alpha = self.log_alpha.exp()
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
 
@@ -303,6 +322,23 @@ class CNNSAC(object):
         # tensorboard_min_iters times (then _ensure_writer creates it lazily),
         # so inference-only CNNSAC instances never write a runs/ directory.
         self.writer = None
+        # Training scripts can provide the complete experiment configuration.
+        # It is emitted once when the lazy writer is created, so inference-only
+        # agents do not create TensorBoard artifacts.
+        self.tensorboard_hparams = dict(tensorboard_hparams or {})
+        self.tensorboard_hparams.update({
+            "actor_lr": self.actor_lr,
+            "critic_lr": self.critic_lr,
+            "alpha_lr": self.alpha_lr,
+            "initial_alpha": self.initial_alpha,
+            "target_entropy": self.target_entropy,
+            "ray_channels": self.ray_channels,
+            "h_beams": self.h_beams,
+            "v_layers": self.v_layers,
+            "kinematic_dim": self.kinematic_dim,
+            "action_dim": action_dim,
+            "cnn_feature_dim": cnn_feature_dim,
+        })
         self.tensorboard_min_iters = (TENSORBOARD_MIN_ITERS
                                       if tensorboard_min_iters is None
                                       else tensorboard_min_iters)
@@ -318,6 +354,14 @@ class CNNSAC(object):
         """
         if self.writer is None and self.iter_count >= self.tensorboard_min_iters:
             self.writer = SummaryWriter()
+            self.writer.add_text(
+                "Hyperparameters",
+                "```json\n%s\n```" % json.dumps(
+                    self.tensorboard_hparams, indent=2, sort_keys=True,
+                    default=str,
+                ),
+                0,
+            )
 
     def get_action(self, ray_grid, kinematic, deterministic=False):
         """
@@ -431,7 +475,10 @@ class CNNSAC(object):
             self.actor_optimizer.step()
 
             # ---- Alpha update (auto-tune temperature) ----
-            alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+            alpha_loss = -(
+                self.log_alpha
+                * (log_prob + self.target_entropy).detach()
+            ).mean()
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
@@ -495,7 +542,7 @@ class CNNSAC(object):
         self.writer.add_scalar("Eval/goal_reached", avg_goal_rate, epoch)
 
     def log_cost_rays(self, step, cost_rays_proc, cost_rays_raw=None):
-        """Visualize the two-channel interval-ray input in TensorBoard.
+        """Visualize the configurable ray-segment input in TensorBoard.
 
         Avoids PIL.Image compatibility issues in older containers.
         No-op before the writer exists (training past the min-iter threshold).
@@ -519,33 +566,37 @@ class CNNSAC(object):
         if cr.ndim != 3:
             raise ValueError("cost_rays_proc must be (N,C,H,V) or (C,H,V)")
 
-        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-        entry = cr[0]
-        width = cr[1] if cr.shape[0] > 1 else np.zeros_like(entry)
+        channel_count = cr.shape[0]
+        fig, axes = plt.subplots(
+            1, channel_count + 1, figsize=(4.5 * (channel_count + 1), 4)
+        )
+        profiles_ax = axes[-1]
+        cmaps = ('hot', 'viridis', 'cividis')
+        for channel_idx in range(channel_count):
+            if channel_idx == 0:
+                label = 'first entry'
+            elif channel_idx % 2:
+                label = 'obstacle width %d' % ((channel_idx + 1) // 2)
+            else:
+                label = 'free gap %d' % (channel_idx // 2)
+            ax = axes[channel_idx]
+            im = ax.imshow(
+                cr[channel_idx].T, aspect='auto', origin='lower',
+                cmap=cmaps[channel_idx % len(cmaps)], interpolation='nearest'
+            )
+            ax.set_xlabel('beam (0°–360°)')
+            ax.set_ylabel('theta orientation')
+            ax.set_title(label)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+            profiles_ax.plot(
+                cr[channel_idx].mean(axis=-1), label=label, linewidth=1
+            )
 
-        im = axes[0].imshow(entry.T, aspect='auto', origin='lower',
-                        cmap='hot', interpolation='nearest')
-        axes[0].set_xlabel('beam (0°–360°)')
-        axes[0].set_ylabel('theta orientation')
-        axes[0].set_title('Entry proximity')
-        plt.colorbar(im, ax=axes[0], shrink=0.8)
-
-        im = axes[1].imshow(width.T, aspect='auto', origin='lower',
-                            cmap='viridis', interpolation='nearest')
-        axes[1].set_xlabel('beam (0°–360°)')
-        axes[1].set_ylabel('theta orientation')
-        axes[1].set_title('Collision width')
-        plt.colorbar(im, ax=axes[1], shrink=0.8)
-
-        entry_mean = entry.mean(axis=-1)
-        width_mean = width.mean(axis=-1)
-        axes[2].plot(entry_mean, label='entry proximity', linewidth=1)
-        axes[2].plot(width_mean, label='collision width', linewidth=1)
-        axes[2].set_xlabel('beam index')
-        axes[2].set_ylabel('theta-averaged value')
-        axes[2].set_title('Horizontal profiles')
-        axes[2].set_xlim(0, len(entry_mean) - 1)
-        axes[2].legend()
+        profiles_ax.set_xlabel('beam index')
+        profiles_ax.set_ylabel('theta-averaged value')
+        profiles_ax.set_title('Horizontal profiles')
+        profiles_ax.set_xlim(0, cr.shape[1] - 1)
+        profiles_ax.legend()
 
         fig.tight_layout()
         self.writer.add_figure("CostRays/processed", fig, step, close=True)
@@ -567,3 +618,7 @@ class CNNSAC(object):
             torch.load("%s/%s_critic.pth" % (directory, filename),
                        map_location=self.device)
         )
+        # A loaded critic must immediately become the Bellman target baseline.
+        # Leaving critic_target at its random constructor weights destabilizes
+        # resumed training during the first replay-buffer refill.
+        self.critic_target.load_state_dict(self.critic.state_dict())

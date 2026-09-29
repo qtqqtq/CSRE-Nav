@@ -34,7 +34,7 @@
        default namespace produces a model literally called "limo/".  Every
        /gazebo/model_states lookup then has to carry that slash.  The model name
        is independent of robot_namespace, so it is a free choice and `limo` is
-       the one the rest of this repo (and planner_bench) already reads. -->
+       the one the rest of this repo (and evaluate) already reads. -->
   <param name="robot_description"
          command="$(find xacro)/xacro '$(find multi_robot_scenario)/xacro/limo/limo_four_diff.xacro'
                   robot_namespace:=$(arg robot_namespace)"/>

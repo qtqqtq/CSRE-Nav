@@ -4,7 +4,7 @@
 obstacle_range: 2.5
 raytrace_range: 3.0
 
-# Minimal footprint: point-like robot (collision checking done by c_space_mapper)
+# Minimal footprint: point-like robot for this costmap configuration.
 footprint: [[0.18, -0.13], [0.18, 0.13], [-0.18, 0.13], [-0.18, -0.13]]
 
 # Inflation radius: small buffer for safety

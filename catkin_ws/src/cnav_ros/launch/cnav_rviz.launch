@@ -19,7 +19,7 @@
   /initialpose.
 
   The node is declared directly rather than <include>-ing cnav.launch, for the
-  same reason planner_bench/launch/cspace.launch does it: cnav.launch can spawn
+  same reason evaluate/start_planner.sh runs the node directly: cnav.launch can spawn
   a send_goal.py, and a startup goal racing the one clicked in rviz is exactly
   the nondeterminism a viewer-centric launch must not have.  Declaring it here
   also exposes ~sac_dir, which cnav.launch does not, and leaves cnav.launch

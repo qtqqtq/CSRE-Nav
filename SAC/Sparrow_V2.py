@@ -70,6 +70,7 @@ default_cfg = dict(
     fwd_reward_weight=1.0, # 分奖励权重: 纯前向速度, 全速前进(=v_linear_max)该步 +fwd_reward_weight
     reverse_penalty=0.0,   # 倒车惩罚权重: 全速倒车该步 -reverse_penalty；0 保持旧行为
     ang_vel_penalty=0.1,  # 分奖励权重: |ω指令| 惩罚(原地转圈), 每步 −ang_vel_penalty·|ω|
+    step_penalty=0.5,     # 每步常驻惩罚；静止且无距离进展时奖励为 -step_penalty
     MapObs=None, # None /or/ the name of .png file, e.g. None / 'map.png'
     ld_a_range=360, # max scanning angle of lidar (degree)
     ld_d_range=100, # max scanning distance of lidar (cm)
@@ -617,13 +618,13 @@ class Sparrow():
         # 总奖励 = distance_reward_weight·R_distance
         #           + fwd_reward_weight·R_forward − reverse_penalty·R_reverse
         #           − ang_vel_penalty·R_angular
-        #           − 0.5(常态时间罚: 推动尽快到目标、压低速徘徊)。
+        #           − step_penalty(常驻时间罚: 推动尽快到目标、压低速徘徊)。
         # 终端(win/+200, 碰撞/越界/−200)在下面由 AWARD/PUNISH 覆盖。
         self.reward_vec = (self.distance_reward_weight * R_distance
                            + self.fwd_reward_weight * R_forward
                            - self.reverse_penalty * R_reverse
                            - self.ang_vel_penalty * R_angular
-                           - 0.5)
+                           - self.step_penalty)
 
         self.reward_vec[self.win_vec] = self.AWARD
         self.reward_vec[self.exceed_vec] = self.PUNISH
@@ -1111,18 +1112,18 @@ observation live in a single module.
 #
 # This "stitches" the NavRL-style configuration-space cost-ray pipeline
 # (`cspace_cost_rays.py`) into ColorDynamic's GPU-vectorized `Sparrow` simulator,
-# replacing the Gazebo/c_space_mapper ROS pipeline.  The observation is exactly the
-# (RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim CNN state consumed by
-# `cnn_network.py` / `train.py` (currently 2×36×30 + 2 = 2162; geometry comes from
-# `settings.CSPACE_*`):
+# without a Gazebo perception pipeline. The observation is exactly the
+# (RAY_CHANNELS×RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim CNN state consumed
+# by `cnn_network.py` / `train.py`; geometry comes from `settings.CSPACE_*`:
 #
-#     state = flatten( preprocess(cost_rays) ) + [distance, heading]
-#               |__ RAY_H_BEAMS × RAY_V_LAYERS __|  |_____ 2 _____|
+#     state = flatten(preprocess(interval_rays))
+#             + [distance, heading, normalized_actual_v, normalized_actual_w]
 #
-# (the kinematic block used to include the previous action command, [v_lin, v_ang];
-# that feedback was removed — see settings.KINEMATIC_DIM)
+# The velocity feedback is taken from `car_state` after the actuator filter has
+# been applied.  It is therefore the actual simulated motion state rather than
+# the previous policy command.
 #
-# matching `laser_env.step()` (CNN mode), where:
+# The observation contains:
 #     cost_rays : (36 beams × 30 theta layers) NavRL cost rays, metres
 #     distance  : distance to goal, metres
 #     heading   : heading error (robot heading -> goal), radians
@@ -1143,9 +1144,11 @@ observation live in a single module.
 #
 # The obstacle occupancy grid is rasterised from the robot's *lidar* hit points
 # (`ld_scan_result` / `ld_vectors_wd`) — the robot's actual line-of-sight
-# perception, mirroring the Gazebo `lidar_to_occupancy_node` — rather than the
-# ground-truth obstacle boundary points (`vec_*_obs_P_shaped`).  Only cells hit by
-# a lidar ray within `ld_d_range` are marked occupied; everything else is free.
+# perception rather than the
+# ground-truth obstacle boundary points (`vec_*_obs_P_shaped`).  Beam paths are
+# known-free, hit endpoints are occupied, and cells outside observed paths are
+# unknown. A footprint is invalid in c-space if it overlaps an obstacle or has
+# no overlap with any known-free cell (entirely unknown footprint).
 #
 # Run the self-test inside the container:
 #     python SAC/Sparrow_V2.py
@@ -1163,6 +1166,7 @@ SPARROW_CSPACE_CFG = dict(
     cost_ray_max_range=settings.CSPACE_COST_RAY_MAX_RANGE,  # m（= 局部观测窗口半径）
     cost_ray_num_beams=settings.CSPACE_COST_RAY_NUM_BEAMS,
     cost_ray_h_res_degrees=settings.CSPACE_COST_RAY_H_RES_DEGREES,
+    cost_ray_num_intervals=settings.CSPACE_COST_RAY_NUM_INTERVALS,
 )
 
 
@@ -1170,7 +1174,8 @@ class SparrowCspaceEnv(Sparrow):
     """Sparrow-V2 with a c-space (NavRL) observation.
 
     Use exactly like `Sparrow`, but `reset()`/`step()` return the cost-ray c-space
-    CNN state (2*B*nz + KINEMATIC_DIM dims, currently 2×36×30+2 = 2162) instead of the
+    CNN state (C*B*nz + KINEMATIC_DIM dims, where C is the configured radial
+    interval count) instead of the
     default lidar state.  Defaults to the Continuous action (action_dim=2); set
     `action_type='Discrete'` for the 7-way discrete action (the last two state
     terms are then the mapped `a_state` velocities — discrete mode is *not* part of
@@ -1197,6 +1202,7 @@ class SparrowCspaceEnv(Sparrow):
         params.setdefault("fwd_reward_weight", settings.SPARROW_FORWARD_REWARD_WEIGHT)
         params.setdefault("reverse_penalty", settings.SPARROW_REVERSE_PENALTY_WEIGHT)
         params.setdefault("ang_vel_penalty", settings.SPARROW_ANGULAR_VEL_PENALTY)
+        params.setdefault("step_penalty", settings.SPARROW_STEP_PENALTY)
         params.setdefault("stuck_reset", settings.SPARROW_STUCK_RESET)    # 卡死(cost ray 全≈0)时自动重置
         params.setdefault("stuck_threshold", settings.SPARROW_STUCK_THRESHOLD)
         # 雷达探测距离必须覆盖 c-space 窗口：基于雷达的 occupancy grid 在
@@ -1256,9 +1262,11 @@ class SparrowCspaceEnv(Sparrow):
 
         # output state dims
         self.cost_ray_num_beams = self.cspace_cfg["cost_ray_num_beams"]
+        self.cost_ray_num_intervals = self.cspace_cfg["cost_ray_num_intervals"]
         self.cost_ray_nz = self.cspace_cfg["nz"]
         self.cspace_state_dim = (
-            settings.RAY_CHANNELS * self.cost_ray_num_beams * self.cost_ray_nz
+            self.cost_ray_num_intervals
+            * self.cost_ray_num_beams * self.cost_ray_nz
             + settings.KINEMATIC_DIM
         )
 
@@ -1381,13 +1389,11 @@ class SparrowCspaceEnv(Sparrow):
 
     # ------------------------------------------------------------------- core
     def _build_occ_grid(self):
-        """Rasterise lidar hit points into a robot-centric grid (N,G,G).
+        """Build occupied and known-free robot-centric grids, each (N,G,G).
 
-        Mirrors the Gazebo `lidar_to_occupancy_node` (LaserScan callback): only
-        the robot's *line-of-sight* lidar hits are marked occupied — its actual
-        perception — instead of the ground-truth obstacle boundary points
-        (`vec_*_obs_P_shaped`).  A ray that reaches the lidar's max range
-        (`ld_d_range`) hit nothing and is dropped; the grid defaults to free.
+        Only cells traversed by a lidar beam are known free. A hit endpoint is
+        occupied; cells outside all beam paths remain unknown. Both grids are
+        built from sensor readings rather than ground-truth obstacle geometry.
 
         World (cm) -> robot frame (m) -> cell index at `g_min` resolution,
         robot always at the grid centre.
@@ -1417,52 +1423,109 @@ class SparrowCspaceEnv(Sparrow):
         occ_flat = torch.zeros(self.N * G * G, dtype=torch.bool, device=self.dvc)
         n_idx = torch.arange(self.N, device=self.dvc)[:, None].expand_as(ci)[inb]
         occ_flat[n_idx * (G * G) + ci[inb] * G + cj[inb]] = True
-        return occ_flat.view(self.N, G, G)
+        occ = occ_flat.view(self.N, G, G)
+
+        # Mark the beam paths as observed free. Sampling at half c-space-cell
+        # spacing closes gaps from the coarser lidar DDA, and stops before a hit
+        # endpoint so occupied evidence is not overwritten as free.
+        max_distance = self.ld_d_range / 100.0
+        step = g_min / 2.0
+        radial = torch.arange(
+            0.0, max_distance + step, step, device=self.dvc
+        )
+        beam_count = radial.numel()
+        ray_distance = (self.ld_scan_result / 100.0).clamp_max(max_distance)
+        free_sample = radial.view(1, 1, beam_count) < ray_distance.unsqueeze(-1)
+        free_sample &= radial.view(1, 1, beam_count) < max_distance
+        sample_pts = (
+            self.car_state[:, None, None, 0:2]
+            + radial.view(1, 1, beam_count, 1) * 100.0
+            * self.ld_vectors_wd[:, :, None, :]
+        )
+        dx_free = sample_pts[..., 0] - self.car_state[:, None, None, 0]
+        dy_free = sample_pts[..., 1] - self.car_state[:, None, None, 1]
+        cos_t = torch.cos(self.car_state[:, 2])[:, None, None]
+        sin_t = torch.sin(self.car_state[:, 2])[:, None, None]
+        rel_x_free = (dx_free * cos_t - dy_free * sin_t) / 100.0
+        rel_y_free = (dx_free * sin_t + dy_free * cos_t) / 100.0
+        free_i = R + torch.round(rel_x_free / g_min).long()
+        free_j = R + torch.round(rel_y_free / g_min).long()
+        free_inb = free_sample & (free_i >= 0) & (free_i < G) \
+            & (free_j >= 0) & (free_j < G)
+        known_flat = torch.zeros(
+            self.N * G * G, dtype=torch.bool, device=self.dvc
+        )
+        env_idx = torch.arange(self.N, device=self.dvc)[:, None, None] \
+            .expand_as(free_i)[free_inb]
+        known_flat[env_idx * (G * G) + free_i[free_inb] * G
+                   + free_j[free_inb]] = True
+        return occ, known_flat.view(self.N, G, G)
 
     def _get_cspace_state(self, current_a):
-        """Build the interval-ray CNN state, e.g. (N, 2*36*30 + 2).
+        """Build the configurable ray-segment CNN state.
 
-        The two ray channels are entry proximity and collision-interval width.
-        The block appended to them is [distance, heading] only. `current_a` is
-        still accepted so reset/step call sites stay uniform, but it does not
-        enter the observation.
+        Ray channels contain the normalized first-obstacle entry distance,
+        followed by alternating occupied and free radial widths.
+        The appended block is [distance, heading, normalized actual linear
+        velocity, normalized actual angular velocity]. `current_a` remains an
+        argument only to keep reset/step call sites uniform; commanded action is
+        deliberately not part of the observation.
         """
         cfg = self.cspace_cfg
-        occ = self._build_occ_grid()
-        cspace = build_cspace(occ, self._cspace_masks)
+        occ, known_free = self._build_occ_grid()
+        cspace = build_cspace(occ, self._cspace_masks, known_free)
         cost_intervals = cost_ray_intervals_3d(
             cspace, self._robot_cell,
             num_beams=cfg["cost_ray_num_beams"],
             h_res_deg=cfg["cost_ray_h_res_degrees"],
             max_range=cfg["cost_ray_max_range"],
             g_min=cfg["g_min"],
-        )                                                          # (N,2,B,nz) m
-        # Preserve the legacy first-hit attribute for stuck detection and
-        # rendering, while exposing both raw interval boundaries for debugging.
+            num_intervals=cfg["cost_ray_num_intervals"],
+        )                                                          # (N,C,B,nz) m
+        # Preserve boundary-style attributes for stuck detection and rendering.
         self.cost_ray_enter_raw = cost_intervals[:, 0].detach()    # (N,B,nz) m
-        self.cost_ray_exit_raw = cost_intervals[:, 1].detach()     # (N,B,nz) m
         self.cost_ray_width_raw = (
-            self.cost_ray_exit_raw - self.cost_ray_enter_raw
+            cost_intervals[:, 1].detach()
+            if cost_intervals.shape[1] > 1
+            else torch.zeros_like(self.cost_ray_enter_raw)
+        )                                                          # (N,B,nz) m
+        self.cost_ray_exit_raw = (
+            self.cost_ray_enter_raw + self.cost_ray_width_raw
+        ).clamp_max(cfg["cost_ray_max_range"])
+        self.cost_ray_second_gap_raw = (
+            cost_intervals[:, 2].detach()
+            if cost_intervals.shape[1] > 2
+            else torch.zeros_like(self.cost_ray_enter_raw)
         )
+        self.cost_ray_second_enter_raw = (
+            self.cost_ray_exit_raw + self.cost_ray_second_gap_raw
+        ).clamp_max(cfg["cost_ray_max_range"])
         self.cost_rays_raw = self.cost_ray_enter_raw
         self.occ_grid = occ.detach()                               # (N,G,G) bool
+        self.known_free_grid = known_free.detach()                  # (N,G,G) bool
         self.cspace = cspace.detach()                              # (N,G,G,nz) bool
         cr_proc = preprocess_cost_ray_intervals(
             cost_intervals,
             max_range=cfg["cost_ray_max_range"],
             epsilon=cfg["g_min"] / 2.0,
-        )                                                          # (N,2,B,nz)
+        )                                                          # (N,C,B,nz)
         self.cost_rays_proc = cr_proc.detach()
-        cr = cr_proc.reshape(self.N, -1)                           # (N,2*B*nz)
+        cr = cr_proc.reshape(self.N, -1)                           # (N,C*B*nz)
 
-        # fresh distance (post AutoReset) + heading
+        # Fresh post-AutoReset goal state plus the post-filter actual velocity.
         self.d2target_now = (
             self.car_state[:, 0:2] - self.target_point
         ).pow(2).sum(-1).pow(0.5)
         distance = (self.d2target_now / 100.0).unsqueeze(-1)       # (N,1) m
         heading = self._heading_error().unsqueeze(-1)              # (N,1) rad
+        actual_velocity = torch.stack((
+            self.car_state[:, 3] / self.v_linear_max,
+            self.car_state[:, 4] / self.v_angular_max,
+        ), dim=-1).clamp_(-1.0, 1.0)                               # (N,2)
 
-        return torch.cat([cr, distance, heading], dim=1)           # (N,2*B*nz+2)
+        return torch.cat(
+            [cr, distance, heading, actual_velocity], dim=1
+        )                                                          # (N,C*B*nz+4)
 
     def is_stuck(self, threshold=0.05):
         """Return (N,) bool: at theta=0 (driving straight, no rotation) even the
@@ -1671,31 +1734,16 @@ class SparrowCspaceEnv(Sparrow):
         return os.path.abspath(save_path)
 
     def xy_projection_rgb(self, env_idx=0):
-        """XY projection of the 3-D c-space as an RGB image (mirrors
-        `ConfigurationMapper::getXYProjectionImage`).
+        """Project the fraction of usable heading layers at each XY cell.
 
-        Each cell's colour encodes *which* theta orientation(s) collide there:
-        red = small theta (0 .. nz/3), green = middle third, blue = large third.
-        Free cells and cells occupied at every theta are both grey (the per-third
-        occupancy is balanced / zero); only cells colliding in a subset of theta
-        thirds are coloured.  Returns a (G, G, 3) uint8 RGB array in robot-centric
-        grid coordinates (robot at the centre, +x = forward).
+        C-space ``True`` means the pose is unavailable (obstacle or entirely
+        unknown footprint). The grayscale value is linear in the usable theta
+        fraction: black means no heading is usable, white means every heading
+        is usable. Returns an RGB uint8 image in robot-centric grid coordinates.
         """
-        cs = self.cspace[env_idx]                            # (G, G, nz) bool
-        nz = cs.shape[-1]
-        third = nz // 3
-        dists = []
-        for lo, hi in ((0, third), (third, 2 * third), (2 * third, nz)):
-            w = torch.zeros(nz, device=cs.device, dtype=torch.float32)
-            w[lo:hi] = 1.0
-            dists.append((cs.float() * w).sum(dim=-1))      # (G, G)
-        red_d, green_d, blue_d = dists
-        avg = (red_d + green_d + blue_d) / 3.0
-        rgb = torch.stack(
-            [torch.sigmoid(d - avg) for d in (red_d, green_d, blue_d)],
-            dim=-1,
-        )                                                    # (G, G, 3) in [0,1]
-        return (rgb * 255.0).to(torch.uint8)
+        available_fraction = (~self.cspace[env_idx]).float().mean(dim=-1)
+        intensity = (available_fraction * 255.0).round().to(torch.uint8)
+        return intensity.unsqueeze(-1).expand(-1, -1, 3).contiguous()
 
     # ------------------------------------------------------------- gym-like API
     def reset(self):
@@ -1828,8 +1876,8 @@ if __name__ == "__main__":
         ]},
     )
     s, info = env.reset()
-    flat = settings.RAY_CHANNELS * env.cost_ray_num_beams * env.cost_ray_nz
-    exp_shape = (env.N, flat + settings.KINEMATIC_DIM)      # e.g. (2, 2162)
+    flat = env.cost_ray_num_intervals * env.cost_ray_num_beams * env.cost_ray_nz
+    exp_shape = (env.N, flat + settings.KINEMATIC_DIM)
     print("reset state shape:", tuple(s.shape), "(expect %s)" % (exp_shape,))
     print("interval-ray sub-range: [%.2f, %.2f] (expect [0, 1])" % (
         s[:, :flat].min().item(), s[:, :flat].max().item()))

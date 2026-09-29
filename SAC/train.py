@@ -1,15 +1,14 @@
 """
 Vectorized CNN-SAC training on Sparrow-V2 with a c-space (NavRL) observation.
 
-Trains the existing `cnn_network.CNNSAC` on `Sparrow_V2.SparrowCspaceEnv`
-instead of the Gazebo `laser_env.GazeboEnv`, collecting N transitions per step
-(one per vectorized env) so both the simulator and the actor forward pass run
-batched on the GPU.
+Trains the existing `cnn_network.CNNSAC` on `Sparrow_V2.SparrowCspaceEnv`,
+collecting N transitions per step (one per vectorized env) so both the
+simulator and the actor forward pass run batched on the GPU.
 
 State / action conventions:
-    - state  : (N, 2×RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM) =
-               flatten([entry proximity, collision width]) + [dist, heading]
-               (currently 2×36×30 + 2 = 2162)
+    - state  : (N, RAY_CHANNELS×RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM) =
+               flatten([first entry, occupied width, free width, ...]) +
+               [dist, heading, normalized actual v, normalized actual w]
     - action : actor outputs tanh(-1,1); env receives
                a_in = settings.map_continuous_action(action)
                (linear a0 in [-1,1] when settings.ALLOW_REVERSE else [0,1];
@@ -19,7 +18,9 @@ State / action conventions:
 
 Usage:
     python3 train.py
+    python3 train.py --intervals 5 --steps 2000000 --name interval_5_2m
 """
+import argparse
 import os
 import time
 
@@ -34,17 +35,45 @@ from render_utils import draw_hud, draw_cost_rays, draw_cspace_projection
 import settings
 
 
+def positive_int(value):
+    result = int(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return result
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--intervals", type=positive_int,
+                    default=settings.CSPACE_COST_RAY_NUM_INTERVALS)
+parser.add_argument("--steps", type=positive_int,
+                    default=int(settings.MAX_TIMESTEPS),
+                    help="number of vectorized transitions to collect")
+parser.add_argument("--name", default="interval_cspace_1",
+                    help="checkpoint and result basename")
+parser.add_argument("--model-dir", default=settings.MODEL_DIR)
+parser.add_argument("--results-dir", default=settings.RESULTS_DIR)
+parser.add_argument("--seed", type=int, default=settings.SEED)
+parser.add_argument("--buffer-size", type=positive_int, default=250000)
+args = parser.parse_args()
+
+# The interval count is experiment-specific; the other observation geometry
+# and environment settings still come from settings.py.
+RAY_CHANNELS = args.intervals
+RAY_GRID_FLAT_DIM = RAY_CHANNELS * settings.RAY_H_BEAMS * settings.RAY_V_LAYERS
+CNN_STATE_DIM = RAY_GRID_FLAT_DIM + settings.KINEMATIC_DIM
+
+
 # ---------------------------------------------------------------------------
 # Hyper-parameters
 # ---------------------------------------------------------------------------
 N_ENVS = settings.SPARROW_N_ENVS              # number of vectorized environments (GPU batch)
 N_OBSTACLES = settings.SPARROW_N_OBSTACLES    # moving obstacles per environment
 batch_size = 256
-buffer_size = 250000
-file_name = "dense_sample_cspace_4"
+buffer_size = args.buffer_size
+file_name = args.name
 save_model = True
-load_model = True
-load_model_name = "dense_sample_cspace_3"
+load_model = False
+load_model_name = "interval_cspace_velocity_0_best"
 
 train_every = 5             # env-steps between training calls
 gradient_steps = 5          # gradient steps per training call (1:1 with steps)
@@ -63,6 +92,41 @@ RENDER = settings.SPARROW_RENDER              # True 时打开渲染窗口
 RENDER_ENV = settings.SPARROW_RENDER_ENV      # 渲染第几个环境（0 .. N_ENVS-1）
 RENDER_SPEED = settings.SPARROW_RENDER_SPEED  # 'slow'=30FPS / 'fast'=最快 / 'real'=仿真速度
 
+# Logged once in TensorBoard when CNNSAC lazily creates its writer.  Keep this
+# dictionary close to the training-loop constants so a run is reproducible
+# from its event files without having to reconstruct command-line output.
+TRAINING_HPARAMS = {
+    "file_name": file_name,
+    "batch_size": batch_size,
+    "buffer_size": buffer_size,
+    "train_every": train_every,
+    "gradient_steps": gradient_steps,
+    "eval_every_steps": EVAL_EVERY_STEPS,
+    "eval_steps": EVAL_STEPS,
+    "n_envs": N_ENVS,
+    "n_obstacles": N_OBSTACLES,
+    "warmup_steps": settings.WARMUP_STEPS,
+    "max_timesteps": args.steps,
+    "discount": settings.DISCOUNT,
+    "tau": settings.TAU,
+    "learning_rate": settings.LR,
+    "actor_lr": settings.ACTOR_LR,
+    "critic_lr": settings.CRITIC_LR,
+    "alpha_lr": settings.ALPHA_LR,
+    "initial_alpha": settings.SAC_INITIAL_ALPHA,
+    "safety_reward_weight": settings.SAFETY_REWARD_WEIGHT,
+    "speed_reward_weight": settings.SPEED_REWARD_WEIGHT,
+    "distance_reward_weight": settings.SPARROW_DISTANCE_REWARD_WEIGHT,
+    "forward_reward_weight": settings.SPARROW_FORWARD_REWARD_WEIGHT,
+    "reverse_penalty_weight": settings.SPARROW_REVERSE_PENALTY_WEIGHT,
+    "angular_velocity_penalty": settings.SPARROW_ANGULAR_VEL_PENALTY,
+    "step_penalty": settings.SPARROW_STEP_PENALTY,
+    "state_dim": CNN_STATE_DIM,
+    "ray_grid_flat_dim": RAY_GRID_FLAT_DIM,
+    "ray_num_intervals": RAY_CHANNELS,
+    "kinematic_dim": settings.KINEMATIC_DIM,
+}
+
 
 # ---------------------------------------------------------------------------
 # Evaluation (deterministic, vectorized)
@@ -75,10 +139,10 @@ def evaluate(network, env, eval_steps=EVAL_STEPS):
     num_collision = 0
     num_goal = 0
     for _ in range(eval_steps):
-        rg = state[:, :settings.RAY_GRID_FLAT_DIM].reshape(
-            env.N, settings.RAY_CHANNELS,
+        rg = state[:, :RAY_GRID_FLAT_DIM].reshape(
+            env.N, RAY_CHANNELS,
             settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
-        kin = state[:, settings.RAY_GRID_FLAT_DIM:]
+        kin = state[:, RAY_GRID_FLAT_DIM:]
         with torch.no_grad():
             action = network.actor.get_mean_action(rg, kin)      # (N,2) in [-1,1]
         a_in = settings.map_continuous_action(action)
@@ -102,13 +166,13 @@ def evaluate(network, env, eval_steps=EVAL_STEPS):
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
-if save_model and not os.path.exists(settings.MODEL_DIR):
-    os.makedirs(settings.MODEL_DIR)
-if not os.path.exists(settings.RESULTS_DIR):
-    os.makedirs(settings.RESULTS_DIR)
+if save_model and not os.path.exists(args.model_dir):
+    os.makedirs(args.model_dir)
+if not os.path.exists(args.results_dir):
+    os.makedirs(args.results_dir)
 
-torch.manual_seed(settings.SEED)
-np.random.seed(settings.SEED)
+torch.manual_seed(args.seed)
+np.random.seed(args.seed)
 
 env = SparrowCspaceEnv(
     N=N_ENVS,
@@ -123,6 +187,7 @@ env = SparrowCspaceEnv(
     render_speed=RENDER_SPEED,
     ri=RENDER_ENV,
     max_ep_steps=settings.MAX_STEPS,
+    cspace_cfg={"cost_ray_num_intervals": RAY_CHANNELS},
 )
 
 if RENDER:
@@ -135,20 +200,21 @@ network = CNNSAC(
     max_action=settings.MAX_ACTION,
     h_beams=settings.RAY_H_BEAMS,
     v_layers=settings.RAY_V_LAYERS,
-    ray_channels=settings.RAY_CHANNELS,
+    ray_channels=RAY_CHANNELS,
     cnn_feature_dim=64,
     lr=settings.LR,
     alpha_lr=settings.ALPHA_LR,
     device=settings.device,
     safety_reward_weight=settings.SAFETY_REWARD_WEIGHT,
     speed_reward_weight=settings.SPEED_REWARD_WEIGHT,
+    tensorboard_hparams=TRAINING_HPARAMS,
 )
 
-replay_buffer = ReplayBuffer(buffer_size, settings.SEED)
+replay_buffer = ReplayBuffer(buffer_size, args.seed)
 
 if load_model:
     try:
-        network.load(load_model_name, settings.MODEL_DIR)
+        network.load(load_model_name, args.model_dir)
         print("Loaded stored model: %s" % load_model_name)
     except Exception:
         print("Could not load stored model, starting from random parameters")
@@ -156,11 +222,15 @@ if load_model:
 print("Training CNN-SAC on Sparrow-V2 c-space state, device=%s, N=%d" %
       (settings.device, N_ENVS))
 print("State dim: %d (cost_rays %d + kinematic %d)" %
-      (settings.CNN_STATE_DIM, settings.RAY_GRID_FLAT_DIM, settings.KINEMATIC_DIM))
+      (CNN_STATE_DIM, RAY_GRID_FLAT_DIM, settings.KINEMATIC_DIM))
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+# Network initialization consumes a different number of random draws for each
+# channel count. Start every condition from the same initial simulator world.
+torch.manual_seed(args.seed)
+np.random.seed(args.seed)
 state, _ = env.reset()
 
 # per-env episode bookkeeping (Sparrow auto-resets done envs internally)
@@ -175,12 +245,12 @@ evaluations = []
 t_start = time.time()
 quit_requested = False
 
-while total_steps < settings.MAX_TIMESTEPS:
+while total_steps < args.steps:
     # split flat state into ray-grid + kinematic
-    rg = state[:, :settings.RAY_GRID_FLAT_DIM].reshape(
-        N_ENVS, settings.RAY_CHANNELS,
+    rg = state[:, :RAY_GRID_FLAT_DIM].reshape(
+        N_ENVS, RAY_CHANNELS,
         settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
-    kin = state[:, settings.RAY_GRID_FLAT_DIM:]
+    kin = state[:, RAY_GRID_FLAT_DIM:]
 
     # sample stochastic action (SAC reparameterized), tanh(-1,1)
     with torch.no_grad():
@@ -248,8 +318,8 @@ while total_steps < settings.MAX_TIMESTEPS:
         evaluations.append(avg_reward)
         network.log_eval(epoch, avg_reward, avg_col, avg_goal)
         if save_model:
-            network.save(file_name, directory=settings.MODEL_DIR)
-        np.save("%s/%s" % (settings.RESULTS_DIR, file_name), evaluations)
+            network.save(file_name, directory=args.model_dir)
+        np.save("%s/%s" % (args.results_dir, file_name), evaluations)
         print("epoch %d | steps %d | avg_reward %.2f | collision_rate %.3f | "
               "goal_reached %.3f | %.1f ksteps/s" % (
                   epoch, total_steps, avg_reward, avg_col, avg_goal,
@@ -263,8 +333,8 @@ avg_reward, avg_col, avg_goal = evaluate(network, env)
 evaluations.append(avg_reward)
 network.log_eval(epoch, avg_reward, avg_col, avg_goal)
 if save_model:
-    network.save(file_name, directory=settings.MODEL_DIR)
-np.save("%s/%s" % (settings.RESULTS_DIR, file_name), evaluations)
-print("Training complete. Model saved to %s/%s" % (settings.MODEL_DIR, file_name))
+    network.save(file_name, directory=args.model_dir)
+np.save("%s/%s" % (args.results_dir, file_name), evaluations)
+print("Training complete. Model saved to %s/%s" % (args.model_dir, file_name))
 if RENDER:
     env.close()
