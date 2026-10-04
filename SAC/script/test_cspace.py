@@ -8,6 +8,12 @@ episodes with at least one lidar-detected contact (including a stuck reset).
 Stuck-reset rate is also printed for comparison with train.py's eval metric.
 Average speed is total absolute linear travel divided by elapsed simulated time
 over completed episodes, in m/s; unfinished episodes are excluded.
+
+Nothing here may drift from train.py: the lidar settings, the footprint regime
+and the c-space geometry all take their defaults from settings.py, so a
+checkpoint is evaluated in the regime it was trained under. `--random_footprint`
+and `--backend` change what the policy sees, so any comparison across them must
+hold the weights and the seed fixed.
 """
 
 import argparse
@@ -21,7 +27,7 @@ import numpy as np
 import torch
 
 import settings
-from Sparrow_V2 import SparrowCspaceEnv
+from Sparrow_V2 import SparrowCspaceEnv, str2bool
 from cnn_network import CNNActor
 
 
@@ -41,6 +47,16 @@ def parse_args():
     parser.add_argument("--intervals", type=positive_int,
                         default=settings.CSPACE_COST_RAY_NUM_INTERVALS,
                         help="ray interval channels used when training the model")
+    parser.add_argument("--backend", choices=("grid", "points"),
+                        default=settings.CSPACE_BACKEND,
+                        help="c-space observation geometry used for evaluation; "
+                             "switching it changes what the policy sees, so "
+                             "compare backends with one checkpoint and one seed")
+    parser.add_argument("--random_footprint", type=str2bool,
+                        default=settings.RANDOM_FOOTPRINT_ENABLED,
+                        help="draw a new footprint every episode, as train.py does; "
+                             "evaluate a checkpoint in the footprint regime it was "
+                             "trained under (default: training setting)")
     parser.add_argument("--episodes", type=positive_int, default=100,
                         help="number of completed navigation episodes (default: 100)")
     parser.add_argument("--envs", type=positive_int,
@@ -88,10 +104,11 @@ def main():
         stuck_reset=settings.SPARROW_STUCK_RESET,
         stuck_threshold=settings.SPARROW_STUCK_THRESHOLD,
         ld_acc=settings.SPARROW_LD_ACC,
-        global_plan=settings.GLOBAL_PLAN_ENABLED,
+        random_footprint=args.random_footprint,
         render_mode=None,
         max_ep_steps=settings.MAX_STEPS,
-        cspace_cfg={"cost_ray_num_intervals": args.intervals},
+        cspace_cfg={"cost_ray_num_intervals": args.intervals,
+                    "backend": args.backend},
     )
 
     completed = successes = collisions = stuck_resets = timeouts = 0
@@ -148,6 +165,8 @@ def main():
     metrics = {
         "model": args.model,
         "intervals": args.intervals,
+        "backend": args.backend,
+        "random_footprint": args.random_footprint,
         "device": str(device),
         "seed": args.seed,
         "episodes": completed,
@@ -170,6 +189,7 @@ def main():
     print("model: %s | intervals: %d | device: %s | seed: %d | episodes: %d | envs: %d" % (
         args.model, args.intervals, device, args.seed, completed, env_count,
     ))
+    print("backend: %s | random footprint: %s" % (args.backend, args.random_footprint))
     print("success rate: %.2f%% (%d/%d)" % (
         100.0 * successes / completed, successes, completed,
     ))

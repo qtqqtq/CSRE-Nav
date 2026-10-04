@@ -68,11 +68,21 @@ CSPACE_G_MIN = 0.1                  # c-space 网格分辨率 (m)
 CSPACE_COST_RAY_MAX_RANGE = 3.0     # cost-ray 最大探测范围 (m)（= 观测局部窗口半径）
 CSPACE_COST_RAY_NUM_BEAMS = 36      # 水平波束数（0°–360°）
 CSPACE_COST_RAY_H_RES_DEGREES = 360.0 / CSPACE_COST_RAY_NUM_BEAMS  # 10 deg
-CSPACE_COST_RAY_NUM_INTERVALS = 3   # 连续径向区间数：首次命中距离、障碍宽度、空闲宽度……
+CSPACE_COST_RAY_NUM_INTERVALS = 2   # 连续径向区间数：首次命中距离、障碍宽度、空闲宽度……
 CSPACE_NZ = 30                      # 观测 θ 朝向层数（cost-ray 第三维, = nz_）
 CSPACE_A = 2 * math.pi / CSPACE_NZ  # θ 分辨率 (rad)，~0.209 = 12°；nz·a=2π -> nz 个
                                     # 朝向唯一、无重复拷贝（旧观测 a=0.698≈2π/9 配
-                                    # nz=10 时，第 10 层是第 0 层的拷贝；见 PLANNER_A 注释）
+                                    # nz=10 时，第 10 层是第 0 层的拷贝）
+
+# c-space 观测的几何后端：
+#   "grid"   —— 栅格：occ_grid -> conv 膨胀 -> build_cspace -> 沿格 ray march
+#               （面位置受 g_min 量化 ±5 cm，且相邻命中点半格各自四舍五入会互相推远
+#                g_min，在本该闭合的开口上留下假缝 —— 见 g_min 与 w⊥ 的关系）
+#   "points" —— 解析：障碍 = 激光命中点集，判据 = 闵可夫斯基半平面不等式，完全不用栅格
+#               （cspace_cost_rays.pointset_batch / pointset_collision）
+# 两者输出**同一形状、同一语义**的 (N, C, B, nz) 区间张量 ⇒ 观测维数不变、权重可互换。
+# 注意它改变的是策略看到的世界，不是渲染开关：跨后端比成功率必须同一份权重 + 同一个 seed。
+CSPACE_BACKEND = "points"           # "grid" | "points"
 
 # CNN ray-grid dims (aliases kept — the network / reshape code reads these)
 RAY_CHANNELS = CSPACE_COST_RAY_NUM_INTERVALS             # 每个径向区间对应一个 CNN 通道
@@ -102,6 +112,14 @@ def rectangular_footprint(length, width):
 ROBOT_FOOTPRINT_LENGTH = 1.20   # m, 沿 +x(前进)
 ROBOT_FOOTPRINT_WIDTH = 0.14    # m, 沿 +y(横向)
 ROBOT_FOOTPRINT = rectangular_footprint(ROBOT_FOOTPRINT_LENGTH, ROBOT_FOOTPRINT_WIDTH)
+
+# Training footprint randomization: centered, independently rotated rectangles.
+# Each episode draws a new union of 1-3 rectangles per parallel environment.
+RANDOM_FOOTPRINT_ENABLED = True
+RANDOM_FOOTPRINT_COUNT = (1, 3)
+RANDOM_FOOTPRINT_LENGTH = (0.35, 1.20)  # m
+RANDOM_FOOTPRINT_WIDTH = (0.12, 0.35)   # m
+RANDOM_FOOTPRINT_ANGLE = (-math.pi / 2, math.pi / 2)  # rad; 180° covers all rectangle orientations
 
 # ---------------------------------------------------------------------------
 # SAC policy bounds
@@ -145,11 +163,20 @@ SPARROW_STEP_PENALTY = 3.0            # tuned constant per-step penalty
 # ---------------------------------------------------------------------------
 SPARROW_N_ENVS = 32          # vectorized environments per training step
 SPARROW_N_OBSTACLES = 8      # moving obstacles per environment
-SPARROW_DYNAMIC_OBS = True   # whether to spawn moving obstacles in c-space environments
+SPARROW_DYNAMIC_OBS = False   # whether to spawn moving obstacles in c-space environments
 SPARROW_OBS_V = 25           # maximum moving-obstacle speed (cm/s)
 SPARROW_LD_ACC = 8           # lidar DDA step size (cm); larger = faster but coarser scan
 # 6x6 regions x 2 attempts x 0.25 -> about 18 static line obstacles per map.
 SPARROW_GENERATE_RATE = 0.25
+
+# Per-env wall: opening width = maximum footprint projection perpendicular to
+# robot forward + extra. Wall angle is sampled uniformly in [0, pi).
+SPARROW_CROSS_WALL = True
+SPARROW_WALL_OPENINGS = 2
+SPARROW_WALL_THICKNESS_CM = 16
+SPARROW_WALL_GAP_EXTRA_CM = 15
+SPARROW_WALL_START_OFFSET_CM = 160
+SPARROW_WALL_OPENING_JITTER_CM = 18
 
 # Stuck auto-reset: boxed-in detection via the theta=0 cost-ray layer
 SPARROW_STUCK_RESET = True
@@ -160,25 +187,6 @@ SPARROW_STUCK_THRESHOLD = 0.1   # < 0 disables stuck reset (training default);
 SPARROW_RENDER = False           # True -> render env SPARROW_RENDER_ENV while training
 SPARROW_RENDER_ENV = 0           # which env to render (0 .. SPARROW_N_ENVS-1)
 SPARROW_RENDER_SPEED = 'real'    # 'slow'=30FPS / 'fast'=max / 'real'=sim-speed
-
-# ---------------------------------------------------------------------------
-# Global planner (GraphPlanner) -- 单机器人，位形空间中的图上规划
-# ---------------------------------------------------------------------------
-# footprint 用 28x28 cm 方（≈碰撞圆 collision_trsd=14cm），而非观测用的 1.2m 大
-# 足迹（否则会挡住 > 一半地图）。见 global_planner.py 模块 docstring。
-GLOBAL_PLAN_ENABLED = False      # 训练时是否启用全局路径航点引导
-PLANNER_FOOTPRINT = ROBOT_FOOTPRINT
-PLANNER_G_MIN = 0.1              # c-space 空间分辨率 (m)，与观测管线一致
-# 全局规划器自己的 θ 采样（可独立于局部观测层 settings.CSPACE_A=2π/CSPACE_NZ）。
-# a 由 nz 推出保证自洽（nz·a = 2π）：nz=30 → a≈0.209 rad（12°），30 个唯一朝向，
-# 不会出现旧观测 a=0.698(≈2π/9)&nz=10 时那种 θ 层重复（9 层 = 360° 后只剩拷贝）。
-PLANNER_NZ = 30                  # 全局规划器的 θ 层数（与观测层 CSPACE_NZ 同取 30，可独立调整）
-PLANNER_A = 2 * math.pi / PLANNER_NZ   # 全局 θ 分辨率 (rad)，由 PLANNER_NZ 推出
-PLANNER_STRIDE_IJ = 2            # 顶点 (i,j) 采样步长 (格)
-PLANNER_STRIDE_K = 1             # 顶点 θ 层采样步长 (层)
-PLANNER_CONNECT_DIST_CM = 60     # 顶点连接半径 (cm)
-PLANNER_WP_REACH_CM = 60         # 距当前航点多近则前进到下一航点 (> target_area 防提前获胜)
-PLANNER_MIN_WP_SPACING_CM = 40   # 航点最小间距 (> target_area 防提前获胜)
 
 # ---------------------------------------------------------------------------
 # Paths

@@ -45,10 +45,14 @@ def positive_int(value):
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--intervals", type=positive_int,
                     default=settings.CSPACE_COST_RAY_NUM_INTERVALS)
+parser.add_argument("--backend", choices=("grid", "points"),
+                    default=settings.CSPACE_BACKEND,
+                    help="c-space observation geometry: grid (raster) or "
+                         "points (analytic lidar point set)")
 parser.add_argument("--steps", type=positive_int,
                     default=int(settings.MAX_TIMESTEPS),
                     help="number of vectorized transitions to collect")
-parser.add_argument("--name", default="interval_cspace_1",
+parser.add_argument("--name", default="interval_cspace_2",
                     help="checkpoint and result basename")
 parser.add_argument("--model-dir", default=settings.MODEL_DIR)
 parser.add_argument("--results-dir", default=settings.RESULTS_DIR)
@@ -72,20 +76,17 @@ batch_size = 256
 buffer_size = args.buffer_size
 file_name = args.name
 save_model = True
-load_model = False
-load_model_name = "interval_cspace_velocity_0_best"
+load_model = True
+load_model_name = "interval_cspace_1"
 
 train_every = 5             # env-steps between training calls
 gradient_steps = 5          # gradient steps per training call (1:1 with steps)
 
-# ---- 评估节奏（调低评估在墙钟里的占比）----
-# settings.EVAL_FREQ=5000 因步进是 N_ENVS=32 一跳、5000 不能被 32 整除，实际上只在
-# 20000(=625*32) 的整数倍才触发评估 —— 这里显式对齐，日志/存档节奏不变（仍是每
-# 20000 计入步一次）。每次评估跑的 env.step() 次数从 500 降到 EVAL_STEPS，
-# 评估 env.step 占总 env.step 的比例约从 44% 降到 24%（两次评估间采样 625 次 env.step）。
-# 调小评估次数/调大间隔会更快，但 avg_reward / collision_rate 统计会变少、变糙。
+# Evaluate on the same three maps at every checkpoint. The independent eval
+# environment leaves training observations and episode bookkeeping intact.
 EVAL_EVERY_STEPS = 20000    # 两次评估之间的计入步间隔（必须能被 N_ENVS 整除才会命中）
-EVAL_STEPS = 200            # 每次评估跑的 env.step() 次数（N_ENVS 个 env 并行，即评估 N*EVAL_STEPS 条轨迹）
+EVAL_STEPS = 200            # 每张地图的 env.step() 次数
+EVAL_SEEDS = tuple(args.seed + 10000 + i for i in range(settings.EVAL_EP))
 
 # 可视化：像 play_cspace 一样实时渲染其中一个并行环境（打开 pygame 窗口）
 RENDER = settings.SPARROW_RENDER              # True 时打开渲染窗口
@@ -103,6 +104,7 @@ TRAINING_HPARAMS = {
     "gradient_steps": gradient_steps,
     "eval_every_steps": EVAL_EVERY_STEPS,
     "eval_steps": EVAL_STEPS,
+    "eval_seeds": str(EVAL_SEEDS),
     "n_envs": N_ENVS,
     "n_obstacles": N_OBSTACLES,
     "warmup_steps": settings.WARMUP_STEPS,
@@ -132,32 +134,41 @@ TRAINING_HPARAMS = {
 # Evaluation (deterministic, vectorized)
 # ---------------------------------------------------------------------------
 def evaluate(network, env, eval_steps=EVAL_STEPS):
-    """Return (avg_reward, collision_rate, goal_rate) over a vectorized run."""
-    state, _ = env.reset()
-    total_reward = 0.0
+    """Evaluate completed episodes on repeatable maps without changing training RNG."""
+    numpy_state = np.random.get_state()
+    cuda_devices = [env.dvc.index if env.dvc.index is not None
+                    else torch.cuda.current_device()] if env.dvc.type == "cuda" else []
+    total_episode_reward = 0.0
     num_done = 0
     num_collision = 0
     num_goal = 0
-    for _ in range(eval_steps):
-        rg = state[:, :RAY_GRID_FLAT_DIM].reshape(
-            env.N, RAY_CHANNELS,
-            settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
-        kin = state[:, RAY_GRID_FLAT_DIM:]
-        with torch.no_grad():
-            action = network.actor.get_mean_action(rg, kin)      # (N,2) in [-1,1]
-        a_in = settings.map_continuous_action(action)
-        state, reward, dw, tr, _ = env.step(a_in)
-        done = dw | tr
-        total_reward += reward.sum().item()
-        num_done += done.sum().item()
-        num_collision += env.collide_vec.sum().item()
-        num_goal += env.win_vec.sum().item()
-    total_steps = eval_steps * env.N
-    avg_reward = total_reward / max(num_done, 1)
-    # collide_vec 现在是「卡死(stuck)重置事件」掩码，是 done 的子集（每步每个
-    # 环境最多触发一次），因此 num_collision <= num_done，碰撞率 = 以碰撞(卡死)
-    # 结束的 episode 占比；goal_rate = 以到达目标(win)结束的 episode 占比。
-    # 两者都天然落在 [0,1]。
+    try:
+        with torch.random.fork_rng(devices=cuda_devices):
+            for seed in EVAL_SEEDS:
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                state, _ = env.reset()
+                episode_reward = torch.zeros(env.N, device=env.dvc)
+                for _ in range(eval_steps):
+                    rg = state[:, :RAY_GRID_FLAT_DIM].reshape(
+                        env.N, RAY_CHANNELS,
+                        settings.RAY_H_BEAMS, settings.RAY_V_LAYERS)
+                    kin = state[:, RAY_GRID_FLAT_DIM:]
+                    with torch.no_grad():
+                        action = network.actor.get_mean_action(rg, kin)
+                    a_in = settings.map_continuous_action(action)
+                    state, reward, dw, tr, _ = env.step(a_in)
+                    episode_reward += reward
+                    done = dw | tr
+                    if done.any():
+                        total_episode_reward += episode_reward[done].sum().item()
+                        num_done += done.sum().item()
+                        num_collision += (env.collide_vec & done).sum().item()
+                        num_goal += (env.win_vec & done).sum().item()
+                        episode_reward[done] = 0
+    finally:
+        np.random.set_state(numpy_state)
+    avg_reward = total_episode_reward / max(num_done, 1)
     collision_rate = num_collision / max(num_done, 1)
     goal_rate = num_goal / max(num_done, 1)
     return avg_reward, collision_rate, goal_rate
@@ -174,7 +185,7 @@ if not os.path.exists(args.results_dir):
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 
-env = SparrowCspaceEnv(
+env_kwargs = dict(
     N=N_ENVS,
     O=N_OBSTACLES,
     dvc=settings.device,
@@ -182,13 +193,16 @@ env = SparrowCspaceEnv(
     stuck_reset=settings.SPARROW_STUCK_RESET,
     stuck_threshold=settings.SPARROW_STUCK_THRESHOLD,
     ld_acc=settings.SPARROW_LD_ACC,
-    global_plan=settings.GLOBAL_PLAN_ENABLED,
+    random_footprint=settings.RANDOM_FOOTPRINT_ENABLED,
     render_mode="human" if RENDER else None,
     render_speed=RENDER_SPEED,
     ri=RENDER_ENV,
     max_ep_steps=settings.MAX_STEPS,
-    cspace_cfg={"cost_ray_num_intervals": RAY_CHANNELS},
+    cspace_cfg={"cost_ray_num_intervals": RAY_CHANNELS,
+                "backend": args.backend},
 )
+env = SparrowCspaceEnv(**env_kwargs)
+eval_env = SparrowCspaceEnv(**{**env_kwargs, "render_mode": None})
 
 if RENDER:
     pygame.font.init()
@@ -314,7 +328,7 @@ while total_steps < args.steps:
 
     # periodic evaluation + save
     if total_steps % EVAL_EVERY_STEPS == 0:
-        avg_reward, avg_col, avg_goal = evaluate(network, env)
+        avg_reward, avg_col, avg_goal = evaluate(network, eval_env)
         evaluations.append(avg_reward)
         network.log_eval(epoch, avg_reward, avg_col, avg_goal)
         if save_model:
@@ -329,7 +343,7 @@ while total_steps < args.steps:
 # ---------------------------------------------------------------------------
 # Final save
 # ---------------------------------------------------------------------------
-avg_reward, avg_col, avg_goal = evaluate(network, env)
+avg_reward, avg_col, avg_goal = evaluate(network, eval_env)
 evaluations.append(avg_reward)
 network.log_eval(epoch, avg_reward, avg_col, avg_goal)
 if save_model:

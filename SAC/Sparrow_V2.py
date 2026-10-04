@@ -11,14 +11,14 @@ import math
 import settings
 from cspace_cost_rays import (
     make_footprint_masks,
+    make_rectangle_union_masks,
     build_cspace,
     cost_ray_intervals_3d,
     preprocess_cost_ray_intervals,
-)
-from global_planner import (
-    GraphPlanner,
-    build_world_occ_grid,
-    draw_planned_path,
+    rectangles_to_polygons,
+    footprint_constraints,
+    footprint_constraint_batch,
+    pointset_batch,
 )
 
 
@@ -324,8 +324,7 @@ class Sparrow():
                     pygame.draw.line(self.Static_obs_canvas, (1, 1, 1), cdnts[0,i,j], cdnts[1,i,j], width=2*self.Obs_R)
 
         obs_np = pygame.surfarray.array3d(self.Static_obs_canvas)[:, :, 0]
-        # 完整障碍位图（含边界线）持久化，供全局规划器构建 c-space 使用；
-        # 之后 obs_np 被原地改成轮廓线（obs_np -= b_obs_np），所以在这里先保存一份真值。
+        # 保存完整障碍位图；之后 obs_np 被原地改成轮廓线。
         self.world_occ_full = obs_np > 0   # (window_size, window_size) bool, 1cm, 每帧 reset 重新生成
         b_obs_np = ndimage.binary_erosion(obs_np, self.b_kernel).astype(obs_np.dtype)  # 腐蚀障碍物图像
         obs_np -= b_obs_np  # 减去腐蚀图像，提取轮廓线
@@ -421,6 +420,20 @@ class Sparrow():
 
         rect = torch.cartesian_prod(torch.arange(x_min, x_max), torch.arange(y_min, y_max)) # (X,2)
         rect_code = (rect[:,0]*self.window_size + rect[:,1]).unsqueeze(-1).to(self.dvc) # (X*2,1)
+
+        if getattr(self, "cross_wall", False):
+            codes = rect_code.squeeze(-1).long()
+            static_hit = ((self.base_occ_flat[codes] &
+                           ~self.wall_clear_flat[N, codes]) |
+                          self.wall_occ_flat[N, codes]).any()
+            if static_hit:
+                return True
+            if self.O > 0:
+                dynamic_codes = (self.vec_dynamic_obs_P_shaped[N, :, 0, 0] *
+                                 self.window_size +
+                                 self.vec_dynamic_obs_P_shaped[N, :, 1, 0])
+                return bool((codes[:, None] == dynamic_codes[None, :]).any())
+            return False
 
         return ((rect_code - self.vec_bound_code[N])==0).any() # (X*2,1)-(1,O1*P1+O2*P2+O3*P3)
 
@@ -576,7 +589,11 @@ class Sparrow():
             # 更新雷达末端位置
             code = self.ld_end_code                          # 当前端点编码, (N,ld_num), dtype与原来一致
             in_win = (code >= 0) & (code < self.w2)          # 越界端点不可能是障碍物集合成员 => 保持"自由/继续扫"
-            hit = self.base_occ_flat[code.clamp(0, self.w2 - 1).long()]  # 1D图按2D索引 gather -> (N,ld_num) bool, 静态∪地图命中
+            safe_code = code.clamp(0, self.w2 - 1).long()
+            hit = self.base_occ_flat[safe_code]  # shared static and map occupancy
+            if getattr(self, "cross_wall", False):
+                hit = (hit & ~self.wall_clear_flat.gather(1, safe_code)) | \
+                    self.wall_occ_flat.gather(1, safe_code)
             if has_dyn:                                       # 动态障碍物命中(仅当存在), 集合比对保持与旧实现一致
                 hit = hit | (code[:, :, None] == dyn_code[:, None, :]).any(dim=-1)
             goon = ~(in_win & hit)                            # 与旧实现的 goon 语义一致: 扫到障碍即停
@@ -599,6 +616,8 @@ class Sparrow():
         self.exceed_vec = self.d2target_now > self.D # (N,)
         self.win_vec = self.d2target_now < self.target_area # (N,)
         self.collide_vec = (self.ld_result_grouped < self.collision_trsd).any(dim=-1)  # (N,)
+        if not getattr(self, "circle_collision_enabled", True):
+            self.collide_vec.zero_()
         self.dw_vec = self.exceed_vec + self.win_vec #+ self.collide_vec # terminated signal (N,)
         self.done_vec = self.tr_vec + self.dw_vec # (N,), used for AutoReset
 
@@ -754,6 +773,13 @@ class Sparrow():
         The ogm can be rendered via 'plt.imshow(self.ogm)' """
         return self.ogm # (window_size, window_size, 3)
 
+    def _draw_wall_overlay(self):
+        """Draw this environment's wall on the obstacle canvas."""
+        if getattr(self, "cross_wall", False):
+            pixels = pygame.surfarray.pixels3d(self.canvas)
+            pixels[self.wall_occ_cpu[self.ri]] = (1, 1, 1)
+            del pixels
+
     def _draw_robot(self):
         """Draw the robot body + heading line onto `self.canvas`.
 
@@ -810,9 +836,12 @@ class Sparrow():
         self.obs_canvas_torch.fill_(255)
         if self.MapObs: self.obs_canvas_torch[self.vec_map_obs_P_shaped[self.ri,:,0],self.vec_map_obs_P_shaped[self.ri,:,1]] = 0
         self.obs_canvas_torch[self.vec_static_obs_P_shaped[self.ri,:,0],self.vec_static_obs_P_shaped[self.ri,:,1]] = 0
+        if getattr(self, "cross_wall", False):
+            self.obs_canvas_torch[torch.from_numpy(self.wall_clear_cpu[self.ri])] = 255
         self.obs_canvas_torch[self.vec_dynamic_obs_P_shaped[self.ri,:,0],self.vec_dynamic_obs_P_shaped[self.ri,:,1]] = 105 #101, 104, 105
         obstacles = pygame.surfarray.make_surface(self.obs_canvas_torch.numpy())
         self.canvas.blit(obstacles, self.canvas.get_rect())
+        self._draw_wall_overlay()
         self.ogm = np.transpose(np.array(pygame.surfarray.pixels3d(self.canvas)), axes=(1, 0, 2))  # occupied grid maps
 
         # draw auxiliary information
@@ -830,12 +859,12 @@ class Sparrow():
         self._draw_lidar_rays()
 
         # draw collision threshold on canvas
-        pygame.draw.circle(
-            self.canvas,
-            (64,64,64),
-            self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
-            self.collision_trsd,
-        )
+        if getattr(self, "circle_collision_enabled", True):
+            pygame.draw.circle(
+                self.canvas, (64,64,64),
+                self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
+                self.collision_trsd,
+            )
 
         # draw robot body + orientation (circle by default; footprint polygon for c-space envs)
         self._draw_robot()
@@ -938,6 +967,8 @@ class Sparrow_PlayGround(Sparrow):
         """只计算是否到达，是否碰撞"""
         self.win_vec = self.d2target_now < self.target_area # (N,)
         self.collide_vec = (self.ld_result_grouped < self.collision_trsd).any(dim=-1)  # (N,)
+        if not getattr(self, "circle_collision_enabled", True):
+            self.collide_vec.zero_()
         self.dw_vec = self.win_vec #+ self.collide_vec # terminated signal (N,)
 
     def step(self,current_a):
@@ -1031,9 +1062,12 @@ class Sparrow_PlayGround(Sparrow):
         self.obs_canvas_torch.fill_(255)
         if self.MapObs: self.obs_canvas_torch[self.vec_map_obs_P_shaped[self.ri,:,0],self.vec_map_obs_P_shaped[self.ri,:,1]] = 0
         self.obs_canvas_torch[self.vec_static_obs_P_shaped[self.ri,:,0],self.vec_static_obs_P_shaped[self.ri,:,1]] = 0
+        if getattr(self, "cross_wall", False):
+            self.obs_canvas_torch[torch.from_numpy(self.wall_clear_cpu[self.ri])] = 255
         self.obs_canvas_torch[self.vec_dynamic_obs_P_shaped[self.ri,:,0],self.vec_dynamic_obs_P_shaped[self.ri,:,1]] = 105 #101, 104, 105
         obstacles = pygame.surfarray.make_surface(self.obs_canvas_torch.numpy())
         self.canvas.blit(obstacles, self.canvas.get_rect())
+        self._draw_wall_overlay()
         self.ogm = np.transpose(np.array(pygame.surfarray.pixels3d(self.canvas)), axes=(1, 0, 2))  # occupied grid maps
 
 
@@ -1041,12 +1075,12 @@ class Sparrow_PlayGround(Sparrow):
         self._draw_lidar_rays()
 
         # draw collision threshold on canvas
-        pygame.draw.circle(
-            self.canvas,
-            (64,64,64),
-            self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
-            self.collision_trsd,
-        )
+        if getattr(self, "circle_collision_enabled", True):
+            pygame.draw.circle(
+                self.canvas, (64,64,64),
+                self._world_2_grid(self.car_state[self.ri,0:2]).cpu().numpy(),
+                self.collision_trsd,
+            )
 
         # draw robot body + orientation (circle by default; footprint polygon for c-space envs)
         self._draw_robot()
@@ -1088,9 +1122,7 @@ class Sparrow_PlayGround(Sparrow):
                 self._handle_click(np.array(pygame.mouse.get_pos()))
 
     def _handle_click(self, xy):
-        '''Handle a mouse click in the playground window.
-        默认行为：直接把点击点追加为航点（若在最大局部规划阈值内）。
-        子类（如 SparrowCspacePlayground）可覆写为「点击 → 全局规划 → 整条路径入队」。'''
+        '''Handle a mouse click by adding a waypoint within the local distance limit.'''
         distance = np.linalg.norm(xy - self.waypoints[-1])
         if distance > self.D:
             print("Distance exceeds maximal local planning threshold!")
@@ -1137,9 +1169,9 @@ observation live in a single module.
 #           rel_y = (dx*sin_t + dy*cos_t) / 100
 #       where (dx,dy) = point - robot (cm), t = robot heading, forward = (cos t, -sin t).
 #       The robot frame +x is the robot's forward, +y its left (verified).
-#     - The robot footprint is a thin rectangle (settings.ROBOT_FOOTPRINT, long
-#       axis along +x = forward) for the observation / cost rays; Sparrow's actual
-#       collision remains its `collision_trsd = car_radius + 5` cm circle.  Override
+#     - The robot footprint defaults to settings.ROBOT_FOOTPRINT. Training can
+#       randomize a union of centered rectangles for each environment and episode.
+#       C-space collisions use the active footprint. Override the fixed shape
 #       via `cspace_cfg={'footprint': [[x,y], ...]}` (metres).
 #
 # The obstacle occupancy grid is rasterised from the robot's *lidar* hit points
@@ -1167,6 +1199,10 @@ SPARROW_CSPACE_CFG = dict(
     cost_ray_num_beams=settings.CSPACE_COST_RAY_NUM_BEAMS,
     cost_ray_h_res_degrees=settings.CSPACE_COST_RAY_H_RES_DEGREES,
     cost_ray_num_intervals=settings.CSPACE_COST_RAY_NUM_INTERVALS,
+    # 观测的几何后端："grid"（栅格 + conv 膨胀）或 "points"（激光点集 + 解析
+    # 闵可夫斯基半平面）。两者输出同形状同语义的 (N,C,B,nz) 区间张量，所以
+    # 切换后端不改观测维数、不改网络结构，但**会改变策略看到的世界**。
+    backend=settings.CSPACE_BACKEND,
 )
 
 
@@ -1184,13 +1220,11 @@ class SparrowCspaceEnv(Sparrow):
 
     def __init__(self, **params):
         cspace_cfg = params.pop("cspace_cfg", None)
+        self.random_footprint = params.pop("random_footprint", False)
+        self.cross_wall = params.pop("cross_wall", settings.SPARROW_CROSS_WALL)
         self.cspace_cfg = dict(SPARROW_CSPACE_CFG)
         if cspace_cfg:
             self.cspace_cfg.update(cspace_cfg)
-
-        # 全局规划引导（"Planning on the Graph"）：开启后每个 env 沿一条全局路径的
-        # 航点推进，state 的 distance/heading 与 reward shaping 相对当前航点而非真目标。
-        self.global_plan = bool(params.pop("global_plan", settings.GLOBAL_PLAN_ENABLED))
 
         params.setdefault("action_type", "Continuous")
         params.setdefault("render_mode", None)
@@ -1212,46 +1246,88 @@ class SparrowCspaceEnv(Sparrow):
             int(round(self.cspace_cfg["cost_ray_max_range"] * 100.0)),
         )
         super().__init__(**params)
+        self.circle_collision_enabled = False
 
         # 关闭 _render_frame 内部的 pygame.display.update()（手动 flush），由
         # play_cspace 主循环在所有叠加层绘制完成后统一 flush 一次，避免叠加层闪动。
         self.manual_flip = True
 
-        # 全局规划引导状态：共享一张静态 c-space 图（N 个 env 障碍物相同），
-        # 每 env 一条航点序列 plan_poses[i]（(x,y,θ) 列表）+ 当前航点下标 plan_idx[i]。
-        self.wp_reach_cm = settings.PLANNER_WP_REACH_CM
-        self.plan_poses = [None] * self.N          # None -> 无引导（直接追真目标）
-        self.plan_idx = [0] * self.N
-        if self.global_plan:
-            # 规划器足迹默认 28x28cm（≈碰撞圆），与观测用的大足迹(settings.ROBOT_FOOTPRINT)
-            # 不同——1.2m 足迹会挡住 > 一半地图。见 global_planner 模块 docstring。
-            self.planner = GraphPlanner(
-                g_min=settings.PLANNER_G_MIN,
-                nz=settings.PLANNER_NZ,
-                a=settings.PLANNER_A,          # 全局 θ 分辨率独立于局部观测的 cspace_cfg["a"]
-                footprint=settings.PLANNER_FOOTPRINT,
-                stride_ij=settings.PLANNER_STRIDE_IJ,
-                stride_k=settings.PLANNER_STRIDE_K,
-                connect_dist_cm=settings.PLANNER_CONNECT_DIST_CM,
-                min_wp_spacing_cm=settings.PLANNER_MIN_WP_SPACING_CM,
-            )
-        else:
-            self.planner = None
-
         # footprint: from settings (rectangular footprint) unless overridden
         self.cspace_cfg.setdefault("footprint", settings.ROBOT_FOOTPRINT)
 
-        # one-time footprint masks + grid geometry
-        self._cspace_masks = torch.as_tensor(
-            make_footprint_masks(
-                self.cspace_cfg["g_min"],
-                self.cspace_cfg["a"],
-                self.cspace_cfg["nz"],
-                self.cspace_cfg["footprint"],
-            ),
-            dtype=torch.float32,
-            device=self.dvc,
-        )
+        self.footprint_rectangles = [None] * self.N
+        # c-space 观测的几何后端（见 SPARROW_CSPACE_CFG 的 backend 说明）：
+        #   grid   —— 需要光栅化 footprint（_cspace_masks）
+        #   points —— 需要解析边表（_fp_nrm/_fp_h/_fp_c），完全不需要栅格
+        self.cspace_backend = self.cspace_cfg["backend"]
+        if self.cspace_backend not in ("grid", "points"):
+            raise ValueError("unknown c-space backend: %r" % (self.cspace_backend,))
+        self._pointset = self.cspace_backend == "points"
+        # 足迹多边形是单一真源，`footprint_polygons[i]` 恒为**多边形列表**：
+        # 固定足迹取 settings.ROBOT_FOOTPRINT 的顶点（一块），随机足迹由
+        # _randomize_footprint 逐环境重写（1..3 块）。
+        self.footprint_polygons = [None] * self.N
+        if self.cross_wall:
+            self.wall_occ_flat = torch.zeros((self.N, self.w2), dtype=torch.bool,
+                                             device=self.dvc)
+            self.wall_clear_flat = torch.zeros_like(self.wall_occ_flat)
+            self.wall_occ_cpu = [None] * self.N
+            self.wall_clear_cpu = [None] * self.N
+            self.wall_origin = [None] * self.N
+            self.wall_tangent = [None] * self.N
+            self.wall_normal = [None] * self.N
+            self.wall_angle = [None] * self.N
+            self.wall_openings = [None] * self.N
+            self.wall_gap_cm = [None] * self.N
+            self.wall_projection_cm = [None] * self.N
+            self.wall_start_offset = min(settings.SPARROW_WALL_START_OFFSET_CM,
+                                         int(0.18 * self.window_size))
+            self._wall_grid_x, self._wall_grid_y = np.indices(
+                (self.window_size, self.window_size), dtype=np.float32)
+        if self.random_footprint:
+            max_length = settings.RANDOM_FOOTPRINT_LENGTH[1]
+            max_width = settings.RANDOM_FOOTPRINT_WIDTH[1]
+            radius = math.hypot(max_length, max_width) / 2
+            self._footprint_half = int(math.ceil(radius / self.cspace_cfg["g_min"])) + 1
+            if self._pointset:
+                # Padded table: every env can draw up to RANDOM_FOOTPRINT_COUNT[1]
+                # pieces, and missing pieces must read as "no piece" (see
+                # footprint_constraint_batch).  Filled in by _randomize_footprint.
+                p_max = settings.RANDOM_FOOTPRINT_COUNT[1]
+                self._fp_nrm = torch.zeros(
+                    (self.N, p_max, 4, 2), dtype=torch.float32, device=self.dvc)
+                self._fp_h = -torch.ones(
+                    (self.N, p_max, 4), dtype=torch.float32, device=self.dvc)
+                self._fp_c = torch.zeros(
+                    (self.N, p_max, self.cspace_cfg["cost_ray_num_beams"],
+                     self.cspace_cfg["nz"], 4),
+                    dtype=torch.float32, device=self.dvc)
+            else:
+                self._cspace_masks = torch.empty(
+                    self.N, self.cspace_cfg["nz"],
+                    2 * self._footprint_half + 1, 2 * self._footprint_half + 1,
+                    dtype=torch.float32, device=self.dvc,
+                )
+        elif self._pointset:
+            # One shared footprint for every env: build the edge table once and
+            # let the point-set functions broadcast it over the env axis.
+            fixed = [np.asarray(self.cspace_cfg["footprint"], dtype=np.float64)]
+            self.footprint_polygons = [fixed] * self.N
+            self._fp_nrm, self._fp_h, self._fp_c = footprint_constraints(
+                fixed,
+                num_beams=self.cspace_cfg["cost_ray_num_beams"],
+                nz=self.cspace_cfg["nz"],
+                a=self.cspace_cfg["a"],
+                h_res_degrees=self.cspace_cfg["cost_ray_h_res_degrees"],
+                device=self.dvc,
+            )
+        else:
+            self._cspace_masks = torch.as_tensor(
+                make_footprint_masks(
+                    self.cspace_cfg["g_min"], self.cspace_cfg["a"],
+                    self.cspace_cfg["nz"], self.cspace_cfg["footprint"],
+                ), dtype=torch.float32, device=self.dvc,
+            )
         self._cR = int(math.ceil(
             self.cspace_cfg["cost_ray_max_range"] / self.cspace_cfg["g_min"]
         )) + 2
@@ -1270,110 +1346,166 @@ class SparrowCspaceEnv(Sparrow):
             + settings.KINEMATIC_DIM
         )
 
-    # --------------------------------------------- global-plan helpers
-    def _rebuild_planner(self):
-        """重建共享的静态 c-space 图（world_occ_full 在 reset() 中已更新）。
-
-        障碍物只在完整 reset() 时重新随机，因此训练期间图只建一次；
-        done/stuck 触发的逐 env 重规划只调 plan()（毫秒级），不重建图。
-        """
-        if not self.global_plan:
+    def _randomize_footprint(self, i):
+        """Draw one episode footprint and replace only environment i's geometry."""
+        if not self.random_footprint:
             return
-        occ = build_world_occ_grid(self, self.planner.g_min)
-        self.planner.build_graph(occ)
-
-    def _plan_intermediate_mask(self):
-        """(N,) bool：该 env 当前处于 plan 的中间航点（非 None 且非末点）。"""
-        if not self.global_plan:
-            return torch.zeros(self.N, dtype=torch.bool, device=self.dvc)
-        return torch.tensor(
-            [bool(self.plan_poses[i]) and self.plan_idx[i] < len(self.plan_poses[i]) - 1
-             for i in range(self.N)],
-            dtype=torch.bool, device=self.dvc,
+        count = np.random.randint(settings.RANDOM_FOOTPRINT_COUNT[0],
+                                  settings.RANDOM_FOOTPRINT_COUNT[1] + 1)
+        rectangles = [
+            (np.random.uniform(*settings.RANDOM_FOOTPRINT_LENGTH),
+             np.random.uniform(*settings.RANDOM_FOOTPRINT_WIDTH),
+             np.random.uniform(*settings.RANDOM_FOOTPRINT_ANGLE))
+            for _ in range(count)
+        ]
+        self.footprint_rectangles[i] = rectangles
+        self.footprint_polygons[i] = rectangles_to_polygons(rectangles)
+        if self._pointset:
+            # Rebuild env i's edge table only (h is rotation-invariant, but the
+            # footprint itself changed, so c follows it).  The table is sized for
+            # the maximum piece count, so refill the whole row: pieces this
+            # episode did not draw go back to the zero-normal / h=-1 sentinel.
+            nrm, h, c = footprint_constraint_batch(
+                self.footprint_polygons[i:i + 1],
+                num_beams=self.cost_ray_num_beams, nz=self.cspace_cfg["nz"],
+                a=self.cspace_cfg["a"],
+                h_res_degrees=self.cspace_cfg["cost_ray_h_res_degrees"],
+                device=self.dvc,
+            )
+            pieces = nrm.shape[1]
+            self._fp_nrm[i].zero_()
+            self._fp_h[i].fill_(-1.0)
+            self._fp_c[i].zero_()
+            self._fp_nrm[i, :pieces].copy_(nrm[0])
+            self._fp_h[i, :pieces].copy_(h[0])
+            self._fp_c[i, :pieces].copy_(c[0])
+            return
+        masks = make_rectangle_union_masks(
+            self.cspace_cfg["g_min"], self.cspace_cfg["a"],
+            self.cspace_cfg["nz"], rectangles, self._footprint_half,
         )
+        self._cspace_masks[i].copy_(torch.from_numpy(masks))
 
-    def _advance_env_waypoint(self, i):
-        """若机器人距当前航点 < wp_reach_cm 且非末点，推进到下一航点。
-
-        wp_reach_cm(60) > target_area(30)，所以中间航点几乎不会被 win 命中，
-        而是在到达前就切到下一航点；win 只可能在真目标(末点)处触发。
-        """
-        pp = self.plan_poses[i]
-        if pp is None:
-            return
-        wp = self.wp_reach_cm
-        while self.plan_idx[i] < len(pp) - 1:
-            cur = self.target_point[i]
-            d = (self.car_state[i, 0:2] - cur).pow(2).sum().pow(0.5).item()
-            if d < wp:
-                self.plan_idx[i] += 1
-                nxt = pp[self.plan_idx[i]]
-                self.target_point[i] = torch.tensor([nxt[0], nxt[1]], device=self.dvc)
-            else:
-                break
-
-    def _advance_waypoints(self):
-        """步首：对所有 env 按当前位姿推进航点（仅 global_plan 模式）。"""
-        if self.global_plan:
+    def _static_obstacle_init(self):
+        super()._static_obstacle_init()
+        if self.cross_wall:
             for i in range(self.N):
-                self._advance_env_waypoint(i)
+                self._refresh_wall(i)
 
-    def _replan(self, i):
-        """对第 i 个 env 重新规划：从当前位姿到真目标，取航点序列。
-
-        `plan()` 的起点/终点是临时顶点（用后即删），不会让图随重规划无界增长。
-        无可行路径时回退无引导（target_point 保持真目标）。
-        """
-        if not self.global_plan:
+    def _refresh_wall(self, i):
+        """Regenerate a wall whose opening fits the footprint's lateral projection."""
+        if not self.cross_wall:
             return
-        car = self.car_state[i]
-        goal = self.target_point[i]                       # 真目标（_target_point_init / _AutoReset 设定）
-        res = self.planner.plan(
-            (float(car[0]), float(car[1]), float(car[2])),
-            (float(goal[0]), float(goal[1]), None),       # goal 朝向任意
-        )
-        if res is None or len(res.poses) < 2:
-            self.plan_poses[i] = None
-            self.plan_idx[i] = 0
-            return
-        self.plan_poses[i] = res.poses
-        self.plan_idx[i] = 1
-        nxt = res.poses[1]
-        self.target_point[i] = torch.tensor([nxt[0], nxt[1]], device=self.dvc)
-        self._advance_env_waypoint(i)                     # 跳过头几个过近的航点
+        if self.random_footprint:
+            projection_cm = 100.0 * max(
+                abs(length * math.sin(rect_angle))
+                + abs(width * math.cos(rect_angle))
+                for length, width, rect_angle in self.footprint_rectangles[i]
+            )
+            radius = 50.0 * max(
+                math.hypot(length, width)
+                for length, width, _ in self.footprint_rectangles[i]
+            )
+        else:
+            vertices = np.asarray(self.cspace_cfg["footprint"], dtype=float)
+            projection_cm = 100.0 * (vertices[:, 1].max() - vertices[:, 1].min())
+            radius = 100.0 * np.linalg.norm(vertices, axis=1).max()
+        gap = int(math.ceil(projection_cm + settings.SPARROW_WALL_GAP_EXTRA_CM))
+        angle = np.random.uniform(0.0, math.pi)
+        tangent = np.array([math.cos(angle), math.sin(angle)], dtype=np.float32)
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
+        origin = np.array([self.window_size / 2, self.window_size / 2],
+                          dtype=np.float32) + np.random.uniform(-20, 20, size=2)
+        half_span = (self.window_size / 2 - 30) / max(abs(tangent))
+        count = settings.SPARROW_WALL_OPENINGS
+        spacing = 2 * half_span / (count + 1)
+        if count < 2 or gap >= spacing:
+            raise ValueError("Window is too small for the current footprint and wall openings")
+        jitter = min(settings.SPARROW_WALL_OPENING_JITTER_CM,
+                     (spacing - gap) / 3)
+        centers = [
+            (j + 1) * spacing - half_span + np.random.uniform(
+                -jitter, jitter)
+            for j in range(count)
+        ]
+        openings = [(center - gap / 2, center + gap / 2)
+                    for center in centers]
 
-    def _replan_after_reset(self, dw, tr, stuck):
-        """对触发重置的 env（done / stuck）重新规划。
+        dx = self._wall_grid_x - origin[0]
+        dy = self._wall_grid_y - origin[1]
+        along = dx * tangent[0] + dy * tangent[1]
+        across = dx * normal[0] + dy * normal[1]
+        wall = abs(across) <= settings.SPARROW_WALL_THICKNESS_CM / 2
+        clear = np.zeros_like(wall)
+        for center in centers:
+            distance = abs(along - center)
+            wall &= distance >= gap / 2
+            clear |= ((distance <= gap / 2 + radius + 100) &
+                      (abs(across) <= self.wall_start_offset + radius + 60))
 
-        这些 env 的位姿或真目标已被重置（_AutoReset / _reset_env），需要新的航点序列。
-        """
-        if not self.global_plan:
-            return
-        reset_mask = torch.zeros(self.N, dtype=torch.bool, device=self.dvc)
-        for m in (dw, tr, stuck):
-            if m is not None:
-                reset_mask = reset_mask | m
-        for i in reset_mask.nonzero(as_tuple=False).squeeze(-1).tolist():
-            self._replan(i)
+        self.wall_occ_cpu[i] = wall
+        self.wall_clear_cpu[i] = clear
+        self.wall_occ_flat[i].copy_(torch.from_numpy(wall.reshape(-1)))
+        self.wall_clear_flat[i].copy_(torch.from_numpy(clear.reshape(-1)))
+        self.wall_origin[i] = origin
+        self.wall_tangent[i] = tangent
+        self.wall_normal[i] = normal
+        self.wall_angle[i] = angle
+        self.wall_openings[i] = openings
+        self.wall_gap_cm[i] = gap
+        self.wall_projection_cm[i] = projection_cm
 
-    def _reward_function(self, current_a):
-        """Base 奖励 + global-plan 中间航点的 win 门控。
+    def _car_loc_init(self, i):
+        """Place the robot near one opening, on either side of the wall."""
+        if not self.cross_wall:
+            return super()._car_loc_init(i)
+        for _ in range(1000):
+            left, right = self.wall_openings[i][
+                np.random.randint(len(self.wall_openings[i]))]
+            side = np.random.choice((-1, 1))
+            along = (left + right) / 2 + np.random.randint(-50, 51)
+            across = side * self.wall_start_offset + np.random.randint(-20, 21)
+            x, y = np.rint(self.wall_origin[i] +
+                           along * self.wall_tangent[i] +
+                           across * self.wall_normal[i]).astype(int)
+            margin = 4 * self.car_radius
+            if not (margin <= x < self.window_size - margin and
+                    margin <= y < self.window_size - margin):
+                continue
+            if not self._rect_in_bound(i, x, y, 4 * self.car_radius):
+                loc = torch.tensor([x, y], device=self.dvc)
+                self.car_state[i, 0:2] = loc
+                return loc
+        raise RuntimeError("Cannot place robot near a wall opening")
 
-        中间航点到达时不结束 episode、也不给 AWARD（航点推进由 _advance_waypoints
-        在 wp_reach_cm>target_area 处提前完成，win 几乎只在真目标处触发；这里是
-        防止航点过密等边角情形下的提前获胜）。
-        """
-        super()._reward_function(current_a)
-        if not self.global_plan:
-            return
-        mid = self._plan_intermediate_mask()
-        mid_win = self.win_vec & mid
-        if mid_win.any():
-            self.reward_vec = self.reward_vec.clone()
-            self.reward_vec[mid_win] = 0.0
-            self.win_vec = self.win_vec & ~mid_win
-            self.dw_vec = self.dw_vec & ~mid_win
-            self.done_vec = self.done_vec & ~mid_win
+    def _target_point_init(self, i):
+        """Place the goal across the wall, near the closest opening."""
+        if not self.cross_wall:
+            return super()._target_point_init(i)
+        car = np.asarray(self.car_state[i, 0:2].tolist())
+        relative = car - self.wall_origin[i]
+        car_along = float(relative @ self.wall_tangent[i])
+        car_across = float(relative @ self.wall_normal[i])
+        openings = sorted(self.wall_openings[i],
+                          key=lambda opening: abs(car_along - sum(opening) / 2))
+        side = -1 if car_across > 0 else 1
+        for attempt in range(2000):
+            left, right = openings[0 if attempt < 1000 else attempt % len(openings)]
+            along = (left + right) / 2 + np.random.randint(-75, 76)
+            across = side * self.wall_start_offset + np.random.randint(-35, 36)
+            x, y = np.rint(self.wall_origin[i] +
+                           along * self.wall_tangent[i] +
+                           across * self.wall_normal[i]).astype(int)
+            margin = self.target_area + self.car_radius
+            if not (margin <= x < self.window_size - margin and
+                    margin <= y < self.window_size - margin):
+                continue
+            if math.hypot(x - car[0], y - car[1]) >= self.D:
+                continue
+            if not self._rect_in_bound(i, x, y, self.target_area + self.car_radius):
+                self.target_point[i] = torch.tensor([x, y], device=self.dvc)
+                return x, y
+        raise RuntimeError("Cannot place goal across a wall opening")
 
     # ------------------------------------------------------------------ utils
     def _heading_error(self):
@@ -1461,6 +1593,54 @@ class SparrowCspaceEnv(Sparrow):
                    + free_j[free_inb]] = True
         return occ, known_flat.view(self.N, G, G)
 
+    def _lidar_hits_robot(self):
+        """Lidar hit points in the robot frame (m), shape (N, ld_num, 2).
+
+        The same conversion `_build_occ_grid` uses (world cm -> robot frame m),
+        so the points live in exactly the frame the cost-ray beams are cast in.
+        Beams that returned nothing are pushed far outside the observation
+        window rather than left at the sensor's maximum range: `ld_scan_result`
+        clamps a no-return beam to `ld_d_range`, and keeping it there would
+        fabricate an obstacle at the edge of the window.
+        """
+        hit = self.ld_scan_result < self.ld_d_range               # (N, ld_num)
+        hit_pts = (
+            self.car_state[:, None, 0:2]
+            + self.ld_scan_result[:, :, None] * self.ld_vectors_wd
+        )
+        dx = hit_pts[:, :, 0] - self.car_state[:, 0, None]
+        dy = hit_pts[:, :, 1] - self.car_state[:, 1, None]
+        cos_t = torch.cos(self.car_state[:, 2])[:, None]
+        sin_t = torch.sin(self.car_state[:, 2])[:, None]
+        rel_x = (dx * cos_t - dy * sin_t) / 100.0
+        rel_y = (dx * sin_t + dy * cos_t) / 100.0
+        # 10x the sensor range: a contact with such a point starts at least
+        # 10*ld_d_range - (footprint radius) away, far outside the window, so
+        # those beams read "clear" instead of "obstacle at max_range".
+        keep = torch.where(hit, torch.ones_like(rel_x),
+                           torch.full_like(rel_x, 10.0))
+        return torch.stack((rel_x * keep, rel_y * keep), dim=-1)
+
+    def _pointset_intervals(self):
+        """Analytic (entry, width) intervals and collision, from lidar points.
+
+        Returns ``cost_intervals (N, C, B, nz)`` in metres -- the same tensor the
+        grid backend produces -- plus the collision flag, so everything
+        downstream of `_get_cspace_state` is backend-agnostic.
+        """
+        cfg = self.cspace_cfg
+        entry, width, collide = pointset_batch(
+            self._lidar_hits_robot(), self._fp_nrm, self._fp_h, self._fp_c,
+            cfg["a"], cfg["cost_ray_max_range"],
+        )                                                          # (N,B,nz) m
+        channels = [entry, width]
+        # A configured interval count above 2 is degenerate for this backend: no
+        # meaningful "second gap" exists once obstacles are points. Report an
+        # empty one, like the grid path does when it has no second interval.
+        while len(channels) < self.cost_ray_num_intervals:
+            channels.append(torch.zeros_like(entry))
+        return torch.stack(channels, dim=1), collide
+
     def _get_cspace_state(self, current_a):
         """Build the configurable ray-segment CNN state.
 
@@ -1472,16 +1652,24 @@ class SparrowCspaceEnv(Sparrow):
         deliberately not part of the observation.
         """
         cfg = self.cspace_cfg
-        occ, known_free = self._build_occ_grid()
-        cspace = build_cspace(occ, self._cspace_masks, known_free)
-        cost_intervals = cost_ray_intervals_3d(
-            cspace, self._robot_cell,
-            num_beams=cfg["cost_ray_num_beams"],
-            h_res_deg=cfg["cost_ray_h_res_degrees"],
-            max_range=cfg["cost_ray_max_range"],
-            g_min=cfg["g_min"],
-            num_intervals=cfg["cost_ray_num_intervals"],
-        )                                                          # (N,C,B,nz) m
+        if self._pointset:
+            cost_intervals, collision = self._pointset_intervals()
+            # No grid exists on this path; the renderers that want one are
+            # short-circuited on None rather than fed a fake.
+            occ = known_free = cspace = None
+        else:
+            occ, known_free = self._build_occ_grid()
+            cspace = build_cspace(occ, self._cspace_masks, known_free)
+            collision = cspace[:, self._cR, self._cR, 0]
+            cost_intervals = cost_ray_intervals_3d(
+                cspace, self._robot_cell,
+                num_beams=cfg["cost_ray_num_beams"],
+                h_res_deg=cfg["cost_ray_h_res_degrees"],
+                max_range=cfg["cost_ray_max_range"],
+                g_min=cfg["g_min"],
+                num_intervals=cfg["cost_ray_num_intervals"],
+            )                                                      # (N,C,B,nz) m
+        self.footprint_collision = collision.clone()
         # Preserve boundary-style attributes for stuck detection and rendering.
         self.cost_ray_enter_raw = cost_intervals[:, 0].detach()    # (N,B,nz) m
         self.cost_ray_width_raw = (
@@ -1501,9 +1689,11 @@ class SparrowCspaceEnv(Sparrow):
             self.cost_ray_exit_raw + self.cost_ray_second_gap_raw
         ).clamp_max(cfg["cost_ray_max_range"])
         self.cost_rays_raw = self.cost_ray_enter_raw
-        self.occ_grid = occ.detach()                               # (N,G,G) bool
-        self.known_free_grid = known_free.detach()                  # (N,G,G) bool
-        self.cspace = cspace.detach()                              # (N,G,G,nz) bool
+        self.occ_grid = None if occ is None else occ.detach()       # (N,G,G) bool
+        self.known_free_grid = (
+            None if known_free is None else known_free.detach()
+        )                                                           # (N,G,G) bool
+        self.cspace = None if cspace is None else cspace.detach()   # (N,G,G,nz) bool
         cr_proc = preprocess_cost_ray_intervals(
             cost_intervals,
             max_range=cfg["cost_ray_max_range"],
@@ -1542,6 +1732,8 @@ class SparrowCspaceEnv(Sparrow):
 
         The playground overrides this with its waypoint/mouse reset semantics.
         """
+        self._randomize_footprint(i)
+        self._refresh_wall(i)
         self._car_loc_init(i)
         self._target_point_init(i)
         self.step_counter_vec[i] = 0
@@ -1566,18 +1758,56 @@ class SparrowCspaceEnv(Sparrow):
             dw = dw | stuck
         return dw, stuck
 
-    def _AutoReset(self):
-        """Reset done掉的 env（truncate / win / exceed）—— 碰撞不再触发重置。
+    def _ensure_clear_start(self, state, current_a, candidates):
+        """Move newly reset robots until their current footprint is clear."""
+        for _ in range(20):
+            blocked = candidates & self.footprint_collision
+            if not blocked.any():
+                return state
+            for i in blocked.nonzero(as_tuple=False).squeeze(-1).tolist():
+                self._reset_env(i)
+            self._ld_scan_vec()
+            state = self._get_cspace_state(current_a=current_a)
+        raise RuntimeError("Cannot place the footprint in free space after 20 attempts")
 
-        原 Sparrow._AutoReset 会在碰撞时 `_car_loc_init` 重置小车位姿；这里去除该
-        分支：碰撞（卡死）只保留 `collide_vec`(= stuck-reset 掩码) 的 -200 惩罚信号，
-        位姿重置交由 `_apply_stuck_reset`（卡死）处理。
-        """
+    def _finish_footprint_step(self, state, reward, dw, tr, current_a):
+        """End an episode when the current footprint overlaps an obstacle."""
+        state = self._ensure_clear_start(state, current_a, dw | tr)
+        collision = self.footprint_collision & ~(dw | tr)
+        dw, stuck = self._apply_stuck_reset(dw)
+        if stuck is not None:
+            collision = collision | stuck
+        # Stuck resets already moved their robots. Move any other colliding
+        # robots, then refresh lidar and the observation for the new episode.
+        extra = collision if stuck is None else collision & ~stuck
+        if extra.any():
+            for i in extra.nonzero(as_tuple=False).squeeze(-1).tolist():
+                self._reset_env(i)
+            self._ld_scan_vec()
+        if collision.any():
+            state = self._get_cspace_state(current_a=current_a)
+            state = self._ensure_clear_start(state, current_a, collision)
+            dw = dw | collision
+        self.collide_vec = collision
+        reward = reward.clone()
+        reward[collision] = self.PUNISH
+        return state, reward, dw, tr, collision
+
+    def _AutoReset(self):
+        """Reset goal/truncation episodes; footprint collisions reset in step()."""
         if self.done_vec.any():
             DoneEnv_idx = torch.where(self.done_vec)[0]
             for i in DoneEnv_idx:
+                self._randomize_footprint(i)
+                self._refresh_wall(i)
+                if self.cross_wall:
+                    # A newly rotated wall may leave the previous goal pose too
+                    # far from every opening on its opposite side.
+                    self._car_loc_init(i)
                 self._target_point_init(i)
             self.step_counter_vec[self.done_vec] = 0
+            if self.cross_wall:
+                self._ld_scan_vec()
 
     # ----------------------------------------------------------------- visualize
     def _draw_robot(self):
@@ -1592,14 +1822,28 @@ class SparrowCspaceEnv(Sparrow):
         cx, cy, t = float(car[0]), float(car[1]), float(car[2])
         cos_t, sin_t = math.cos(t), math.sin(t)
 
-        pts = []
-        for fx, fy in self.cspace_cfg["footprint"]:
-            # robot frame (m) -> world (cm); matches _build_occ_grid convention
-            wx = cx + 100.0 * (fx * cos_t + fy * sin_t)
-            wy = cy + 100.0 * (-fx * sin_t + fy * cos_t)
-            pts.append(self._world_2_grid(torch.tensor([wx, wy])).numpy())
-        pygame.draw.polygon(self.canvas, (200, 128, 250), pts)
-        pygame.draw.polygon(self.canvas, (120, 40, 160), pts, width=2)
+        polygons = []
+        if self.random_footprint and self.footprint_rectangles[self.ri] is not None:
+            for length, width, angle in self.footprint_rectangles[self.ri]:
+                c, s = math.cos(angle), math.sin(angle)
+                polygons.append([
+                    (x * c - y * s, x * s + y * c)
+                    for x, y in ((length / 2, width / 2),
+                                 (length / 2, -width / 2),
+                                 (-length / 2, -width / 2),
+                                 (-length / 2, width / 2))
+                ])
+        else:
+            polygons.append(self.cspace_cfg["footprint"])
+        for polygon in polygons:
+            pts = []
+            for fx, fy in polygon:
+                # robot frame (m) -> world (cm); matches _build_occ_grid convention
+                wx = cx + 100.0 * (fx * cos_t + fy * sin_t)
+                wy = cy + 100.0 * (-fx * sin_t + fy * cos_t)
+                pts.append(self._world_2_grid(torch.tensor([wx, wy])).numpy())
+            pygame.draw.polygon(self.canvas, (200, 128, 250), pts)
+            pygame.draw.polygon(self.canvas, (120, 40, 160), pts, width=2)
 
         # heading line (forward direction from centre)
         head = car[0:2].cpu() + self.car_radius * torch.tensor(
@@ -1655,11 +1899,6 @@ class SparrowCspaceEnv(Sparrow):
                                (int(255 * (1 - frac)), int(255 * frac), 0),
                                sta_gd, ends_gd[i])
 
-        # global-plan 路径叠加（品红折线，画在 cost rays 之上）
-        pp = getattr(self, "plan_poses", None)
-        if pp is not None and pp[self.ri] is not None:
-            draw_planned_path(self, pp[self.ri])
-
     def _plot_cspace(self, env_idx=0, save_path="cspace_viz.png"):
         """Render the occupancy grid, 3-D c-space and cost rays to a PNG.
 
@@ -1671,6 +1910,13 @@ class SparrowCspaceEnv(Sparrow):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.gridspec import GridSpec
+
+        if self.occ_grid is None or self.cspace is None:
+            # points backend: there is no grid to draw.  Say so instead of
+            # crashing in the middle of a 30-panel figure.
+            raise RuntimeError(
+                "c-space plot needs the grid backend (CSPACE_BACKEND='grid')"
+            )
 
         cfg = self.cspace_cfg
         nz = cfg["nz"]
@@ -1740,40 +1986,33 @@ class SparrowCspaceEnv(Sparrow):
         unknown footprint). The grayscale value is linear in the usable theta
         fraction: black means no heading is usable, white means every heading
         is usable. Returns an RGB uint8 image in robot-centric grid coordinates.
+
+        Needs the grid backend (the points backend keeps no c-space grid);
+        returns None there so renderers can skip the layer.
         """
+        if self.cspace is None:
+            return None
         available_fraction = (~self.cspace[env_idx]).float().mean(dim=-1)
         intensity = (available_fraction * 255.0).round().to(torch.uint8)
         return intensity.unsqueeze(-1).expand(-1, -1, 3).contiguous()
 
     # ------------------------------------------------------------- gym-like API
     def reset(self):
+        for i in range(self.N):
+            self._randomize_footprint(i)
         _, info = super().reset()                     # base state discarded
-        if self.global_plan:
-            self._rebuild_planner()                   # world_occ_full 已更新 -> 重建图
-            for i in range(self.N):
-                self._replan(i)
-        return self._get_cspace_state(current_a=None), info
+        state = self._get_cspace_state(current_a=None)
+        state = self._ensure_clear_start(
+            state, None, torch.ones(self.N, dtype=torch.bool, device=self.dvc))
+        if self.random_footprint and self.render_mode == "human":
+            self._render_frame()
+        return state, info
 
     def step(self, current_a):
-        if self.global_plan:
-            self._advance_waypoints()                 # 步首：按 wp_reach 推进航点
         _, reward, dw, tr, info = super().step(current_a)
-        if self.global_plan:
-            # super().step() 内的 _AutoReset 已给 done env 分配新真目标 -> 重规划
-            self._replan_after_reset(dw, tr, None)
         state = self._get_cspace_state(current_a=current_a)
-        dw, stuck = self._apply_stuck_reset(dw)
-        if stuck is not None and stuck.any():
-            state = self._get_cspace_state(current_a=current_a)   # 重置后重算观测
-            if self.global_plan:
-                self._replan_after_reset(None, None, stuck)       # stuck env 换了位姿+目标
-        # 碰撞计数 = 本步因卡死（is_stuck）而触发的重置事件。基类的 point-lidar
-        # collide_vec（9cm 圆 + ld_acc 失配）已失效，这里用 stuck-reset 掩码代替，
-        # 使「一旦因为碰撞(卡死)而重置，碰撞计数就 +1」；并施加 -200 惩罚。
-        self.collide_vec = stuck if stuck is not None else torch.zeros(
-            self.N, dtype=torch.bool, device=self.dvc)
-        reward = reward.clone()
-        reward[self.collide_vec] = self.PUNISH
+        state, reward, dw, tr, _ = self._finish_footprint_step(
+            state, reward, dw, tr, current_a)
         return state, reward, dw, tr, info
 
 
@@ -1792,43 +2031,20 @@ class SparrowCspacePlayground(Sparrow_PlayGround, SparrowCspaceEnv):
     """
 
     def reset(self):
+        self._randomize_footprint(self.ri)
         _, info = Sparrow_PlayGround.reset(self)         # waypoint/mouse env reset
-        if self.global_plan:
-            self._rebuild_planner()                      # 障碍物重新随机 -> 重建共享图
-        return self._get_cspace_state(current_a=None), info
-
-    def _handle_click(self, xy):
-        """点击 → 全局规划 → 整条路径入队（global_plan 模式）。
-
-        复写 `Sparrow_PlayGround._handle_click`：把规划出的航点序列整条塞进
-        global_path / waypoints，基类 `Sparrow_PlayGround.step` 的 win-pop 机制会
-        逐航点推进；点击点（真目标）是最后一个航点。无可行路径时回退基类单点行为。
-        """
-        if not self.global_plan:
-            return super()._handle_click(xy)
-        car = self.car_state[self.ri]
-        res = self.planner.plan(
-            (float(car[0]), float(car[1]), float(car[2])),
-            (float(xy[0]), float(xy[1]), None),           # 目标朝向任意
-        )
-        if res is None or len(res.poses) < 2:
-            print("No global path to the clicked point; using a direct waypoint.")
-            return super()._handle_click(xy)
-        poses = res.poses
-        self.plan_poses[self.ri] = poses
-        self.plan_idx[self.ri] = 1
-        self.global_path.clear()
-        self.waypoints.clear()
-        for x, y, _t in poses:
-            p = np.array([float(x), float(y)], dtype=np.float32)
-            self.global_path.append(p)
-            self.waypoints.append(p)
-        nxt = poses[1]
-        self.target_point = torch.tensor([nxt[0], nxt[1]], device=self.dvc)
+        state = self._get_cspace_state(current_a=None)
+        state = self._ensure_clear_start(
+            state, None, torch.ones(self.N, dtype=torch.bool, device=self.dvc))
+        if self.random_footprint and self.render_mode == "human":
+            self._render_frame()
+        return state, info
 
     def _reset_env(self, i):
         """Stuck reset for the playground — mirrors `Sparrow_PlayGround._AutoReset`:
         new car pose, clear waypoints/global path, target = new pose."""
+        self._randomize_footprint(i)
+        self._refresh_wall(i)
         init_xy = self._car_loc_init(i)
         self.global_path.clear()
         self.waypoints.clear()
@@ -1838,22 +2054,14 @@ class SparrowCspacePlayground(Sparrow_PlayGround, SparrowCspaceEnv):
         self.step_counter_vec[i] = 0
 
     def _AutoReset(self):
-        """碰撞不再触发重置（去除原 Sparrow_PlayGround 的碰撞重置）。
-
-        卡死由 `_apply_stuck_reset` -> `_reset_env` 处理；到达目标点仅由 dw_vec
-        标记 episode 结束，等待鼠标点击新航点继续。
-        """
+        """Leave goal handling to the playground; footprint collisions reset in step()."""
         pass
 
     def step(self, current_a):
         _, reward, dw, tr, info = Sparrow_PlayGround.step(self, current_a)
         state = self._get_cspace_state(current_a=current_a)
-        dw, stuck = self._apply_stuck_reset(dw)
-        if stuck is not None and stuck.any():
-            state = self._get_cspace_state(current_a=current_a)   # 重置后重算观测
-        # 碰撞计数 = 卡死(stuck)重置事件（与 SparrowCspaceEnv.step 一致），驱动 HUD 的 COLLIDE 提示
-        self.collide_vec = stuck if stuck is not None else torch.zeros(
-            self.N, dtype=torch.bool, device=self.dvc)
+        state, reward, dw, tr, _ = self._finish_footprint_step(
+            state, reward, dw, tr, current_a)
         return state, reward, dw, tr, info
 
 """------------------------------------------------------------------------------------------------------------------------"""

@@ -8,7 +8,6 @@ waypoints, press Esc to reset, close the window to quit.  Loads a model from
 Usage (inside the container, with a display / GPU):
 
     python3 play_cspace.py --ModelName SAC_sparrow_cspace --dvc cuda
-    python3 play_cspace.py --ModelName SAC_sparrow_cspace --dvc cuda --global_plan
 
 The model consumes the
 (RAY_CHANNELS×RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim c-space state
@@ -16,9 +15,7 @@ The model consumes the
 [dist, heading, normalized actual v, normalized actual w]), so it must have been
 trained on `SparrowCspaceEnv` (e.g. `SAC_sparrow_cspace`).
 
-With `--global_plan`, clicking the map plans a global path in the c-space graph
-(`GraphPlanner`) from the robot to the clicked point and enqueues its waypoints;
-without it, a click adds a single local waypoint as before.
+Clicking the map adds a local waypoint within the configured distance limit.
 
 On top of the overlays from `render_utils`, `draw_interval_rays` (on by default,
 disable with `--interval_rays False`) draws the interval-ray far boundary: a cyan
@@ -45,7 +42,7 @@ from render_utils import (draw_hud, draw_cost_rays, draw_interval_rays,
 parser = argparse.ArgumentParser()
 
 # ---- Model / agent ----
-parser.add_argument('--ModelName', type=str, default='interval_cspace_1',
+parser.add_argument('--ModelName', type=str, default='interval_cspace_2',
                     help='model basename in pytorch_models (e.g. SAC_sparrow_cspace)')
 parser.add_argument('--ModelDir', type=str, default=settings.MODEL_DIR,
                     help='directory holding *_actor.pth / *_critic.pth')
@@ -68,12 +65,22 @@ parser.add_argument('--max_ep_steps', type=int, default=500)
 # ---- Lidar scan (mirrors ColorDynamic/play_with_mouse.py defaults) ----
 parser.add_argument('--ld_a_range', type=int, default=360,
                     help='max scanning angle of lidar (degree)')
-parser.add_argument('--ld_d_range', type=int, default=400,
-                    help='max lidar range (cm); should cover the c-space window (4 m)')
-parser.add_argument('--ld_num', type=int, default=72,
-                    help='number of lidar rays per world')
+parser.add_argument('--ld_d_range', type=int,
+                    default=int(round(settings.CSPACE_COST_RAY_MAX_RANGE * 100)),
+                    help='max lidar range (cm); defaults to the training value, '
+                         'which is exactly the c-space observation range')
+parser.add_argument('--ld_num', type=int, default=36,
+                    help='number of lidar rays per world (training default; '
+                         'the c-space observation is built from these hits)')
 parser.add_argument('--ld_GN', type=int, default=3,
                     help='lidar rays grouped (down-sampled) per group')
+parser.add_argument('--ld_acc', type=int, default=settings.SPARROW_LD_ACC,
+                    help='lidar DDA step size in cm (training default; the '
+                         'default 3 cm here used to disagree with training)')
+parser.add_argument('--backend', choices=('grid', 'points'),
+                    default=settings.CSPACE_BACKEND,
+                    help='c-space observation geometry: grid (raster) or '
+                         'points (analytic lidar point set)')
 
 # ---- Stuck auto-reset (cost rays ~0 in every direction) ----
 parser.add_argument('--stuck_reset', type=str2bool, default=settings.SPARROW_STUCK_RESET,
@@ -87,13 +94,6 @@ parser.add_argument('--interval_rays', type=str2bool, default=True,
                     help='overlay the interval rays: cyan polyline = nearest entry '
                          '(min over theta), orange ray = farthest exit (max over the '
                          'colliding theta layers)')
-
-# ---- Global planner (click -> plan a path in c-space, follow waypoints) ----
-parser.add_argument('--global_plan', action='store_true',
-                    default=settings.GLOBAL_PLAN_ENABLED,
-                    help='enable global graph planning: clicking the map plans a full '
-                         'path from the robot to the clicked point and enqueues its '
-                         'waypoints (else: single-waypoint click behavior)')
 
 opt = parser.parse_args()
 opt.dvc = torch.device(opt.dvc)
@@ -116,11 +116,13 @@ def main():
         ld_d_range=opt.ld_d_range,
         ld_num=opt.ld_num,
         ld_GN=opt.ld_GN,
+        ld_acc=opt.ld_acc,
         noise=False,
         DR=False,
         stuck_reset=opt.stuck_reset,
         stuck_threshold=opt.stuck_threshold,
-        global_plan=opt.global_plan,
+        random_footprint=settings.RANDOM_FOOTPRINT_ENABLED,
+        cspace_cfg={"backend": opt.backend},
     )
 
     network = CNNSAC(
