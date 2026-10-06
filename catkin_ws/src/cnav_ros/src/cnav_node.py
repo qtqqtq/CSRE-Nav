@@ -21,6 +21,6 @@ if __name__ == "__main__":
         pass
     except Exception as exc:
         # Configuration problems (missing checkpoint, geometry mismatch, bad
-        # sac_dir) are fatal and must be loud rather than a silent traceback.
+        # backend) are fatal and must be loud rather than a silent traceback.
         rospy.logfatal("cnav: %s", exc)
         raise

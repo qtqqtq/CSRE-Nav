@@ -5,6 +5,10 @@
 # (g_min 0.1, a 0.698 -> nz 10, 3 m, same 1.20 x 0.14 m footprint).  Only the theta
 # resolution differs from the current generation; the ray pipeline, the grid
 # handedness, the log encoding and the velocity scale are identical.
+#
+# Kept as a geometry reference, not as a runnable profile: its `preprocess: log`
+# is rejected by this build outright, and the checkpoint is not shipped in
+# `model/`.  Point `model_dir` at a SAC checkout's pytorch_models/ to use it.
 
 model_name: SAC_sparrow_cspace_2
 device: cuda

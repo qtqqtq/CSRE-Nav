@@ -8,30 +8,44 @@ velocity commands:
 
 ```
 /scan ────┐
-/odom ────┼─→ occ grid → c-space → 1×36×nz first-entry rays ──┐
-/cnav_goal┘                                                       ├─→ actor → velocity filter → /cnav_cmd_vel
-             [distance, heading, actual v, actual w] ─────────────┘
+/odom ────┼─→ c-space geometry → 1×36×nz first-entry rays ────┐
+/cnav_goal┘                                                   ├─→ actor → velocity filter → /cnav_cmd_vel
+             [distance, heading, actual v, actual w] ─────────┘
 ```
 
-It calls the same pure-numpy/torch helpers the training env uses
-(`SAC/cspace_cost_rays.py: make_footprint_masks / build_cspace /
-cost_ray_intervals_3d / preprocess_cost_ray_intervals`), so it needs a laser
-scan, odometry and a tf tree.
+**Self-contained.** The checkpoints ship in `model/` and the c-space geometry
+lives in `src/cnav_cspace.py` — a vendored, byte-identical copy of the training
+tree's `SAC/cspace_cost_rays.py` (both backends). Nothing here reads a SAC
+checkout, and no module is imported across the two trees. The node needs only a
+laser scan, odometry and a tf tree.
 
-The local lidar grid keeps observed-free cells along beam paths, occupied cells
-at finite hit endpoints, and unknown cells outside observed paths. In
-configuration space, obstacle overlap is a collision; an otherwise obstacle-
-free pose is invalid only when its entire footprint is unknown. A footprint
-with any known-free overlap remains valid even if part of it is unknown.
+Two geometries produce that ray grid, selected by `~backend` (see
+[The c-space backend](#the-c-space-backend)):
+
+- **`points`** (the shipped profile) — the obstacles *are* the lidar hit points
+  and the footprint is intersected with them in closed form. No grid, no
+  rasterisation, no march.
+- **`grid`** — the older path: a local occupancy grid keeping observed-free cells
+  along beam paths, occupied cells at finite hit endpoints and unknown cells
+  outside observed paths, then a rasterised c-space that the rays march through.
+  In configuration space, obstacle overlap is a collision; an otherwise
+  obstacle-free pose is invalid only when its entire footprint is unknown. A
+  footprint with any known-free overlap remains valid even if part of it is
+  unknown.
+
+Both emit the same shapes with the same semantics; they differ in geometry.
 
 > ### Current model: one ray interval plus measured velocity
 >
-> The state is **1084-dimensional**: one `36×30` ray-distance channel plus
+> `model/exact_castray_interval1_0_actor.pth` — the state is
+> **1084-dimensional**: one `36×30` ray-distance channel plus
 > `[distance, heading, normalized_actual_v, normalized_actual_w]`. Velocity comes
 > from the filtered simulator state during training and odometry during deployment;
 > it is not the previous action command.
 >
-> Older checkpoints are intentionally incompatible and must be retrained.
+> It was trained with the **point-set** backend, so `config/cnav_sparrow.yaml`
+> sets `backend: points`. Older checkpoints are intentionally incompatible and
+> must be retrained.
 
 ## Quick start
 
@@ -75,9 +89,10 @@ read in the fixed frame (`odom`): the node ignores the message's
 **2D Pose Estimate** is deliberately left unwired; nothing here reads
 `/initialpose`.
 
-`~sac_dir` defaults to `/DRL-robot-navigation/SAC`; set it if your checkout lives
-elsewhere. `~device` defaults to `cuda` in the configs — `cpu` is plenty for a
-single 36×nz grid.
+`~model_dir` defaults to `model`, i.e. the `model/` directory **inside this
+package**; that is where `exact_castray_interval1_0_actor.pth` lives, so a fresh
+checkout runs as-is. `~device` defaults to `cuda` in the configs — `cpu` is
+plenty for a single 36×nz grid.
 
 ## Node API
 
@@ -129,17 +144,23 @@ exist at runtime either.
 
 ## Config profiles — pick the one matching your checkpoint
 
-`SAC/pytorch_models/` holds three checkpoint families that are **not**
+The SAC training tree holds several checkpoint families that are **not**
 interchangeable. The network architecture is sniffed from the state dict
-automatically, but the **geometry and the ray pipeline are not recoverable from a
-checkpoint**, so they come from a config file. The node validates the geometry
-against the loaded network and **aborts on a mismatch** rather than navigating with
-a wrong observation (which would be silent and dangerous).
+automatically, but the **geometry, the backend and the ray pipeline are not
+recoverable from a checkpoint**, so they come from a config file. The node
+validates the geometry against the loaded network and **aborts on a mismatch**
+rather than navigating with a wrong observation (which would be silent and
+dangerous).
 
 | config | use with | ray grid | features | pipeline |
 |---|---|---|---|---|
-| `config/cnav_sparrow.yaml` | `interval_1_2000000steps` in `pytorch_models/interval_sweep_2m` | 1×36×30 | 64 | normalized first-entry distance, measured velocity, `env` frame, 0.5 m/s / 2 rad/s, 3 m, 0.1 m cells, 1.20×0.14 m footprint |
-| legacy profiles | old one-channel checkpoints | incompatible | — | retained only as historical geometry references; retraining is required |
+| `config/cnav_sparrow.yaml` | `model/exact_castray_interval1_0_actor.pth` | 1×36×30 | 64 | point-set backend, normalized first-entry distance, measured velocity, `env` frame, 0.5 m/s / 2 rad/s, 3 m, 0.1 m cells, 1.20×0.14 m footprint |
+| `config/cnav_legacy_sparrow.yaml` | old one-channel checkpoints | incompatible | — | retained only as a historical geometry reference; retraining is required, and its checkpoint is not shipped |
+
+To deploy a different checkpoint, drop its `_actor.pth` into `model/` and point
+`~model_name` / `~model_dir` at it. It must come from a training run whose
+geometry matches the profile — in particular, a grid-trained actor has to be
+deployed with `backend: grid`, or it silently sees the wrong observation:
 
 ```bash
 roslaunch cnav_ros cnav.launch \
@@ -150,34 +171,67 @@ roslaunch cnav_ros cnav.launch \
 > The old one-channel checkpoints used a different observation shape and need
 > retraining for the current pipeline.
 
+## The c-space backend
+
+`~backend` picks the geometry that turns the scan into cost rays. Both fill the
+same `1×36×nz` channel with the same convention (distance until the footprint
+first touches an obstacle, clipped to `max_range`), and both use the same
+footprint, `nz`, `a` and beam spacing — so the network cannot tell them apart by
+shape. What differs is the obstacle model:
+
+| | `points` | `grid` |
+|---|---|---|
+| obstacle | the lidar hit points themselves | occupied cells of a 65×65 grid |
+| geometry | analytic half-plane intersection against the footprint edges | footprint rasterised into a c-space, rays marched through it |
+| cell size | none — metric | `g_min` = 0.1 m |
+| dilation | none | `g_min` added around every hit |
+
+The point-set route drops two approximations the grid route cannot: the 0.1 m
+quantisation of obstacle positions, and the `+g_min` relaxation that makes a gap
+look wider than it is. With 36 beams 10° apart, hit spacing grows with range
+(28 cm at 1.6 m, 52 cm at 3 m), so the grid path can open a phantom corridor
+where the robot does not actually fit — the gap between two hit endpoints
+overestimates it by up to `g_min`. The point-set geometry removes the `g_min`
+term; the remaining phantom gap is hit spacing alone.
+
+**A checkpoint must be deployed on the backend it was trained with.** Switching
+backends changes the world the policy sees; it is not a rendering option. When
+comparing the two, use the same weights and the same seed, so the only difference
+is the geometry.
+
+`~backend` is validated at startup and the node refuses anything but `grid` or
+`points`.
+
 ## Two details that are easy to get wrong
 
 These are load-bearing; getting either wrong yields a plausible-looking but wrong
 policy, which is why they are explicit config knobs rather than hardcoded.
 
 1. **Grid handedness.** `SparrowCspaceEnv._build_occ_grid` projects hits with
-   `rel_y = dx·sin(t) + dy·cos(t)`, so the occupancy grid's second axis runs to the
-   robot's **right** — the mirror of the standard ROS body frame. Feed a ROS-frame
-   grid directly and every ray comes out left/right swapped (differences up to the
-   full 3 m range). `ray_frame: env` negates the ROS left component before
-   quantisation; `ray_frame: ros` is the un-mirrored variant the old C++ mapper
-   produced.
+   `rel_y = dx·sin(t) + dy·cos(t)`, so the c-space frame's second axis runs to the
+   robot's **right** — the mirror of the standard ROS body frame. Feed ROS-frame
+   hits directly and every ray comes out left/right swapped (differences up to the
+   full 3 m range). `ray_frame: env` negates the ROS left component before it
+   reaches the geometry; `ray_frame: ros` is the un-mirrored variant the old C++
+   mapper produced. This applies to **both** backends — `points` negates the hit
+   points, `grid` negates before quantisation.
 
 2. **Velocity means measured motion, not the previous command.** Training divides
    Sparrow's post-filter `car_state` velocity by `(v_linear_max, v_angular_max)`;
    deployment applies the same normalization to odometry twist. Both values are
    clipped to `[-1,1]`. Checkpoints without this complete layout are rejected.
 
-Also worth knowing: the cost rays are quantised to 0.05 m march steps on a 0.1 m
-grid and clipped to `max_range` before normalization; the sim's lidar is quantised
-to 8 cm, with hit endpoints occupied and sampled beam paths marked known-free.
-A real laser gives a richer grid
-— that is the intended sim→real direction, not a bug.
+Also worth knowing: the grid backend quantises the scan to 8 cm, marks hit
+endpoints occupied and samples beam paths as known-free, then marches rays in
+0.05 m steps; the point-set backend keeps the hits at full metric precision and
+solves for the contact distance directly. A real laser gives more precise hits
+than the sim's 8 cm quantisation — that is the intended sim→real direction, not
+a bug, and the point-set backend is what lets it through.
 
 ## Reading the cost-ray image
 
-`/cnav_cost_ray_image` is the HUD panel `SAC/play_cspace.py` draws, republished
-for rviz's Image display:
+`/cnav_cost_ray_image` is the observation the actor consumes, drawn as a HUD
+panel (`SAC/play_cspace.py`'s layout) and republished for rviz's Image display:
 
 ```
         beam b = 0 ────────────────────────► b = 35      (10° apart)
@@ -195,10 +249,13 @@ layer k = 29 ██████████████████████�
 - **The colour is channel 0 after normalization, not the raw distance.**
   `v = first_entry / max_range`; the image is red near an obstacle and green at
   the 3 m observation boundary. This is the single channel in the current policy.
-- **A fully red image means the robot is already in collision at its current
-  pose**, which is a genuine reading, not a bug: the first march step is
-  `g_min/2 = 0.05 m`, so every ray clips there. Compare against the actual pose
-  before concluding the perception is broken.
+- **A fully red image is usually a phantom obstacle next to the robot, not a
+  collision.** Every ray reads `entry = 0` when a hit point sits inside the
+  footprint. The usual cause is a laser self-return: any robot geometry or dust
+  within a few centimetres feeds a return that lands under the footprint and
+  reddens all 30 θ layers at once. Raise `~scan_min_range` above it — the shipped
+  profile uses `0.09`. Genuine collision reads the same way, so check the pose
+  before blaming the perception.
 - **The heatmap follows the policy observation layout** used by
   `play_cspace.py`.
 
@@ -209,12 +266,12 @@ raise `~cost_ray_image_cell` on a large screen (10 ⇒ 360×300).
 
 | param | default | meaning |
 |---|---|---|
-| `~model_name` | `interval_1_2000000steps` | checkpoint basename in `~model_dir` |
-| `~model_dir` | `pytorch_models/interval_sweep_2m` | actor directory; relative paths resolve under `~sac_dir` |
-| `~sac_dir` | `/DRL-robot-navigation/SAC` | training tree, for `cspace_cost_rays` |
+| `~model_name` | `exact_castray_interval1_0` | checkpoint basename in `~model_dir`; `_actor.pth` is appended |
+| `~model_dir` | `model` | actor directory; relative paths resolve inside the `cnav_ros` package |
 | `~device` | `cuda` | `cuda` or `cpu` |
 | `~stochastic` | `false` | `true` samples from the policy instead of `tanh(mean)` |
-| `~g_min`, `~nz`, `~a` | `0.1`, `30`, `2π/30` | c-space cell size, θ layers, θ step |
+| `~backend` | `grid` | `grid` \| `points` — the c-space geometry; must match the checkpoint |
+| `~g_min`, `~nz`, `~a` | `0.1`, `30`, `2π/30` | c-space cell size (`grid` only), θ layers, θ step |
 | `~cost_ray_max_range` | `3.0` | ray horizon (m) |
 | `~cost_ray_num_beams` | `36` | beams per layer |
 | `~cost_ray_h_res_degrees` | `10.0` | beam spacing |
@@ -241,8 +298,8 @@ raise `~cost_ray_image_cell` on a large screen (10 ⇒ 360×300).
   ```bash
   rosrun cnav_ros check_models.py --config config/cnav_legacy_sparrow.yaml
   ```
-  It shares `_kin_dim_of` and `KINEMATIC_DIM` with the node, so it cannot report a
-  model as loadable that the node would reject.
+  It shares `_kin_dim_of`, `KINEMATIC_DIM` and the backend's geometry with the
+  node, so it cannot report a model as loadable that the node would reject.
 - `send_goal.py` — publish a goal `PoseStamped`.
   ```bash
   rosrun cnav_ros send_goal.py 3.0 3.0 --frame odom
@@ -250,16 +307,19 @@ raise `~cost_ray_image_cell` on a large screen (10 ⇒ 360×300).
 
 ## Caveats
 
-- **Single goal, no global planner.** The shipped checkpoints were trained with
-  `settings.GLOBAL_PLAN_ENABLED = False`, i.e. against a randomly placed target
-  point, so the node drives straight at one goal and stops within
-  `~goal_tolerance`. Feeding it graph-planner waypoints is a shift in the target
-  distribution — the policy sees distance/heading to the current waypoint, so
-  it should transfer, but the waypoint statistics would not match training.
+- **Single goal.** The shipped checkpoints were trained against a randomly
+  placed target point. The node drives toward one goal and stops within
+  `~goal_tolerance`.
 - **No collision checking or safety layer.** The actor is the only thing between
   the robot and an obstacle. Add a watchdog before running on hardware.
+- **Only the point-set backend is exercised.** The shipped profile and the smoke
+  test both use `backend: points`. `grid` still runs and produces the same
+  observation shapes, but nothing here is currently deployed on it.
 - The old Gazebo family is loaded but its ray pipeline is inferred, not verified
   (see above).
 - `SAC/play_cspace.py:118` hardcodes `cnn_feature_dim=64`, so it cannot load the
   `SAC_sparrow_cspace_*` checkpoints (which need 128). That is a bug in that
   script, not here — this node reads the feature width from the state dict.
+- `src/cnav_cspace.py` is a vendored copy of the training helpers. It is
+  byte-identical today, but it no longer tracks `SAC/cspace_cost_rays.py`: if the
+  training-side geometry changes, this copy has to be re-synced by hand.

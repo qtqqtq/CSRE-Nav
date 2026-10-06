@@ -1,16 +1,17 @@
-# CNN-SAC c-space policy -- one interval (1 x 36 x 30 rays).
+# CNN-SAC c-space policy -- one interval (1 x 36 x 30 rays), point-set backend.
 #
-# Uses the 2e6-step one-interval actor from SAC/pytorch_models/interval_sweep_2m.
-# Geometry source: SAC/settings.py CSPACE_* (36 beams, nz=30, a=2*pi/30, 3 m,
+# Uses the actor shipped in this package: model/exact_castray_interval1_0_actor.pth.
+# geometry source: SAC/settings.py CSPACE_* (36 beams, nz=30, a=2*pi/30, 3 m,
 # 0.1 m cells, 1.20 x 0.14 m footprint).  Do not change `nz`/`a` independently of
 # the checkpoint -- the node validates the ray-grid shape at load and aborts on a
 # mismatch rather than running with a wrong observation.
 
 # --- model ---
 # This checkpoint uses one ray channel and four kinematic values. Relative
-# model_dir is resolved against sac_dir by cnav_core.
-model_name: interval_1_2000000steps
-model_dir: pytorch_models/interval_sweep_2m
+# model_dir is resolved against the cnav_ros package, so `model` is the
+# directory next to this config's package root.
+model_name: exact_castray_interval1_0
+model_dir: model
 device: cuda                 # "cpu" also works and is enough for one 36x30 grid
 stochastic: false            # false = tanh(mean), the deterministic eval policy
 
@@ -23,6 +24,13 @@ cost_ray_num_beams: 36
 cost_ray_h_res_degrees: 10.0
 cost_ray_num_intervals: 1
 footprint: [[0.6, 0.07], [0.6, -0.07], [-0.6, -0.07], [-0.6, 0.07]]
+
+# How the rays are derived from the scan. `points` = the obstacles are the lidar
+# hit points and the footprint is intersected with them analytically; `grid`
+# rasterizes the footprint and marches through a c-space grid. Same shapes and
+# semantics, different geometry -- a checkpoint must be deployed on the backend
+# it was trained with. This one was trained with the point-set backend.
+backend: points
 
 # SparrowCspaceEnv builds its occupancy grid with axis 1 running to the robot's
 # RIGHT, i.e. mirrored w.r.t. the ROS body frame. The single channel is the
@@ -48,9 +56,11 @@ lidar_frame: laser_link
 
 # The beams at the two ends of the 240 deg FOV (idx 0-2 and 716-719, i.e. +-120
 # deg) clip the robot's own body at 0.05-0.09 m -- measured in open space, at
-# every heading.  Training's closest possible return is car_radius = 9 cm, so
+# every heading. Training's closest possible return is car_radius = 9 cm, so
 # this is below anything the policy ever saw; and at g_min = 0.1 it quantises
 # into a cell one step from the robot's own, which reddens all nz headings.
+# (On the points backend there is no cell to quantise into, but the same
+# self-return is still a phantom obstacle, so the filter stays.)
 scan_min_range: 0.09
 
 rate: 10.0                   # Sparrow control interval is 0.1 s

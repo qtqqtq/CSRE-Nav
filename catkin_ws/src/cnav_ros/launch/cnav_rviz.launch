@@ -22,8 +22,7 @@
   same reason evaluate/start_planner.sh runs the node directly: cnav.launch can spawn
   a send_goal.py, and a startup goal racing the one clicked in rviz is exactly
   the nondeterminism a viewer-centric launch must not have.  Declaring it here
-  also exposes ~sac_dir, which cnav.launch does not, and leaves cnav.launch
-  untouched for the headless workflow.
+  also leaves cnav.launch untouched for the headless workflow.
 
   rviz:=false gives the planner alone (then: rosrun cnav_ros send_goal.py 3.0 3.0).
 
@@ -40,8 +39,6 @@
        doc="override the config's model_name (e.g. dense_sample_cspace_0)"/>
   <arg name="device" default="" doc="override the config's device (cuda/cpu)"/>
   <arg name="stochastic" default="" doc="override: true to sample instead of tanh(mean)"/>
-  <arg name="sac_dir" default=""
-       doc="override the node's /DRL-robot-navigation/SAC checkout location"/>
 
   <arg name="rviz" default="true" doc="false to run the policy with no viewer"/>
   <arg name="rviz_config" default="$(find cnav_ros)/rviz/cnav.rviz"/>
@@ -53,7 +50,6 @@
     <param name="model_name" value="$(arg model_name)" if="$(eval arg('model_name') != '')"/>
     <param name="device"     value="$(arg device)"     if="$(eval arg('device') != '')"/>
     <param name="stochastic" value="$(arg stochastic)" if="$(eval arg('stochastic') != '')"/>
-    <param name="sac_dir"    value="$(arg sac_dir)"    if="$(eval arg('sac_dir') != '')"/>
   </node>
 
   <!-- required="true" above means a policy that dies on startup takes rviz with

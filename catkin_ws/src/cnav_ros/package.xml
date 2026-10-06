@@ -6,7 +6,8 @@
     ROS 1 wrapper for the CNN-SAC c-space (cost-ray) navigation policy trained in
     DRL-robot-navigation/SAC.  Rebuilds the training observation (36 x nz cost rays
     + distance/heading) from live LaserScan + Odometry and publishes velocity
-    commands.
+    commands.  Self-contained: the checkpoints ship in model/ and the c-space
+    helpers are vendored in src/cnav_cspace.py, so no SAC checkout is needed.
   </description>
 
   <maintainer email="qtqqtq@todo.todo">qtqqtq</maintainer>
@@ -24,5 +25,6 @@
 
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-torch</exec_depend>
+  <exec_depend>python3-rospkg</exec_depend>
   <exec_depend>rviz</exec_depend>
 </package>

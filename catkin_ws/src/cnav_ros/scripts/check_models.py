@@ -24,12 +24,16 @@ for _p in (_HERE, os.path.join(_HERE, os.pardir, "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import numpy as np
 import torch
 import yaml
 
 from cnav_core import (KINEMATIC_DIM, RAY_CHANNELS, _ActorDeterministic,
                        _ActorStochastic, _arch_of, _BackboneNew, _BackboneOld,
-                       _kin_dim_of, _ray_channels_of)
+                       _kin_dim_of, _ray_channels_of, resolve_model_dir)
+from cnav_cspace import (build_cspace, cost_ray_intervals_3d,
+                         footprint_constraints, make_footprint_masks,
+                         pointset_batch, preprocess_cost_ray_intervals)
 
 # models this node supports are the CNN c-space actors; the MLP SAC_laser_* and
 # the *_critic.pth files are not
@@ -68,7 +72,7 @@ def discover(model_dir):
     return names
 
 
-def check(name, cfg, sac_dir):
+def check(name, cfg):
     """Build the network for `name` under geometry `cfg`.  Returns (ok, detail)."""
     ray_channels = int(cfg.get("cost_ray_num_intervals", RAY_CHANNELS))
     state = torch.load(os.path.join(cfg["model_dir"], "%s_actor.pth" % name),
@@ -104,28 +108,40 @@ def check(name, cfg, sac_dir):
     actor.load_state_dict(state)
     actor.eval()
 
-    # one real observation -> action, through the same helper pipeline the node uses
-    sys.path.insert(0, sac_dir)
-    from cspace_cost_rays import (build_cspace, cost_ray_intervals_3d,
-                                  make_footprint_masks,
-                                  preprocess_cost_ray_intervals)
-
+    # one real observation -> action, through the same helper pipeline the node
+    # uses -- including the backend, since the two disagree on geometry
     g_min, nz, beams = cfg["g_min"], cfg["nz"], cfg["cost_ray_num_beams"]
-    masks = torch.as_tensor(
-        make_footprint_masks(g_min, cfg["a"], nz, cfg["footprint"]), dtype=torch.float32)
-    R = int(math.ceil(cfg["cost_ray_max_range"] / g_min)) + 2
-    G = 2 * R + 1
-    occ = torch.zeros((1, G, G), dtype=torch.bool)
-    occ[0, R + 10, R + 3] = True                    # a single obstacle 1 m ahead
-    cspace = build_cspace(occ, masks, torch.ones_like(occ))
-    intervals = cost_ray_intervals_3d(
-        cspace, torch.full((1, 2), R, dtype=torch.long),
-        num_beams=beams, h_res_deg=cfg["cost_ray_h_res_degrees"],
-        max_range=cfg["cost_ray_max_range"], g_min=g_min,
-        num_intervals=ray_channels)
+    a, max_range = cfg["a"], cfg["cost_ray_max_range"]
+    backend = cfg.get("backend", "grid")
+    if backend == "points":
+        # A single hit point 1 m ahead on the robot's +x axis.
+        fp_nrm, fp_h, fp_c = footprint_constraints(
+            [np.asarray(cfg["footprint"], dtype=np.float64)],
+            num_beams=beams, nz=nz, a=a,
+            h_res_degrees=cfg["cost_ray_h_res_degrees"])
+        pts = torch.zeros((1, 1, 2))
+        pts[0, 0, 0] = 1.0
+        entry, width, _collide = pointset_batch(pts, fp_nrm, fp_h, fp_c,
+                                                a, max_range)
+        channels = [entry, width][:ray_channels]
+        while len(channels) < ray_channels:
+            channels.append(torch.zeros_like(entry))
+        intervals = torch.stack(channels, dim=1)
+    else:
+        masks = torch.as_tensor(
+            make_footprint_masks(g_min, a, nz, cfg["footprint"]),
+            dtype=torch.float32)
+        R = int(math.ceil(max_range / g_min)) + 2
+        G = 2 * R + 1
+        occ = torch.zeros((1, G, G), dtype=torch.bool)
+        occ[0, R + 10, R + 3] = True                # a single obstacle 1 m ahead
+        cspace = build_cspace(occ, masks, torch.ones_like(occ))
+        intervals = cost_ray_intervals_3d(
+            cspace, torch.full((1, 2), R, dtype=torch.long),
+            num_beams=beams, h_res_deg=cfg["cost_ray_h_res_degrees"],
+            max_range=max_range, g_min=g_min, num_intervals=ray_channels)
     cr = preprocess_cost_ray_intervals(
-        intervals, max_range=cfg["cost_ray_max_range"],
-        epsilon=g_min / 2.0).reshape(1, -1)
+        intervals, max_range=max_range, epsilon=g_min / 2.0).reshape(1, -1)
 
     # [distance, heading, normalized actual linear/angular velocity]
     kin = torch.zeros(1, KINEMATIC_DIM)
@@ -147,30 +163,29 @@ def main(argv):
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=default_cfg)
-    parser.add_argument("--sac-dir", default="/DRL-robot-navigation/SAC")
-    parser.add_argument("--model-dir", default=None)
+    parser.add_argument("--model-dir", default=None,
+                        help="default: the config's model_dir, relative to the package")
     parser.add_argument("--models", nargs="*", default=None,
                         help="default: the model_name from the config")
     args = parser.parse_args(argv)
 
     with open(args.config) as fh:
         cfg = yaml.safe_load(fh) or {}
-    model_dir = args.model_dir or cfg.get("model_dir") or "pytorch_models"
-    cfg["model_dir"] = (model_dir if os.path.isabs(model_dir)
-                        else os.path.join(args.sac_dir, model_dir))
+    cfg["model_dir"] = resolve_model_dir(args.model_dir or cfg.get("model_dir"))
 
     names = args.models or [cfg["model_name"]]
     print("config: %s" % args.config)
-    print("  nz=%d a=%s g_min=%s range=%s beams=%s intervals=%s ray_frame=%s preprocess=%s"
+    print("  nz=%d a=%s g_min=%s range=%s beams=%s intervals=%s ray_frame=%s "
+          "preprocess=%s backend=%s"
           % (cfg["nz"], cfg["a"], cfg["g_min"], cfg["cost_ray_max_range"],
              cfg["cost_ray_num_beams"], cfg.get("cost_ray_num_intervals", RAY_CHANNELS),
-             cfg.get("ray_frame"), cfg.get("preprocess")))
+             cfg.get("ray_frame"), cfg.get("preprocess"), cfg.get("backend", "grid")))
     print()
 
     failed = 0
     for name in names:
         try:
-            ok, detail = check(name, cfg, args.sac_dir)
+            ok, detail = check(name, cfg)
         except Exception as exc:                    # noqa: BLE001 - report, don't crash
             ok, detail = False, "%s: %s" % (type(exc).__name__, exc)
         mark = {True: "PASS", False: "FAIL", None: "skip"}[ok]

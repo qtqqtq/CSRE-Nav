@@ -10,16 +10,17 @@ Its observation is
             + [distance, heading, normalized_actual_v, normalized_actual_w]
 
 where the cost rays are built from the robot's line-of-sight lidar hits, exactly
-as `SparrowCspaceEnv._build_occ_grid()` does.  This node rebuilds that observation
-from live ROS sensor data using the same pure-numpy/torch helpers in
-`SAC/cspace_cost_rays.py`, using live laser scans and odometry.
+as `SparrowCspaceEnv` does.  This node rebuilds that observation from live ROS
+sensor data with `cnav_cspace`, the vendored copy of the training tree's
+`cspace_cost_rays.py` that ships in this package (`src/cnav_cspace.py`), using
+live laser scans and odometry.  Nothing here reaches into a SAC checkout: the
+package is self-contained, with its checkpoints under `model/`.
 
 The kinematic block contains goal-relative geometry and normalized velocity from
 odometry.  These are measured velocities, not the previous actor command, matching
 the post-filter `car_state[:, 3:5]` values used during Sparrow training.
 
-THREE things differ between the checkpoint families in `SAC/pytorch_models/`, and
-each is a knob here:
+FOUR things differ between checkpoint families, and each is a knob here:
 
   1. `architecture` -- sniffed out of the state dict, never configured: backbone
      4->8->8 stride 2 vs 4->16->16 stride [1,1]/[1,2], and head
@@ -36,10 +37,17 @@ each is a knob here:
      2 rad/s action scale; the older Gazebo models read ROS-frame rays from the C++
      mapper with a linear `max_range - d` encoding and the actor output published
      to /cmd_vel unscaled.
+  4. `backend` -- how the rays are derived from the scan, and the one knob that is
+     not recoverable from a checkpoint *or* from the geometry: `grid` rasterizes
+     the footprint and marches through a c-space grid, `points` intersects the
+     analytic footprint with the lidar hit points.  The two share shapes and
+     semantics but not geometry, so a checkpoint must be deployed on the backend
+     it was trained with (see `cnav_cspace`).
 
 The current deployment profile is `config/cnav_sparrow.yaml` for the
-one-channel, 36x30 first-entry model. Legacy profiles are retained
-as geometry references but are intentionally rejected by this build.
+one-channel, 36x30 first-entry model `exact_castray_interval1_0`, trained with
+the point-set backend. Legacy profiles are retained as geometry references but
+are intentionally rejected by this build.
 
 Developed for the DRL-robot-navigation workspace.
 """
@@ -59,6 +67,14 @@ from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import Image, LaserScan
 from visualization_msgs.msg import Marker
+
+# The node runs both from src/ and from lib/<pkg>/ after catkin_install_python,
+# so make the sibling module importable before touching it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from cnav_cspace import (build_cspace, cost_ray_intervals_3d,
+                         footprint_constraints, make_footprint_masks,
+                         pointset_batch, preprocess_cost_ray_intervals)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +224,42 @@ def wrap_to_pi(angle):
 RAY_CHANNELS = 1
 KINEMATIC_DIM = 4
 
+# Where this package keeps the checkpoints it ships with.
+DEFAULT_MODEL_DIR = "model"
+
+
+def package_dir():
+    """Root of the cnav_ros package, from either the source tree or an install space.
+
+    Running from the source tree the file sits in `<pkg>/src/`, so the package
+    root is its parent and `model/` is right there.  `catkin_install_python`
+    instead puts it in `lib/<pkg>/`, where that parent is `lib/`; ask ros for the
+    package path then.  (In a devel-space build rospack also resolves to the
+    source tree, so both branches agree.)
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.normpath(os.path.join(here, os.pardir))
+    if os.path.isdir(os.path.join(local, DEFAULT_MODEL_DIR)):
+        return local
+    try:
+        import rospkg
+        return rospkg.RosPack().get_path("cnav_ros")
+    except Exception:                  # no ros / package not on ROS_PACKAGE_PATH
+        return local
+
+
+def resolve_model_dir(model_dir):
+    """Absolute checkpoint directory.  Relative paths resolve under the package.
+
+    Models travel with the package, so `model` -- the default -- always means
+    this package's own `model/` directory, whatever the working directory is.
+    """
+    if not model_dir:
+        model_dir = DEFAULT_MODEL_DIR
+    if os.path.isabs(model_dir):
+        return model_dir
+    return os.path.join(package_dir(), model_dir)
+
 
 def _kin_dim_of(state_dict, feature_dim, name=None):
     """Sniff the kinematic-block width out of an actor state dict.
@@ -255,10 +307,8 @@ class CnavCore(object):
 
         # ---- model ------------------------------------------------------
         self.model_name = rospy.get_param(
-            "~model_name", "interval_1_2000000steps")
-        self.sac_dir = rospy.get_param("~sac_dir", "/DRL-robot-navigation/SAC")
-        self.model_dir = rospy.get_param(
-            "~model_dir", "pytorch_models/interval_sweep_2m")
+            "~model_name", "exact_castray_interval1_0")
+        self.model_dir = resolve_model_dir(rospy.get_param("~model_dir", ""))
         self.device = torch.device(rospy.get_param("~device", "cuda"))
         self.stochastic = bool(rospy.get_param("~stochastic", False))
 
@@ -317,6 +367,18 @@ class CnavCore(object):
             raise ValueError("~preprocess must be 'interval' for the current "
                              "observation, got %r" % self.preprocess)
 
+        # How the rays are derived from the scan.  Shapes and semantics are the
+        # same either way; the geometry is not, so this must match the training
+        # run of the checkpoint (see cnav_cspace).
+        #   `grid`   -- rasterize the footprint, dilate the occupancy grid into a
+        #               3D c-space, march rays through it.
+        #   `points` -- no grid at all: the obstacles are the lidar hit points
+        #               and the footprint is intersected with them in closed form.
+        self.backend = rospy.get_param("~backend", "grid")
+        if self.backend not in ("grid", "points"):
+            raise ValueError("~backend must be 'grid' or 'points', got %r"
+                             % self.backend)
+
         # ---- action scaling ---------------------------------------------
         # Sparrow: v_phys = continuous_scale * a with (50 cm/s, 2 rad/s).  The
         # Gazebo pipeline published the actor output straight to /cmd_vel, so its
@@ -347,7 +409,6 @@ class CnavCore(object):
         self.scan_max_range = scan_max if scan_max > 0.0 else self.max_range
         self.scan_min_range = float(rospy.get_param("~scan_min_range", 0.0))
 
-        self._load_helpers()
         self._load_actor()
         self._build_geometry()
 
@@ -357,6 +418,7 @@ class CnavCore(object):
         self.goal = None               # np.array([x, y])
         self.occ_grid = None
         self.known_free_grid = None
+        self.hit_points = None         # (M, 2) lidar hits, c-space frame, metres
         self.arrived = False
 
         self.vel_pub = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
@@ -373,10 +435,11 @@ class CnavCore(object):
         rospy.loginfo("cnav: model=%s backbone=%s head=%s feature_dim=%d device=%s",
                       self.model_name, self.backbone, self.action_head,
                       self.feature_dim, self.device)
-        rospy.loginfo("cnav: geometry nz=%d a=%.4f g_min=%.3f range=%.2f beams=%d "
-                      "-> ray_grid=%dx%d, occ_grid=%dx%d, state_dim=%d",
-                      self.nz, self.a, self.g_min, self.max_range, self.num_beams,
-                      self.num_beams, self.nz, self.G, self.G,
+        rospy.loginfo("cnav: backend=%s geometry nz=%d a=%.4f g_min=%.3f range=%.2f "
+                      "beams=%d -> ray_grid=%dx%d, occ_grid=%s, state_dim=%d",
+                      self.backend, self.nz, self.a, self.g_min, self.max_range,
+                      self.num_beams, self.num_beams, self.nz,
+                      "%dx%d" % (self.G, self.G) if self.G else "none",
                       self.num_intervals * self.num_beams * self.nz + KINEMATIC_DIM)
         rospy.loginfo("cnav: ray_frame=%s preprocess=%s scale=(%.2f m/s, %.2f rad/s) "
                       "filter_k=(%.2f, %.2f) rate=%.1f Hz",
@@ -387,32 +450,8 @@ class CnavCore(object):
         rospy.loginfo("cnav: waiting for a goal on %s", self.goal_topic)
 
     # ------------------------------------------------------------------ setup
-    def _load_helpers(self):
-        """Import the pure-numpy cost-ray helpers from the SAC training tree."""
-        if self.sac_dir not in sys.path:
-            sys.path.insert(0, self.sac_dir)
-        try:
-            from cspace_cost_rays import (build_cspace,
-                                          cost_ray_intervals_3d,
-                                          make_footprint_masks,
-                                          preprocess_cost_ray_intervals)
-        except ImportError as exc:
-            raise ImportError(
-                "cannot import cspace_cost_rays from sac_dir='%s' (%s). Set the "
-                "~sac_dir parameter to the DRL-robot-navigation/SAC directory."
-                % (self.sac_dir, exc))
-        self._build_cspace = build_cspace
-        self._cost_ray_intervals_3d = cost_ray_intervals_3d
-        self._make_masks = make_footprint_masks
-        self._preprocess_intervals = preprocess_cost_ray_intervals
-
     def _load_actor(self):
         """Load <model_name>_actor.pth, building a network to match its shapes."""
-        if self.model_dir is None:
-            self.model_dir = os.path.join(
-                self.sac_dir, "pytorch_models", "interval_sweep_2m")
-        elif not os.path.isabs(self.model_dir):
-            self.model_dir = os.path.join(self.sac_dir, self.model_dir)
         path = os.path.join(self.model_dir, "%s_actor.pth" % self.model_name)
         if not os.path.exists(path):
             raise IOError("actor checkpoint not found: %s" % path)
@@ -450,13 +489,25 @@ class CnavCore(object):
         self.actor = actor.to(self.device).eval()
 
     def _build_geometry(self):
-        """One-time footprint masks + robot-centric grid geometry.
+        """One-time footprint geometry, in whichever form the backend needs.
 
-        Mirrors `SparrowCspaceEnv.__init__`: R = ceil(max_range/g_min) + 2, the grid
-        is (2R+1)^2, and the robot always sits at cell (R, R).
+        The grid path mirrors `SparrowCspaceEnv.__init__`: R = ceil(max_range/g_min)
+        + 2, the grid is (2R+1)^2, and the robot always sits at cell (R, R).  The
+        point-set path needs no grid -- just the footprint's outward edge normals,
+        offsets and per-(beam, theta) cosines, which are rotation-invariant in `h`
+        and therefore built once for the one fixed footprint.
         """
+        if self.backend == "points":
+            self._fp_nrm, self._fp_h, self._fp_c = footprint_constraints(
+                [np.asarray(self.footprint, dtype=np.float64)],
+                num_beams=self.num_beams, nz=self.nz, a=self.a,
+                h_res_degrees=self.h_res_deg, device=self.device)
+            self.masks = None
+            self.R = self.G = self.robot_cell = None
+            return
+
         self.masks = torch.as_tensor(
-            self._make_masks(self.g_min, self.a, self.nz, self.footprint),
+            make_footprint_masks(self.g_min, self.a, self.nz, self.footprint),
             dtype=torch.float32, device=self.device)
         self.R = int(math.ceil(self.max_range / self.g_min)) + 2
         self.G = 2 * self.R + 1
@@ -483,11 +534,15 @@ class CnavCore(object):
             self._publish_goal_marker()
 
     def scan_callback(self, msg):
-        """Build occupied and observed-free robot-centric lidar grids.
+        """Turn one scan into whatever the backend consumes.
 
-        Cells crossed by each usable beam are known free up to its return; a
-        finite obstacle return marks the endpoint occupied. Cells beyond returns
+        The grid backend keeps occupied and observed-free robot-centric rasters:
+        cells crossed by each usable beam are known free up to its return, and a
+        finite obstacle return marks the endpoint occupied.  Cells beyond returns
         and outside the scan field of view remain unknown.
+
+        The point-set backend keeps the hit endpoints themselves, unquantised --
+        rasterising is the thing that backend exists to avoid.
         """
         if self.robot_state is None:
             return
@@ -503,6 +558,7 @@ class CnavCore(object):
         if not np.any(usable):
             self.occ_grid = None
             self.known_free_grid = None
+            self.hit_points = None
             return
 
         r_all, th_all = np.minimum(ranges[usable], hi), angles[usable]
@@ -529,11 +585,23 @@ class CnavCore(object):
         rel_x = (px * cy - py * sy) + trans[0]
         rel_y = (px * sy + py * cy) + trans[1]
 
+        # The trained grid's axis 1 runs to the robot's RIGHT, so the ROS left
+        # component is negated (see `ray_frame`).  Both backends share the
+        # conversion; only what happens to the result differs.
+        j = -rel_y if self.mirror_y else rel_y
+
+        if self.backend == "points":
+            # Obstacle points in the cost-ray frame, metres.  A beam that
+            # returned nothing is simply absent, which is equivalent to the
+            # training env's "push it far outside the window": the nearest
+            # contact with such a point is ~10x the sensor range away.
+            self.hit_points = np.stack((rel_x, j), axis=1)
+            self.occ_grid = None
+            self.known_free_grid = None
+            return
+
         g, R, G = self.g_min, self.R, self.G
         ci = R + np.round(rel_x / g).astype(np.int64)
-        # The trained grid's axis 1 runs to the robot's RIGHT, so the ROS left
-        # component is negated before quantisation (see `ray_frame`).
-        j = -rel_y if self.mirror_y else rel_y
         cj = R + np.round(j / g).astype(np.int64)
 
         occ = np.zeros((G, G), dtype=bool)
@@ -566,8 +634,34 @@ class CnavCore(object):
         self.known_free_grid = known_free
 
     # ------------------------------------------------------------- inference
+    def _pointset_intervals(self):
+        """Analytic (entry, width) ray segments from the lidar hit points.
+
+        Mirrors `SparrowCspaceEnv._pointset_intervals`: channel 0 is the entry
+        distance and channel 1 the contact's own width, in metres, shaped
+        `(1, C, B, nz)` -- the same tensor the grid backend produces.  Only the
+        configured channels are kept; a C above 2 is degenerate once obstacles
+        are points (there is no second gap), so the extra ones are zeroed rather
+        than left undefined.
+        """
+        shape = (1, self.num_beams, self.nz)
+        entry = torch.full(shape, self.max_range, dtype=torch.float32,
+                           device=self.device)
+        width = torch.zeros(shape, dtype=torch.float32, device=self.device)
+        if self.hit_points is not None and self.hit_points.shape[0] > 0:
+            pts = torch.as_tensor(self.hit_points[None, ...],
+                                  dtype=torch.float32, device=self.device)
+            entry, width, _collide = pointset_batch(
+                pts, self._fp_nrm, self._fp_h, self._fp_c,
+                self.a, self.max_range)
+
+        channels = [entry, width][:self.num_intervals]
+        while len(channels) < self.num_intervals:
+            channels.append(torch.zeros_like(entry))
+        return torch.stack(channels, dim=1)                     # (1,C,B,nz) m
+
     def _build_perception(self):
-        """Scan -> occupancy -> c-space -> ray segments -> processed grid.
+        """Scan -> ray segments -> processed grid, via the configured backend.
 
         Returns `(entry_rays, cr4)`: raw first-collision distances `(1,B,nz)`
         in metres and the processed `(1,C,B,nz)` ray grid consumed by the
@@ -579,26 +673,31 @@ class CnavCore(object):
         from startup, so it looks like a dead publisher rather than a policy
         that is simply not driving anywhere yet.
         """
-        if self.occ_grid is None or self.known_free_grid is None:
-            # Without a scan, every cell is unknown and every pose is invalid.
-            occ = torch.zeros((1, self.G, self.G), dtype=torch.bool, device=self.device)
-            known_free = torch.zeros_like(occ)
+        if self.backend == "points":
+            intervals = self._pointset_intervals()
         else:
-            occ = torch.as_tensor(self.occ_grid[None, ...], dtype=torch.bool,
+            if self.occ_grid is None or self.known_free_grid is None:
+                # Without a scan, every cell is unknown and every pose is invalid.
+                occ = torch.zeros((1, self.G, self.G), dtype=torch.bool,
                                   device=self.device)
-            known_free = torch.as_tensor(
-                self.known_free_grid[None, ...], dtype=torch.bool,
-                device=self.device)
+                known_free = torch.zeros_like(occ)
+            else:
+                occ = torch.as_tensor(self.occ_grid[None, ...], dtype=torch.bool,
+                                      device=self.device)
+                known_free = torch.as_tensor(
+                    self.known_free_grid[None, ...], dtype=torch.bool,
+                    device=self.device)
 
-        cspace = self._build_cspace(occ, self.masks, known_free)
-        intervals = self._cost_ray_intervals_3d(
-            cspace, self.robot_cell,
-            num_beams=self.num_beams, h_res_deg=self.h_res_deg,
-            max_range=self.max_range, g_min=self.g_min,
-            num_intervals=self.num_intervals)                # (1,C,B,nz) m
-        cr4 = self._preprocess_intervals(
+            cspace = build_cspace(occ, self.masks, known_free)
+            intervals = cost_ray_intervals_3d(
+                cspace, self.robot_cell,
+                num_beams=self.num_beams, h_res_deg=self.h_res_deg,
+                max_range=self.max_range, g_min=self.g_min,
+                num_intervals=self.num_intervals)            # (1,C,B,nz) m
+
+        cr4 = preprocess_cost_ray_intervals(
             intervals, max_range=self.max_range,
-            epsilon=self.g_min / 2.0).float()                  # (1,C,B,nz)
+            epsilon=self.g_min / 2.0).float()                   # (1,C,B,nz)
         return intervals[:, 0], cr4
 
     def _build_state(self, rays, cr4):
