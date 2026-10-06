@@ -46,12 +46,18 @@ map_frame: odom
 base_frame: base_link
 lidar_frame: laser_link
 
-# The beams at the two ends of the 240 deg FOV (idx 0-2 and 716-719, i.e. +-120
-# deg) clip the robot's own body at 0.05-0.09 m -- measured in open space, at
-# every heading.  Training's closest possible return is car_radius = 9 cm, so
-# this is below anything the policy ever saw; and at g_min = 0.1 it quantises
-# into a cell one step from the robot's own, which reddens all nz headings.
-scan_min_range: 0.09
+# The robot's own chassis, in base_link: the Limo's URDF collision union
+# (0.29 x 0.22 m -- its 0.13 x 0.12 m box plus the four wheel cylinders) inflated
+# by 2 cm.  Hits inside it are dropped before the cost rays are built.  Measured
+# on the Limo in an empty world the self-return appears only while driving
+# forward, on the last two beams at each end of the FOV, at 0.0500-0.0931 m.
+# See catkin_ws/src/cnav_ros/config/cnav_sparrow.yaml for the full note; this
+# file is a snapshot of it.
+body: [[0.165, 0.13], [0.165, -0.13], [-0.165, -0.13], [-0.165, 0.13]]
+
+# Floor only; 0 means the sensor's own range_min (0.05).  The body test above is
+# what removes the robot from its own scan.
+scan_min_range: 0.0
 
 rate: 10.0                   # Sparrow control interval is 0.1 s
 goal_tolerance: 0.3          # Sparrow target_area = 30 cm

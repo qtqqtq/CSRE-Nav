@@ -197,6 +197,42 @@ its hits; this node keeps the laser's own precision and solves for the contact
 distance directly. A real laser gives more precise hits than the sim's 8 cm
 quantisation — that is the intended sim→real direction, not a bug.
 
+## The robot in its own scan
+
+The laser sees the robot. `~body` is the polygon that gets removed before the
+cost rays are built — by default the Limo's URDF collision union (a 0.13 × 0.12 m
+chassis box plus four wheel cylinders, 0.29 × 0.22 m in all) inflated by 2 cm.
+It is the same polygon `evaluate/config/bench.yaml` calls `robot.body`.
+
+**Measured on the Limo in an empty world** — no obstacles, no walls, so every
+near return can only be the robot:
+
+| motion | raw scan minimum | self-returns |
+|---|---|---|
+| at rest | `inf` | 0 |
+| **driving straight** | **0.0500 m** | **beams 0-1 and 718-719 (±120°), 0.0500-0.0931 m** |
+| spinning in place | `inf` | 0 |
+| reversing | `inf` | 0 |
+
+Two things follow, and both matter:
+
+- **It is not there at rest.** A stationary robot scans itself cleanly, so this
+  is invisible to any check that does not drive the robot — and it appears
+  exactly when it does damage, sitting under the footprint and reddening all 30 θ
+  layers at once. The mechanism is the chassis box's near corners (at ±122.4°
+  when level, i.e. *just* outside the 240° FOV) swinging into the FOV as the body
+  pitches under drive.
+- **No scalar cutoff fits.** The worst self-return measured is **0.0931 m**, so
+  the `scan_min_range: 0.09` this replaced leaked it; and a cutoff high enough to
+  cover it would discard every genuine return out to 9 cm on every *other*
+  bearing. A polygon costs nothing outside the chassis instead: the horizon is
+  0.062 m dead ahead and 0.150 m at ±120°, and hits are tested for *containment*
+  rather than distance, because the laser sits outside the shape it clips.
+
+Verified end to end: driving the Limo in an empty world for 92 scans, the raw
+minimum is 0.0500 m and the minimum after `~body` is `inf`, with 193 returns
+dropped and nothing else touched.
+
 ## Reading the cost-ray image
 
 `/cnav_cost_ray_image` is the observation the actor consumes, drawn as a HUD
@@ -227,10 +263,17 @@ layer k = 29 ██████████████████████�
   the 3 m observation boundary. This is the single channel in the current policy.
 - **A fully red image is usually a phantom obstacle next to the robot, not a
   collision.** Every ray reads `entry = 0` when a hit point sits inside the
-  footprint. The usual cause is a laser self-return: any robot geometry or dust
-  within a few centimetres feeds a return that lands under the footprint and
-  reddens all 30 θ layers at once. Raise `~scan_min_range` above it — the shipped
-  profile uses `0.09`. Genuine collision reads the same way, so check the pose
+  footprint. Two things put one there, and they are worth telling apart:
+  - *The robot's own body.* `~body` removes it per beam (see
+    [The robot in its own scan](#the-robot-in-its-own-scan)). If the panel is red
+    *and the robot is driving forward*, suspect this.
+  - *A real obstacle inside the footprint.* Remember the footprint is an
+    **observation** shape, not the chassis: at 1.20 × 0.14 m its support reaches
+    **0.60 m dead ahead** and 0.49 m at ±43°, so a genuine obstacle half a metre
+    out reddens all 30 θ layers without anything being wrong with the perception.
+    Shrinking the footprint is the fix; a filter is not.
+
+  Genuine collision reads the same way again on top of both, so check the pose
   before blaming the perception.
 - **The heatmap follows the policy observation layout** used by
   `play_cspace.py`.
@@ -259,7 +302,8 @@ raise `~cost_ray_image_cell` on a large screen (10 ⇒ 360×300).
 | `~rate` | `10.0` | control rate (Hz); training used 0.1 s |
 | `~goal_tolerance` | `0.3` | arrival radius (m); training's `target_area` |
 | `~scan_max_range` | `0` | hits beyond this count as no-return; `0` ⇒ use `~cost_ray_max_range` |
-| `~scan_min_range` | `0` | ignore returns closer than this |
+| `~body` | 0.33 × 0.26 m box | robot chassis polygon in `base_frame`; hits inside it are dropped. `[]` disables |
+| `~scan_min_range` | `0` | ignore returns closer than this; a floor only, `0` ⇒ the sensor's own `range_min`. Not the self-return fix — see `~body` |
 | `~cost_ray_image_topic` | `/cnav_cost_ray_image` | cost-ray heatmap topic |
 | `~cost_ray_image_cell` | `5` | pixels per cost-ray cell in that image (5 ⇒ 180×150) |
 | `~publish_debug` | `true` | publish the goal marker and both cost-ray visualisations |

@@ -68,6 +68,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cnav_cspace import (footprint_constraints, pointset_batch,
                          preprocess_cost_ray_intervals)
 
+# The Limo's URDF collision union (0.29 x 0.22 m: its chassis box plus the four
+# wheel cylinders) inflated by 2 cm, in `base_frame`.  See `~body`.
+BODY_POLYGON_DEFAULT = [[0.165, 0.13], [0.165, -0.13], [-0.165, -0.13], [-0.165, 0.13]]
+
 
 # ---------------------------------------------------------------------------
 # Vendored actor networks
@@ -253,6 +257,34 @@ def resolve_model_dir(model_dir):
     return os.path.join(package_dir(), model_dir)
 
 
+def points_in_polygon(px, py, polygon):
+    """Even-odd point-in-polygon, vectorised over the points.
+
+    `polygon` is a closed list of (x, y) vertices in the same frame as the
+    points; the edge from the last vertex back to the first is included, so the
+    winding direction does not matter.
+
+    This is the body test in `~body`, and it is deliberately a containment test
+    rather than a ray-exit distance: the Limo's laser sits *outside* the shape it
+    clips (the chassis box is 3.8 cm astern of it), so "how far to the polygon's
+    far edge along this bearing" is undefined for most bearings while "is this
+    hit point on the robot" is well posed everywhere.
+    """
+    inside = np.zeros(np.shape(px), dtype=bool)
+    n = len(polygon)
+    for i in range(n):
+        x0, y0 = polygon[i]
+        x1, y1 = polygon[(i + 1) % n]
+        # Half-open in y, so a vertex exactly at a point's height counts once.
+        straddle = (y0 > py) != (y1 > py)
+        dy = y1 - y0
+        # Only straddling edges can contribute, and they have dy != 0, so the
+        # guarded denominator never feeds a live branch.
+        x_cross = x0 + (py - y0) * (x1 - x0) / np.where(dy == 0.0, 1.0, dy)
+        inside ^= straddle & (px < x_cross)
+    return inside
+
+
 def _kin_dim_of(state_dict, feature_dim, name=None):
     """Sniff the kinematic-block width out of an actor state dict.
 
@@ -387,6 +419,34 @@ class CnavCore(object):
         self.scan_max_range = scan_max if scan_max > 0.0 else self.max_range
         self.scan_min_range = float(rospy.get_param("~scan_min_range", 0.0))
 
+        # The robot's own chassis, as a polygon in `base_frame` (+x forward, +y
+        # left, metres).  Hits inside it are the laser seeing the robot and are
+        # dropped before the cost rays are built; `[]` disables the test.
+        #
+        # Default: the Limo's URDF collision union -- its 0.13 x 0.12 m chassis
+        # box plus the four wheel cylinders, i.e. 0.29 x 0.22 m -- inflated by
+        # 2 cm.  Same polygon as `evaluate/config/bench.yaml`'s `robot.body`,
+        # which measures contact the same way.
+        #
+        # A scalar range cutoff cannot do this job.  Measured on the Limo in an
+        # empty world, the self-return appears only while driving forward (not at
+        # rest, not spinning, not reversing) and only on the last two beams at
+        # each end of the FOV, at 0.0500-0.0931 m -- so the largest useful scalar
+        # cutoff (0.09) is *below* the worst self-return, while a cutoff large
+        # enough to cover it would also discard every genuine return out to 9 cm
+        # on every other bearing.
+        body = rospy.get_param("~body", BODY_POLYGON_DEFAULT)
+        if body in (None, [], ()):
+            self.body = None
+        else:
+            verts = np.asarray(body, dtype=np.float64)
+            if verts.ndim != 2 or verts.shape[1] != 2 or verts.shape[0] < 3:
+                raise ValueError("~body must be a list of >= 3 [x, y] pairs, got %r"
+                                 % (body,))
+            if not np.all(np.isfinite(verts)):
+                raise ValueError("~body has a non-finite vertex: %r" % (body,))
+            self.body = [tuple(v) for v in verts]
+
         self._load_actor()
         self._build_geometry()
 
@@ -395,6 +455,7 @@ class CnavCore(object):
         self.robot_velocity = np.zeros(2, dtype=np.float64)  # [m/s, rad/s]
         self.goal = None               # np.array([x, y])
         self.hit_points = None         # (M, 2) lidar hits, c-space frame, metres
+        self.n_body_hits = 0           # returns dropped by the `~body` test
         self.arrived = False
 
         self.vel_pub = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
@@ -541,6 +602,16 @@ class CnavCore(object):
         # body frame, metres: `rel_x` forward, `rel_y` to the robot's LEFT
         rel_x = (px * cy - py * sy) + trans[0]
         rel_y = (px * sy + py * cy) + trans[1]
+
+        # Drop the robot's own chassis, in `base_frame` and before the c-space
+        # frame flip, so the polygon stays a plain robot-geometry description.
+        # See `~body` for why this is a containment test and not a range cutoff.
+        self.n_body_hits = 0
+        if self.body is not None:
+            keep = ~points_in_polygon(rel_x, rel_y, self.body)
+            self.n_body_hits = int(np.count_nonzero(~keep))
+            if self.n_body_hits:
+                rel_x, rel_y = rel_x[keep], rel_y[keep]
 
         # The trained grid's axis 1 runs to the robot's RIGHT, so the ROS left
         # component is negated (see `ray_frame`).
