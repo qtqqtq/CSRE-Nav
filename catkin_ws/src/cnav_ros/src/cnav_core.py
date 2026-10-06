@@ -68,9 +68,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cnav_cspace import (footprint_constraints, pointset_batch,
                          preprocess_cost_ray_intervals)
 
-# The Limo's URDF collision union (0.29 x 0.22 m: its chassis box plus the four
-# wheel cylinders) inflated by 2 cm, in `base_frame`.  See `~body`.
-BODY_POLYGON_DEFAULT = [[0.165, 0.13], [0.165, -0.13], [-0.165, -0.13], [-0.165, 0.13]]
+# The Limo's URDF collision union (0.29 x 0.22 m: its 0.13 x 0.12 m chassis box
+# plus the four wheel cylinders), uninflated, in `base_frame`.  See `~body`.
+BODY_POLYGON_DEFAULT = [[0.145, 0.11], [0.145, -0.11], [-0.145, -0.11], [-0.145, 0.11]]
+
+# The same union plus a 2 cm observation margin.  See `~footprint`.
+FOOTPRINT_POLYGON_DEFAULT = [[0.165, 0.13], [0.165, -0.13],
+                             [-0.165, -0.13], [-0.165, 0.13]]
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +377,7 @@ class CnavCore(object):
         if self.num_intervals < 1:
             raise ValueError("~cost_ray_num_intervals must be >= 1")
         self.footprint = [[float(x), float(y)] for x, y in rospy.get_param(
-            "~footprint", [[0.6, 0.07], [0.6, -0.07], [-0.6, -0.07], [-0.6, 0.07]])]
+            "~footprint", FOOTPRINT_POLYGON_DEFAULT)]
 
         # `env`: the grid's 2nd axis runs to the robot's RIGHT, as built by
         #        SparrowCspaceEnv._build_occ_grid (both Sparrow families).
@@ -424,9 +428,13 @@ class CnavCore(object):
         # dropped before the cost rays are built; `[]` disables the test.
         #
         # Default: the Limo's URDF collision union -- its 0.13 x 0.12 m chassis
-        # box plus the four wheel cylinders, i.e. 0.29 x 0.22 m -- inflated by
-        # 2 cm.  Same polygon as `evaluate/config/bench.yaml`'s `robot.body`,
-        # which measures contact the same way.
+        # box plus the four wheel cylinders, i.e. 0.29 x 0.22 m -- left
+        # uninflated, so that it stays strictly inside the default `~footprint`
+        # (the same union + 2 cm).  That nesting is load-bearing, not tidy:
+        # `entry = 0` iff a hit is inside the *footprint*, so a body that covered
+        # the whole footprint would hide every genuine contact and the
+        # observation would lose its collision signal.  The visible contact band
+        # is the 2 cm shell between the two polygons.
         #
         # A scalar range cutoff cannot do this job.  Measured on the Limo in an
         # empty world, the self-return appears only while driving forward (not at

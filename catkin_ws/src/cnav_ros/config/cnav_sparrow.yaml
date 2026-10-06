@@ -1,10 +1,11 @@
 # CNN-SAC c-space policy -- one interval (1 x 36 x 30 rays).
 #
 # Uses the actor shipped in this package: model/exact_castray_interval1_0_actor.pth.
-# geometry source: SAC/settings.py CSPACE_* (36 beams, nz=30, a=2*pi/30, 3 m,
-# 1.20 x 0.14 m footprint).  Do not change `nz`/`a` independently of
-# the checkpoint -- the node validates the ray-grid shape at load and aborts on a
-# mismatch rather than running with a wrong observation.
+# geometry source: SAC/settings.py CSPACE_* (36 beams, nz=30, a=2*pi/30, 3 m).
+# Do not change `nz`/`a` independently of the checkpoint -- the node validates the
+# ray-grid shape at load and aborts on a mismatch rather than running with a wrong
+# observation.  The footprint is NOT part of that check and is not pinned by any
+# checkpoint; see `footprint` below.
 
 # --- model ---
 # This checkpoint uses one ray channel and four kinematic values. Relative
@@ -22,7 +23,25 @@ cost_ray_max_range: 3.0
 cost_ray_num_beams: 36
 cost_ray_h_res_degrees: 10.0
 cost_ray_num_intervals: 1
-footprint: [[0.6, 0.07], [0.6, -0.07], [-0.6, -0.07], [-0.6, 0.07]]
+# The robot's real collision footprint -- the URDF's collider union (0.13 x 0.12 m
+# chassis box plus four wheel cylinders, 0.29 x 0.22 m in all) -- plus a 2 cm
+# observation margin, i.e. 0.33 x 0.26 m.  This replaced a 1.20 x 0.14 m bar.
+#
+# Training does NOT use a fixed footprint: `train.py` passes
+# `random_footprint=settings.RANDOM_FOOTPRINT_ENABLED` (True), so each episode and
+# each parallel env draws its own union of 1-3 centred rectangles, L in
+# [0.35, 1.20] m, W in [0.12, 0.35] m, rotated arbitrarily (Sparrow_V2.py
+# `_randomize_footprint`).  `settings.ROBOT_FOOTPRINT` is only the `setdefault`
+# fallback for the non-random path, so what goes here is a *deployment choice*,
+# not something a checkpoint pins.
+#
+# The bar was not harmless: at 1.20 x 0.14 m its support reaches 0.60 m dead
+# ahead, so a genuine obstacle half a metre out reddens all nz layers and the
+# policy reads "in contact" with clear space around it.  At 0.33 x 0.26 m that
+# support drops to 0.165 m.
+#
+# The 2 cm margin is not cosmetic: it is the only room `~body` has.  See below.
+footprint: [[0.165, 0.13], [0.165, -0.13], [-0.165, -0.13], [-0.165, 0.13]]
 
 # The obstacles are the lidar hit points and the footprint is intersected with
 # them analytically: no raster, so obstacle positions keep full metric precision.
@@ -47,22 +66,29 @@ map_frame: odom
 base_frame: base_link
 lidar_frame: laser_link
 
-# The robot's own chassis, in base_link: the Limo's URDF collision union
-# (0.29 x 0.22 m -- its 0.13 x 0.12 m box plus the four wheel cylinders) inflated
-# by 2 cm.  Hits inside it are dropped before the cost rays are built.
+# The robot's own chassis, in base_link: the Limo's URDF collision union -- its
+# 0.13 x 0.12 m box plus the four wheel cylinders, 0.29 x 0.22 m -- UNINFLATED.
+# Hits inside it are dropped before the cost rays are built.
+#
+# It sits strictly inside `footprint` (2 cm of margin on every side), and that is
+# load-bearing rather than tidy: `entry = 0` iff the hit point is inside the
+# footprint, so if the mask covered the whole footprint no genuine contact could
+# ever register and the observation would lose its collision signal entirely.
+# The visible contact band is exactly the 2 cm shell between the two polygons.
 #
 # Measured on the Limo in an empty world, the self-return is a fixed structure
 # that appears ONLY while driving forward -- nothing at rest, spinning in place
 # or reversing -- on the last two beams at each end of the FOV (idx 0-1 and
-# 718-719, i.e. +-120 deg), at 0.0500-0.0931 m.  Left in, it sits under the
-# footprint and reddens all nz headings at once.
+# 718-719, i.e. +-120 deg), at 0.0500-0.0931 m.  In base_link that locus runs
+# from (0.078, +-0.043) to (0.057, +-0.081); the polygon's +-0.11 in y clears it
+# by 3 cm, and by 1 cm even at +2 sigma on the laser's 1 cm noise.
 #
 # This used to be `scan_min_range: 0.09`, which is a scalar and so cannot fit:
 # 0.09 is below the worst self-return measured (0.0931), and a cutoff large
 # enough to cover it would also throw away every genuine return out to 9 cm on
 # every other bearing.  The polygon removes the same hits per beam and costs
 # nothing outside the chassis.
-body: [[0.165, 0.13], [0.165, -0.13], [-0.165, -0.13], [-0.165, 0.13]]
+body: [[0.145, 0.11], [0.145, -0.11], [-0.145, -0.11], [-0.145, 0.11]]
 
 # Kept as a floor only.  0 means "the sensor's own range_min" (0.05 here); the
 # body test above, not this, is what removes the robot from its own scan.

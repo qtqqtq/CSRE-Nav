@@ -2,10 +2,11 @@
 # CNN-SAC c-space policy -- one interval (1 x 36 x 30 rays).
 #
 # Uses the 2e6-step one-interval actor from SAC/pytorch_models/interval_sweep_2m.
-# Geometry source: SAC/settings.py CSPACE_* (36 beams, nz=30, a=2*pi/30, 3 m,
-# 0.1 m cells, 1.20 x 0.14 m footprint).  Do not change `nz`/`a` independently of
-# the checkpoint -- the node validates the ray-grid shape at load and aborts on a
-# mismatch rather than running with a wrong observation.
+# Geometry source: SAC/settings.py CSPACE_* (36 beams, nz=30, a=2*pi/30, 3 m).
+# Do not change `nz`/`a` independently of the checkpoint -- the node validates the
+# ray-grid shape at load and aborts on a mismatch rather than running with a wrong
+# observation.  The footprint is NOT part of that check and is not pinned by any
+# checkpoint (training randomizes it per episode); see `footprint` below.
 
 # --- model ---
 # This checkpoint uses one ray channel and four kinematic values. Relative
@@ -23,7 +24,11 @@ cost_ray_max_range: 3.0
 cost_ray_num_beams: 36
 cost_ray_h_res_degrees: 10.0
 cost_ray_num_intervals: 1
-footprint: [[0.6, 0.07], [0.6, -0.07], [-0.6, -0.07], [-0.6, 0.07]]
+# The robot's real collision footprint (URDF collider union, 0.29 x 0.22 m) plus a
+# 2 cm observation margin.  Replaced a 1.20 x 0.14 m bar whose support reached
+# 0.60 m dead ahead, reddening all nz layers for an obstacle half a metre away.
+# See catkin_ws/src/cnav_ros/config/cnav_sparrow.yaml for the full note.
+footprint: [[0.165, 0.13], [0.165, -0.13], [-0.165, -0.13], [-0.165, 0.13]]
 
 # SparrowCspaceEnv builds its occupancy grid with axis 1 running to the robot's
 # RIGHT, i.e. mirrored w.r.t. the ROS body frame. The single channel is the
@@ -47,13 +52,14 @@ base_frame: base_link
 lidar_frame: laser_link
 
 # The robot's own chassis, in base_link: the Limo's URDF collision union
-# (0.29 x 0.22 m -- its 0.13 x 0.12 m box plus the four wheel cylinders) inflated
-# by 2 cm.  Hits inside it are dropped before the cost rays are built.  Measured
-# on the Limo in an empty world the self-return appears only while driving
-# forward, on the last two beams at each end of the FOV, at 0.0500-0.0931 m.
+# (0.29 x 0.22 m -- its 0.13 x 0.12 m box plus the four wheel cylinders),
+# UNINFLATED, and strictly inside `footprint` above.  Hits inside it are dropped
+# before the cost rays are built.  Measured on the Limo in an empty world the
+# self-return appears only while driving forward, on the last two beams at each
+# end of the FOV, at 0.0500-0.0931 m.
 # See catkin_ws/src/cnav_ros/config/cnav_sparrow.yaml for the full note; this
 # file is a snapshot of it.
-body: [[0.165, 0.13], [0.165, -0.13], [-0.165, -0.13], [-0.165, 0.13]]
+body: [[0.145, 0.11], [0.145, -0.11], [-0.145, -0.11], [-0.145, 0.11]]
 
 # Floor only; 0 means the sensor's own range_min (0.05).  The body test above is
 # what removes the robot from its own scan.

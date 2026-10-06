@@ -140,7 +140,7 @@ with a wrong observation (which would be silent and dangerous).
 
 | config | use with | ray grid | features | pipeline |
 |---|---|---|---|---|
-| `config/cnav_sparrow.yaml` | `model/exact_castray_interval1_0_actor.pth` | 1×36×30 | 64 | normalized first-entry distance, measured velocity, `env` frame, 0.5 m/s / 2 rad/s, 3 m, 1.20×0.14 m footprint |
+| `config/cnav_sparrow.yaml` | `model/exact_castray_interval1_0_actor.pth` | 1×36×30 | 64 | normalized first-entry distance, measured velocity, `env` frame, 0.5 m/s / 2 rad/s, 3 m, 0.33×0.26 m footprint |
 | `config/cnav_legacy_sparrow.yaml` | old one-channel checkpoints | incompatible | — | retained only as a historical geometry reference; retraining is required, and its checkpoint is not shipped |
 
 To deploy a different checkpoint, drop its `_actor.pth` into `model/` and point
@@ -200,9 +200,8 @@ quantisation — that is the intended sim→real direction, not a bug.
 ## The robot in its own scan
 
 The laser sees the robot. `~body` is the polygon that gets removed before the
-cost rays are built — by default the Limo's URDF collision union (a 0.13 × 0.12 m
-chassis box plus four wheel cylinders, 0.29 × 0.22 m in all) inflated by 2 cm.
-It is the same polygon `evaluate/config/bench.yaml` calls `robot.body`.
+cost rays are built — by default the Limo's URDF collision union, a 0.13 × 0.12 m
+chassis box plus four wheel cylinders, **0.29 × 0.22 m**, left uninflated.
 
 **Measured on the Limo in an empty world** — no obstacles, no walls, so every
 near return can only be the robot:
@@ -226,8 +225,20 @@ Two things follow, and both matter:
   the `scan_min_range: 0.09` this replaced leaked it; and a cutoff high enough to
   cover it would discard every genuine return out to 9 cm on every *other*
   bearing. A polygon costs nothing outside the chassis instead: the horizon is
-  0.062 m dead ahead and 0.150 m at ±120°, and hits are tested for *containment*
+  0.042 m dead ahead and 0.127 m at ±120°, and hits are tested for *containment*
   rather than distance, because the laser sits outside the shape it clips.
+
+**The mask has to sit strictly inside `~footprint`.** `entry = 0` holds exactly
+when a hit is inside the *footprint*, so a body covering the whole footprint would
+hide every genuine contact and the observation would lose its collision signal
+altogether. The default pair nests with 2 cm to spare — 0.29 × 0.22 inside
+0.33 × 0.26 — and that 2 cm shell is the entire band in which a real contact can
+still be seen: the footprint's horizon is 0.062 m dead ahead and 0.150 m at ±120°,
+against the body's 0.042 m and 0.127 m.
+
+The self-return locus in `base_link` runs from (0.078, ±0.043) to (0.057, ±0.081)
+over the beams measured; the mask clears it by 3 cm, and still by 1 cm at +2σ on
+the laser's 1 cm noise.
 
 Verified end to end: driving the Limo in an empty world for 92 scans, the raw
 minimum is 0.0500 m and the minimum after `~body` is `inf`, with 193 returns
@@ -268,10 +279,12 @@ layer k = 29 ██████████████████████�
     [The robot in its own scan](#the-robot-in-its-own-scan)). If the panel is red
     *and the robot is driving forward*, suspect this.
   - *A real obstacle inside the footprint.* Remember the footprint is an
-    **observation** shape, not the chassis: at 1.20 × 0.14 m its support reaches
-    **0.60 m dead ahead** and 0.49 m at ±43°, so a genuine obstacle half a metre
-    out reddens all 30 θ layers without anything being wrong with the perception.
-    Shrinking the footprint is the fix; a filter is not.
+    **observation** shape, not the chassis: at 0.33 × 0.26 m its support reaches
+    **0.165 m dead ahead**, so an obstacle that close reddens all 30 θ layers
+    without anything being wrong with the perception. It used to be a 1.20 × 0.14 m
+    bar, whose 0.60 m support meant an obstacle **half a metre away** did the same
+    — that is what shrinking the footprint fixed, and it is why the footprint is
+    the real collision shape plus 2 cm rather than a long planning bar.
 
   Genuine collision reads the same way again on top of both, so check the pose
   before blaming the perception.
@@ -294,7 +307,7 @@ raise `~cost_ray_image_cell` on a large screen (10 ⇒ 360×300).
 | `~cost_ray_num_beams` | `36` | beams per layer |
 | `~cost_ray_h_res_degrees` | `10.0` | beam spacing |
 | `~cost_ray_num_intervals` | `1` | ray channels; must match the checkpoint |
-| `~footprint` | `[[0.6,0.07],…]` | robot polygon, metres, +x forward |
+| `~footprint` | 0.33 × 0.26 m box | robot polygon, metres, +x forward — the real collider union + 2 cm |
 | `~ray_frame` | `env` | `env` \| `ros` — see above |
 | `~preprocess` | `interval` | divide each interval distance by max range |
 | `~v_linear_max`, `~v_angular_max` | `0.5`, `2.0` | action scale (m/s, rad/s) |
@@ -302,7 +315,7 @@ raise `~cost_ray_image_cell` on a large screen (10 ⇒ 360×300).
 | `~rate` | `10.0` | control rate (Hz); training used 0.1 s |
 | `~goal_tolerance` | `0.3` | arrival radius (m); training's `target_area` |
 | `~scan_max_range` | `0` | hits beyond this count as no-return; `0` ⇒ use `~cost_ray_max_range` |
-| `~body` | 0.33 × 0.26 m box | robot chassis polygon in `base_frame`; hits inside it are dropped. `[]` disables |
+| `~body` | 0.29 × 0.22 m box | robot chassis polygon in `base_frame`; hits inside it are dropped. Must stay strictly inside `~footprint`. `[]` disables |
 | `~scan_min_range` | `0` | ignore returns closer than this; a floor only, `0` ⇒ the sensor's own `range_min`. Not the self-return fix — see `~body` |
 | `~cost_ray_image_topic` | `/cnav_cost_ray_image` | cost-ray heatmap topic |
 | `~cost_ray_image_cell` | `5` | pixels per cost-ray cell in that image (5 ⇒ 180×150) |
