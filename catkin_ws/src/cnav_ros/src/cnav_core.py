@@ -740,12 +740,19 @@ class CnavCore(object):
         """Render normalized first-entry distance as an rgb8 debug image.
 
         The actor consumes the configured ray-segment channels. This RViz
-        image displays channel 0 only: columns are beams, rows are theta layers,
-        red means a nearby entry and green means clear/far.
+        image displays channel 0 only: columns are beams rolled so that beam 0
+        (the robot's front) is the centre column, rows are theta layers, red
+        means a nearby entry and green means clear/far.
         """
         cell = self.cost_ray_image_cell
         proc = cr4[0, 0].detach().cpu().numpy()                 # (B, nz)
         v = np.clip(proc, 0.0, 1.0)                             # (B, nz)
+        # Roll the beam axis by half a turn so the robot's FRONT (beam 0) is the
+        # centre column and its rear falls on the two edges, matching the HUD
+        # panel in SAC/render_utils.draw_cost_rays.  Bearing increases to the
+        # robot's right, so the left half of the image is its left side.
+        # Display only: the actor consumes the unrolled beam order.
+        v = np.roll(v, self.num_beams // 2, axis=0)
         # Transposing to (nz, B, 3) puts the beam on the image x axis and the
         # heading layer on y, the orientation play_cspace draws it in.
         rgb = np.empty((self.nz, self.num_beams, 3), dtype=np.uint8)

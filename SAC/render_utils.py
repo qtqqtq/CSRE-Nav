@@ -54,7 +54,9 @@ def draw_cost_rays(env, font):
          for each beam, the nearest footprint-collision distance
          (min over the nz theta layers) in world coordinates.
       2. HUD heatmaps     -- the configured B×nz normalized distance channels
-         consumed by the CNN.
+         consumed by the CNN, drawn with the beam axis rolled by half a turn so
+         the robot's front is in the middle of the panel and its rear falls off
+         both edges.
     """
     if env.window is None or getattr(env, "cost_rays_raw", None) is None:
         return
@@ -85,12 +87,22 @@ def draw_cost_rays(env, font):
 
     # --- HUD heatmaps: processed interval-ray input (C x B x nz) ---
     proc = env.cost_rays_proc[env.ri].detach().cpu().numpy()
+    # Roll the beam axis by half a turn for display.  The stored order runs
+    # beam 0 (front) .. beam 35, which would put the robot's FRONT at the left
+    # edge and its rear in the middle; rolled, front sits in the middle column
+    # and the rear is split across the two edges.  Bearing increases to the
+    # robot's right, so the left half of the panel is the robot's left side and
+    # the right half its right side -- a top-down view of a robot facing "up".
+    # Display only: the tensor the CNN consumes keeps its original beam order.
+    num_beams = proc.shape[1]
+    proc = proc[:, (np.arange(num_beams) + num_beams // 2) % num_beams, :]
     C, B, L = proc.shape
     cell = 5
     W, H = B * cell, L * cell
     panel_h = C * (H + 16) + 4
     panel = pygame.Surface((W + 4, panel_h), pygame.SRCALPHA)
     panel.fill((0, 0, 0, 160))
+    front_x = 2 + (B // 2) * cell                            # centre column = beam 0
     for c in range(C):
         y0 = c * (H + 16)
         if c == 0:
@@ -108,7 +120,17 @@ def draw_cost_rays(env, font):
                     panel, col,
                     (2 + i * cell, y0 + 16 + j * cell, cell, cell),
                 )
-    env.window.blit(panel, (env.window_size - W - 12, 8))
+        # Front marker last, so the heat cells cannot paint over it.
+        panel.fill((255, 255, 255), (front_x, y0 + 16, 1, H))
+    panel_x = env.window_size - W - 12
+    env.window.blit(panel, (panel_x, 8))
+    caption = font.render("front (beam 0) = centre line", True, (220, 220, 220))
+    tag = pygame.Surface((caption.get_width() + 8, caption.get_height() + 4),
+                         pygame.SRCALPHA)
+    tag.fill((0, 0, 0, 160))
+    tag.blit(caption, (4, 2))
+    env.window.blit(tag, (env.window_size - tag.get_width() - 12,
+                          8 + panel_h + 4))
 
 
 def draw_interval_rays(env, font, legend=True):

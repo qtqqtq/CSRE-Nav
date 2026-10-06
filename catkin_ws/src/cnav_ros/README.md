@@ -203,18 +203,25 @@ quantisation — that is the intended sim→real direction, not a bug.
 panel (`SAC/play_cspace.py`'s layout) and republished for rviz's Image display:
 
 ```
-        beam b = 0 ────────────────────────► b = 35      (10° apart)
-layer k = 0  ████████████████████████████   ← robot keeps its current heading
+               rear            FRONT           rear
+image column i ──► beam (i + 18) % 36            (10° apart)
+        b = 18 ───────────── b = 0 ───────────── b = 17
+layer k = 0  ██████████████████████████████████████████  ← robot keeps its heading
    (θ = 0)
-   │              ▓▓▓▓▓▓                      red   = obstacle close
-   │              ▓▓▓▓▓▓                      green = free / far
-   ▼                                          colour = (255(1-v), 255v, 40)
-layer k = 29 ████████████████████████████        v = first_entry / max_range
+   │                        ▓▓▓▓                    red   = obstacle close
+   │                        ▓▓▓▓                    green = free / far
+   ▼                                                colour = (255(1-v), 255v, 40)
+layer k = 29 ██████████████████████████████████████████   v = first_entry / max_range
 ```
 
 - **x axis is the beam** (0..35 at 10°, so 360° across), **y axis is the θ layer**
   (0..nz-1) — row 0 is the layer where the robot holds its current heading.
-  Neither axis is unwrapped or rotated; the layout is exactly play_cspace's.
+  The beam axis is **rolled by half a turn**, so the robot's front (beam 0) is the
+  centre column and its rear is split across the two edges — the same view
+  `play_cspace.py` draws. Bearing increases to the robot's right, so the left half
+  of the image is the robot's left side. This is a display roll only: the actor
+  consumes the unrolled beam order, and the θ axis is neither unwrapped nor
+  rotated.
 - **The colour is channel 0 after normalization, not the raw distance.**
   `v = first_entry / max_range`; the image is red near an obstacle and green at
   the 3 m observation boundary. This is the single channel in the current policy.
