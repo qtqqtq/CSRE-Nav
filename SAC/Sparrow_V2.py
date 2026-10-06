@@ -540,6 +540,22 @@ class Sparrow():
         # 移动障碍物, 注意vec_dynamic_obs_P_shaped会与vec_dynamic_obs_P数据联动
         self.vec_dynamic_obs_P += self.Obs_V_tensor*self.dynamic_obs_mask  # (N,O,P,2) += (N,O,1,2)
 
+        # 查看哪些环境的哪些障碍物的x轴/y轴速度需要反向：
+        Vx_reverse = ((self.vec_dynamic_obs_P[:, :, :, 0] < self.l_margin) + (self.vec_dynamic_obs_P[:, :, :, 0] > self.h_margin)).any(dim=-1)  # (N,O)
+        Vy_reverse = ((self.vec_dynamic_obs_P[:, :, :, 1] < self.l_margin) + (self.vec_dynamic_obs_P[:, :, :, 1] > self.h_margin)).any(dim=-1)  # (N,O)
+        # 对越界的障碍物速度反向:
+        V_reverse = torch.stack([Vx_reverse, Vy_reverse], dim=2).unsqueeze(2)
+        self.Obs_V_tensor[V_reverse] *= -1
+
+        # 再整体回拉到活动域内。速度反向只改变下一帧的移动方向, 越界的点本身并不会被拉回:
+        # 初始分散就可能落在 [l_margin, h_margin] 之外, 加上RdOV的随机扰动后坐标还会缓慢
+        # 向外游走(实测约1e4步就到 800 = window_size), 渲染时 fancy-index 直接越界。
+        # 按障碍物整体平移(不改形状)回拉, 与上面的速度反向合起来才是"反弹"。
+        self.vec_dynamic_obs_P += (
+            (self.l_margin - self.vec_dynamic_obs_P.amin(dim=2, keepdim=True)).clamp(min=0)
+            - (self.vec_dynamic_obs_P.amax(dim=2, keepdim=True) - self.h_margin).clamp(min=0)
+        ) * self.dynamic_obs_mask
+
         # 对动态障碍物进行编码，以用于后续雷达扫描:
         self.vec_bound_code = (self.vec_dynamic_obs_P_shaped[:,:,0,0]*self.window_size +self.vec_dynamic_obs_P_shaped[:,:,1,0]).unsqueeze(1) # (N,1,O*P)
         # 加入静态障碍物：
@@ -547,13 +563,6 @@ class Sparrow():
         # 加入地图障碍物
         if self.MapObs: self.vec_bound_code = torch.cat((self.vec_map_bound_code,self.vec_bound_code), dim=-1)
 
-
-        # 查看哪些环境的哪些障碍物的x轴/y轴速度需要反向：
-        Vx_reverse = ((self.vec_dynamic_obs_P[:, :, :, 0] < self.l_margin) + (self.vec_dynamic_obs_P[:, :, :, 0] > self.h_margin)).any(dim=-1)  # (N,O)
-        Vy_reverse = ((self.vec_dynamic_obs_P[:, :, :, 1] < self.l_margin) + (self.vec_dynamic_obs_P[:, :, :, 1] > self.h_margin)).any(dim=-1)  # (N,O)
-        # 对越界的障碍物速度反向:
-        V_reverse = torch.stack([Vx_reverse, Vy_reverse], dim=2).unsqueeze(2)
-        self.Obs_V_tensor[V_reverse] *= -1
 
     def _ld_scan_vec(self):
         '''Get the scan result (in vectorized worlds) of lidars.
@@ -834,7 +843,11 @@ class Sparrow():
         self.obs_canvas_torch[self.vec_static_obs_P_shaped[self.ri,:,0],self.vec_static_obs_P_shaped[self.ri,:,1]] = 0
         if getattr(self, "cross_wall", False):
             self.obs_canvas_torch[torch.from_numpy(self.wall_clear_cpu[self.ri])] = 255
-        self.obs_canvas_torch[self.vec_dynamic_obs_P_shaped[self.ri,:,0],self.vec_dynamic_obs_P_shaped[self.ri,:,1]] = 105 #101, 104, 105
+        # 渲染下标必须落在画布内。位置本身已由 _obstacle_move 回拉到活动域, 这里再兜一层,
+        # 免得任何越界坐标让渲染直接 IndexError。clamp 不能就地做: vec_dynamic_obs_P_shaped
+        # 是 vec_dynamic_obs_P 的视图, 就地截断会反过来改动仿真状态。
+        dyn_obs = self.vec_dynamic_obs_P_shaped[self.ri].clamp(0, self.window_size - 1)
+        self.obs_canvas_torch[dyn_obs[:,0], dyn_obs[:,1]] = 105 #101, 104, 105
         obstacles = pygame.surfarray.make_surface(self.obs_canvas_torch.numpy())
         self.canvas.blit(obstacles, self.canvas.get_rect())
         self._draw_wall_overlay()
@@ -1060,7 +1073,11 @@ class Sparrow_PlayGround(Sparrow):
         self.obs_canvas_torch[self.vec_static_obs_P_shaped[self.ri,:,0],self.vec_static_obs_P_shaped[self.ri,:,1]] = 0
         if getattr(self, "cross_wall", False):
             self.obs_canvas_torch[torch.from_numpy(self.wall_clear_cpu[self.ri])] = 255
-        self.obs_canvas_torch[self.vec_dynamic_obs_P_shaped[self.ri,:,0],self.vec_dynamic_obs_P_shaped[self.ri,:,1]] = 105 #101, 104, 105
+        # 渲染下标必须落在画布内。位置本身已由 _obstacle_move 回拉到活动域, 这里再兜一层,
+        # 免得任何越界坐标让渲染直接 IndexError。clamp 不能就地做: vec_dynamic_obs_P_shaped
+        # 是 vec_dynamic_obs_P 的视图, 就地截断会反过来改动仿真状态。
+        dyn_obs = self.vec_dynamic_obs_P_shaped[self.ri].clamp(0, self.window_size - 1)
+        self.obs_canvas_torch[dyn_obs[:,0], dyn_obs[:,1]] = 105 #101, 104, 105
         obstacles = pygame.surfarray.make_surface(self.obs_canvas_torch.numpy())
         self.canvas.blit(obstacles, self.canvas.get_rect())
         self._draw_wall_overlay()
