@@ -9,10 +9,8 @@ State / action conventions:
     - state  : (N, RAY_CHANNELS×RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM) =
                flatten([first entry, occupied width, free width, ...]) +
                [dist, heading, normalized actual v, normalized actual w]
-    - action : actor outputs tanh(-1,1); env receives
-               a_in = settings.map_continuous_action(action)
-               (linear a0 in [-1,1] when settings.ALLOW_REVERSE else [0,1];
-                angular a1 in [-1,1])
+    - action : actor outputs tanh(-1,1) and env receives it unchanged
+               (linear a0 in [-1,1], negative = reverse; angular a1 in [-1,1])
     - reward : Sparrow's native reward (+200 win / -200 collide / -200 exceed,
                plus goal-seeking shaping)
 
@@ -31,7 +29,7 @@ import torch
 from replay_buffer import ReplayBuffer
 from Sparrow_V2 import SparrowCspaceEnv
 from cnn_network import CNNSAC
-from render_utils import draw_hud, draw_cost_rays, draw_cspace_projection
+from render_utils import draw_hud, draw_cost_rays
 import settings
 
 
@@ -45,14 +43,10 @@ def positive_int(value):
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--intervals", type=positive_int,
                     default=settings.CSPACE_COST_RAY_NUM_INTERVALS)
-parser.add_argument("--backend", choices=("grid", "points"),
-                    default=settings.CSPACE_BACKEND,
-                    help="c-space observation geometry: grid (raster) or "
-                         "points (analytic lidar point set)")
 parser.add_argument("--steps", type=positive_int,
                     default=int(settings.MAX_TIMESTEPS),
                     help="number of vectorized transitions to collect")
-parser.add_argument("--name", default="interval_cspace_2",
+parser.add_argument("--name", default="exact_castray_interval1_0",
                     help="checkpoint and result basename")
 parser.add_argument("--model-dir", default=settings.MODEL_DIR)
 parser.add_argument("--results-dir", default=settings.RESULTS_DIR)
@@ -76,8 +70,8 @@ batch_size = 256
 buffer_size = args.buffer_size
 file_name = args.name
 save_model = True
-load_model = True
-load_model_name = "interval_cspace_1"
+load_model = False
+load_model_name = "interval_cspace_2"
 
 train_every = 5             # env-steps between training calls
 gradient_steps = 5          # gradient steps per training call (1:1 with steps)
@@ -156,8 +150,7 @@ def evaluate(network, env, eval_steps=EVAL_STEPS):
                     kin = state[:, RAY_GRID_FLAT_DIM:]
                     with torch.no_grad():
                         action = network.actor.get_mean_action(rg, kin)
-                    a_in = settings.map_continuous_action(action)
-                    state, reward, dw, tr, _ = env.step(a_in)
+                    state, reward, dw, tr, _ = env.step(action)
                     episode_reward += reward
                     done = dw | tr
                     if done.any():
@@ -192,14 +185,14 @@ env_kwargs = dict(
     action_type="Continuous",
     stuck_reset=settings.SPARROW_STUCK_RESET,
     stuck_threshold=settings.SPARROW_STUCK_THRESHOLD,
+    ld_num=settings.SPARROW_LD_NUM,
     ld_acc=settings.SPARROW_LD_ACC,
     random_footprint=settings.RANDOM_FOOTPRINT_ENABLED,
     render_mode="human" if RENDER else None,
     render_speed=RENDER_SPEED,
     ri=RENDER_ENV,
     max_ep_steps=settings.MAX_STEPS,
-    cspace_cfg={"cost_ray_num_intervals": RAY_CHANNELS,
-                "backend": args.backend},
+    cspace_cfg={"cost_ray_num_intervals": RAY_CHANNELS},
 )
 env = SparrowCspaceEnv(**env_kwargs)
 eval_env = SparrowCspaceEnv(**{**env_kwargs, "render_mode": None})
@@ -269,9 +262,7 @@ while total_steps < args.steps:
     # sample stochastic action (SAC reparameterized), tanh(-1,1)
     with torch.no_grad():
         action, _ = network.actor.sample(rg, kin)              # (N,2)
-    a_in = settings.map_continuous_action(action)
-
-    next_state, reward, dw, tr, _ = env.step(a_in)
+    next_state, reward, dw, tr, _ = env.step(action)
     done = dw | tr
 
     # store N transitions (t = terminal flag only; truncation bootstraps)
@@ -305,10 +296,9 @@ while total_steps < args.steps:
     env_steps += 1
 
     # 可视化：渲染第 RENDER_ENV 号环境（base 帧已在 env.step 内部绘制，
-    # 这里叠加 cost rays / c-space 投影 / HUD 后统一 flush 一次）
+    # 这里叠加 cost rays / HUD 后统一 flush 一次）
     if RENDER:
         draw_cost_rays(env, font)
-        draw_cspace_projection(env, font)
         draw_hud(env, font, float(reward[RENDER_ENV].item()),
                  float(ep_rewards[RENDER_ENV].item()))
         pygame.display.update()

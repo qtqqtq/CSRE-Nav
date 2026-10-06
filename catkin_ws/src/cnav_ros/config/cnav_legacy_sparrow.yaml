@@ -2,7 +2,7 @@
 #
 # Use with: SAC_sparrow_cspace, SAC_sparrow_cspace_{1..4}
 # Geometry source: SAC/sparrow_cspace_env.py @ 289333b SPARROW_CSPACE_CFG
-# (g_min 0.1, a 0.698 -> nz 10, 3 m, same 1.20 x 0.14 m footprint).  Only the theta
+# (a 0.698 -> nz 10, 3 m, same 1.20 x 0.14 m footprint).  Only the theta
 # resolution differs from the current generation; the ray pipeline, the grid
 # handedness, the log encoding and the velocity scale are identical.
 #
@@ -15,7 +15,6 @@ device: cuda
 stochastic: false            # false = tanh(mean), the deterministic eval policy
 
 # --- c-space geometry (must match training) ---
-g_min: 0.1
 nz: 10
 a: 0.698
 cost_ray_max_range: 3.0
@@ -29,7 +28,6 @@ preprocess: log
 # --- action scaling (same Sparrow continuous_scale) ---
 v_linear_max: 0.5
 v_angular_max: 2.0
-allow_reverse: true
 velocity_filter_k: [0.55, 0.60]  # Sparrow K_linear, K_angular
 
 # --- io / frames ---

@@ -34,7 +34,6 @@ preprocess: interval
 # --- action scaling: v = 50 cm/s * a0, omega = 2 rad/s * a1 ---
 v_linear_max: 0.5
 v_angular_max: 2.0
-allow_reverse: true          # settings.ALLOW_REVERSE
 # Sparrow dynamics: velocity = K * previous + (1-K) * target.
 velocity_filter_k: [0.55, 0.60]  # [linear, angular]
 

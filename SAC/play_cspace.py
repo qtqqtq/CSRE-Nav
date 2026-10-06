@@ -11,7 +11,7 @@ Usage (inside the container, with a display / GPU):
 
 The model consumes the
 (RAY_CHANNELS×RAY_H_BEAMS×RAY_V_LAYERS + KINEMATIC_DIM)-dim c-space state
-(by default 3×36×30 + 4 = 3244 ray-segment grid +
+(by default 1×36×30 + 4 = 1084 ray-segment grid +
 [dist, heading, normalized actual v, normalized actual w]), so it must have been
 trained on `SparrowCspaceEnv` (e.g. `SAC_sparrow_cspace`).
 
@@ -35,14 +35,13 @@ import torch
 import settings
 from Sparrow_V2 import str2bool, Sparrow, SparrowCspacePlayground
 from cnn_network import CNNSAC
-from render_utils import (draw_hud, draw_cost_rays, draw_interval_rays,
-                          draw_cspace_projection, draw_lidar_ogm)
+from render_utils import draw_hud, draw_cost_rays, draw_interval_rays
 
 
 parser = argparse.ArgumentParser()
 
 # ---- Model / agent ----
-parser.add_argument('--ModelName', type=str, default='interval_cspace_2',
+parser.add_argument('--ModelName', type=str, default='exact_castray_interval1_0',
                     help='model basename in pytorch_models (e.g. SAC_sparrow_cspace)')
 parser.add_argument('--ModelDir', type=str, default=settings.MODEL_DIR,
                     help='directory holding *_actor.pth / *_critic.pth')
@@ -69,7 +68,7 @@ parser.add_argument('--ld_d_range', type=int,
                     default=int(round(settings.CSPACE_COST_RAY_MAX_RANGE * 100)),
                     help='max lidar range (cm); defaults to the training value, '
                          'which is exactly the c-space observation range')
-parser.add_argument('--ld_num', type=int, default=36,
+parser.add_argument('--ld_num', type=int, default=settings.SPARROW_LD_NUM,
                     help='number of lidar rays per world (training default; '
                          'the c-space observation is built from these hits)')
 parser.add_argument('--ld_GN', type=int, default=3,
@@ -77,10 +76,6 @@ parser.add_argument('--ld_GN', type=int, default=3,
 parser.add_argument('--ld_acc', type=int, default=settings.SPARROW_LD_ACC,
                     help='lidar DDA step size in cm (training default; the '
                          'default 3 cm here used to disagree with training)')
-parser.add_argument('--backend', choices=('grid', 'points'),
-                    default=settings.CSPACE_BACKEND,
-                    help='c-space observation geometry: grid (raster) or '
-                         'points (analytic lidar point set)')
 
 # ---- Stuck auto-reset (cost rays ~0 in every direction) ----
 parser.add_argument('--stuck_reset', type=str2bool, default=settings.SPARROW_STUCK_RESET,
@@ -122,7 +117,6 @@ def main():
         stuck_reset=opt.stuck_reset,
         stuck_threshold=opt.stuck_threshold,
         random_footprint=settings.RANDOM_FOOTPRINT_ENABLED,
-        cspace_cfg={"backend": opt.backend},
     )
 
     network = CNNSAC(
@@ -167,24 +161,20 @@ def main():
             else:
                 action, _ = network.actor.sample(rg, kin)
 
-            # 当前执行动作的 Q 估计(双 critic): 与训练约定一致 —— 喂原始 tanh(-1,1) 动作,
-            # 而非映射后的 a_in(env 真正执行的物理速度)。min-Q 是 SAC 优化的目标。
+            # 当前执行动作的 Q 估计(双 critic): 喂原始 tanh(-1,1) 动作，也就是
+            # env 真正执行的那个（动作映射已是恒等）。min-Q 是 SAC 优化的目标。
             q1, q2 = network.critic(rg, kin, action)
             q_pair = (float(q1.item()), float(q2.item()))
 
-        # same action convention as training: linear a0 in [-1,1] if ALLOW_REVERSE
-        a_in = settings.map_continuous_action(action)
-        s, r, dw, tr, info = env.step(a_in)
+        s, r, dw, tr, info = env.step(action)
 
         # PlayGround 的 reward 恒为 0；用训练用的完整奖励函数实时重算并显示
-        Sparrow._reward_function(env, a_in)
+        Sparrow._reward_function(env, action)
         reward_val = float(env.reward_vec.item())
         ep_reward += reward_val
         draw_cost_rays(env, font)
         if opt.interval_rays:
             draw_interval_rays(env, font)
-        draw_cspace_projection(env, font)
-        draw_lidar_ogm(env, font)
         draw_hud(env, font, reward_val, ep_reward, q_pair=q_pair)
         pygame.display.update()   # 每帧在所有叠加层绘制完成后只 flush 一次，避免闪动
         if bool(dw.item()):   # win / collide / stuck -> 一个 episode 结束，累计奖励清零

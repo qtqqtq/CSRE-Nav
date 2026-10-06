@@ -13,7 +13,6 @@ is caught before a rollout instead of mid-navigation.
 
 import argparse
 import glob
-import math
 import os
 import sys
 
@@ -31,9 +30,8 @@ import yaml
 from cnav_core import (KINEMATIC_DIM, RAY_CHANNELS, _ActorDeterministic,
                        _ActorStochastic, _arch_of, _BackboneNew, _BackboneOld,
                        _kin_dim_of, _ray_channels_of, resolve_model_dir)
-from cnav_cspace import (build_cspace, cost_ray_intervals_3d,
-                         footprint_constraints, make_footprint_masks,
-                         pointset_batch, preprocess_cost_ray_intervals)
+from cnav_cspace import (footprint_constraints, pointset_batch,
+                         preprocess_cost_ray_intervals)
 
 # models this node supports are the CNN c-space actors; the MLP SAC_laser_* and
 # the *_critic.pth files are not
@@ -109,39 +107,24 @@ def check(name, cfg):
     actor.eval()
 
     # one real observation -> action, through the same helper pipeline the node
-    # uses -- including the backend, since the two disagree on geometry
-    g_min, nz, beams = cfg["g_min"], cfg["nz"], cfg["cost_ray_num_beams"]
+    # uses
+    nz, beams = cfg["nz"], cfg["cost_ray_num_beams"]
     a, max_range = cfg["a"], cfg["cost_ray_max_range"]
-    backend = cfg.get("backend", "grid")
-    if backend == "points":
-        # A single hit point 1 m ahead on the robot's +x axis.
-        fp_nrm, fp_h, fp_c = footprint_constraints(
-            [np.asarray(cfg["footprint"], dtype=np.float64)],
-            num_beams=beams, nz=nz, a=a,
-            h_res_degrees=cfg["cost_ray_h_res_degrees"])
-        pts = torch.zeros((1, 1, 2))
-        pts[0, 0, 0] = 1.0
-        entry, width, _collide = pointset_batch(pts, fp_nrm, fp_h, fp_c,
-                                                a, max_range)
-        channels = [entry, width][:ray_channels]
-        while len(channels) < ray_channels:
-            channels.append(torch.zeros_like(entry))
-        intervals = torch.stack(channels, dim=1)
-    else:
-        masks = torch.as_tensor(
-            make_footprint_masks(g_min, a, nz, cfg["footprint"]),
-            dtype=torch.float32)
-        R = int(math.ceil(max_range / g_min)) + 2
-        G = 2 * R + 1
-        occ = torch.zeros((1, G, G), dtype=torch.bool)
-        occ[0, R + 10, R + 3] = True                # a single obstacle 1 m ahead
-        cspace = build_cspace(occ, masks, torch.ones_like(occ))
-        intervals = cost_ray_intervals_3d(
-            cspace, torch.full((1, 2), R, dtype=torch.long),
-            num_beams=beams, h_res_deg=cfg["cost_ray_h_res_degrees"],
-            max_range=max_range, g_min=g_min, num_intervals=ray_channels)
+    # A single hit point 1 m ahead on the robot's +x axis.
+    fp_nrm, fp_h, fp_c = footprint_constraints(
+        [np.asarray(cfg["footprint"], dtype=np.float64)],
+        num_beams=beams, nz=nz, a=a,
+        h_res_degrees=cfg["cost_ray_h_res_degrees"])
+    pts = torch.zeros((1, 1, 2))
+    pts[0, 0, 0] = 1.0
+    entry, width, _collide = pointset_batch(pts, fp_nrm, fp_h, fp_c,
+                                            a, max_range)
+    channels = [entry, width][:ray_channels]
+    while len(channels) < ray_channels:
+        channels.append(torch.zeros_like(entry))
+    intervals = torch.stack(channels, dim=1)
     cr = preprocess_cost_ray_intervals(
-        intervals, max_range=max_range, epsilon=g_min / 2.0).reshape(1, -1)
+        intervals, max_range=max_range).reshape(1, -1)
 
     # [distance, heading, normalized actual linear/angular velocity]
     kin = torch.zeros(1, KINEMATIC_DIM)
@@ -175,11 +158,11 @@ def main(argv):
 
     names = args.models or [cfg["model_name"]]
     print("config: %s" % args.config)
-    print("  nz=%d a=%s g_min=%s range=%s beams=%s intervals=%s ray_frame=%s "
-          "preprocess=%s backend=%s"
-          % (cfg["nz"], cfg["a"], cfg["g_min"], cfg["cost_ray_max_range"],
+    print("  nz=%d a=%s range=%s beams=%s intervals=%s ray_frame=%s "
+          "preprocess=%s"
+          % (cfg["nz"], cfg["a"], cfg["cost_ray_max_range"],
              cfg["cost_ray_num_beams"], cfg.get("cost_ray_num_intervals", RAY_CHANNELS),
-             cfg.get("ray_frame"), cfg.get("preprocess"), cfg.get("backend", "grid")))
+             cfg.get("ray_frame"), cfg.get("preprocess")))
     print()
 
     failed = 0

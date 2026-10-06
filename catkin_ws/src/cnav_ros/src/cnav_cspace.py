@@ -2,260 +2,44 @@
 
 """c-space observation helpers for cnav_ros -- vendored, no training tree needed.
 
-These are copies of the pure-numpy/torch functions in
-`DRL-robot-navigation/SAC/cspace_cost_rays.py` that the node actually calls, so
-`cnav_ros` builds its observation without importing anything from a SAC
-checkout.  The training env remains the single source of truth for what the
-observation *means*; this file is the deployment copy of it.
+A verbatim copy of `DRL-robot-navigation/SAC/cspace_cost_rays.py`, minus the
+module docstring above and the `__main__` self-test: the node builds its
+observation from this file, so `cnav_ros` needs no SAC checkout (`src/` and
+`model/` make the package self-contained).  The training tree stays the single
+source of truth for what the observation *means* -- re-sync this file by hand
+after any change there.
 
-Both geometry backends are kept, and the node picks one with `~backend`:
-
-  - **grid** -- `make_footprint_masks` + `build_cspace` +
-    `cost_ray_intervals_3d`: rasterize the footprint, dilate the occupancy grid
-    to a 3D c-space, then march rays through it.  The original backend.
-  - **points** -- `footprint_constraints` + `pointset_batch`: an obstacle is a
-    lidar hit *point*, and "would driving along beam b at heading theta_k touch
-    that point?" is answered in closed form, with no grid to quantise the
-    surface onto.
-
-The two agree on shapes and semantics and disagree on geometry, which is why
-they are both here: a checkpoint must be deployed on the backend it was trained
-with.  `SparrowCspaceEnv.__init__` carries the same branch.
-
-Deliberately not copied (unused by the node, which has one fixed footprint and
-never trains): `make_rectangle_union_masks`, `rectangles_to_polygons`,
-`footprint_constraint_batch`, `cost_rays_3d`, `compute_cost_rays`,
-`preprocess_cost_rays`, and the benchmark harness.  Behaviour of everything
-below is unchanged from the training copies.
+An obstacle is a lidar hit *point*, and "would driving along beam b at heading
+theta_k touch it?" is answered in closed form: no occupancy grid, no rasterized
+c-space, no march.  The obstacle's own Minkowski footprint is intersected
+against the robot's, one half-plane inequality per footprint edge, which keeps
+obstacle positions at full metric precision.
 """
-
 from __future__ import annotations
 
 import math
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+
+__all__ = [
+    "preprocess_cost_ray_intervals",
+    "rectangles_to_polygons",
+    "polygon_constraints",
+    "footprint_constraints",
+    "footprint_constraint_batch",
+    "pointset_intervals",
+    "pointset_batch",
+    "pointset_collision",
+]
 
 
-def _point_in_polygon(x, y, poly):
-    """Even-odd ray-casting point-in-polygon test.
-
-    `poly` is a (V, 2) array; `x`, `y` are broadcastable to a common shape.
-    Returns a bool array of that shape.
-    """
-    x = np.asarray(x, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-    shape = np.broadcast(x, y).shape
-    inside = np.zeros(shape, dtype=bool)
-    V = poly.shape[0]
-    j = V - 1
-    with np.errstate(divide="ignore", invalid="ignore"):
-        for i in range(V):
-            xi, yi = poly[i]
-            xj, yj = poly[j]
-            cond = ((yi > y) != (yj > y)) & (
-                x < (xj - xi) * (y - yi) / (yj - yi) + xi
-            )
-            inside ^= cond
-            j = i
-    return inside
-
-
-def make_footprint_masks(g_min, a, nz, footprint, subsample=3):
-    """Build the footprint dilation masks for every theta layer.
-
-    Returns a float32 array of shape (nz, m, m) where `mask[k]` is the footprint
-    rotated by `theta = k*a`, rasterized onto a g_min-resolution grid.  A cell is
-    set to 1 if any of its `subsample x subsample` sub-points falls inside the
-    rotated polygon (approximating cell/polygon overlap).
-
-    The mask is used as a dilation structuring element in `build_cspace`.
-    """
-    footprint = np.asarray(footprint, dtype=np.float64)  # (V, 2)
-    max_ext = float(np.abs(footprint).max())             # ~0.22 m
-    half = int(math.ceil(max_ext / g_min)) + 1           # cells
-    m = 2 * half + 1
-    masks = np.zeros((nz, m, m), dtype=np.float32)
-
-    # cell-centre offsets (m), relative to the robot centre
-    offsets = (np.arange(m, dtype=np.float64) - half) * g_min
-    # sub-point offsets within a cell (m)
-    sub = ((np.arange(subsample, dtype=np.float64) + 0.5) / subsample - 0.5) * g_min
-
-    for k in range(nz):
-        theta = k * a
-        c, s = math.cos(theta), math.sin(theta)
-        # rotate vertices by +theta (same convention as footprintCostAtPose)
-        rot = footprint @ np.array([[c, s], [-s, c]])   # (V, 2)
-        for mi in range(m):
-            for mj in range(m):
-                cx = offsets[mi]   # +x = forward
-                cy = offsets[mj]   # +y = left
-                hit = False
-                for sx in sub:
-                    for sy in sub:
-                        if _point_in_polygon(cx + sx, cy + sy, rot):
-                            hit = True
-                            break
-                    if hit:
-                        break
-                # store as (forward, left) so dim0/dim1 line up with the
-                # occupancy grid's (nx=forward, ny=left) in build_cspace.
-                masks[k, mi, mj] = 1.0 if hit else 0.0
-    return masks
-
-
-def build_cspace(occ_grid, masks, known_free_grid=None):
-    """Build collision configurations from occupancy, footprint, and known space.
-
-    Args:
-        occ_grid: (N, nx, ny) bool tensor (1 = occupied obstacle cell).
-        masks:    (nz, m, m) shared or (N, nz, m, m) per-env masks.
-        known_free_grid: optional (N, nx, ny) bool tensor (1 = observed free).
-                  When provided, a pose is valid if its footprint overlaps at least one known
-                  free cell and overlaps no occupied cell. Thus a footprint
-                  entirely inside unknown space is collision; partial unknown
-                  coverage is accepted when known free space is also covered.
-
-    Returns:
-        cspace: (N, nx, ny, nz) bool tensor; cspace[n, i, j, k] == True iff the
-        footprint overlaps an obstacle, or (when known_free_grid is provided)
-        contains no known-free cells. Unknown cells do not count as occupied.
-    """
-    masks_t = torch.as_tensor(masks, dtype=torch.float32,
-                              device=occ_grid.device)
-    per_env = masks_t.ndim == 4
-    if per_env:
-        n, nz, m, _ = masks_t.shape
-        if n != occ_grid.shape[0]:
-            raise ValueError("per-env footprint batch must match occupancy batch")
-        masks_t = masks_t.reshape(n * nz, 1, m, m)
-        occ = occ_grid.float().unsqueeze(0)                      # (1, N, nx, ny)
-        groups = n
-    else:
-        masks_t = masks_t.unsqueeze(1)                           # (nz, 1, m, m)
-        occ = occ_grid.float().unsqueeze(1)                      # (N, 1, nx, ny)
-        groups = 1
-    pad = masks_t.shape[-1] // 2
-    out = F.conv2d(occ, masks_t, padding=pad, groups=groups)
-    if per_env:
-        out = out.reshape(n, nz, *out.shape[-2:])
-    cspace = out > 0.5                                             # occupied overlap
-    if known_free_grid is not None:
-        known_free = known_free_grid.float().unsqueeze(0 if per_env else 1)
-        known_count = F.conv2d(known_free, masks_t, padding=pad,
-                               groups=groups)
-        if per_env:
-            known_count = known_count.reshape(n, nz, *known_count.shape[-2:])
-        entirely_unknown = known_count <= 0.5
-        cspace = cspace | entirely_unknown
-    return cspace.permute(0, 2, 3, 1)                              # (N, nx, ny, nz)
-
-
-def cost_ray_intervals_3d(cspace, robot_cell, num_beams=36,
-                          h_res_deg=10.0, max_range=5.0,
-                          g_min=0.2, acc=None, num_intervals=3):
-    """Return consecutive radial interval lengths along each c-space ray.
-
-    The channels start with ``first_entry`` and then alternate between occupied
-    and free widths::
-
-        [first_entry, first_occupied_width, first_free_width,
-         second_occupied_width, second_free_width, ...]
-
-    ``num_intervals`` controls the number of returned channels.  A clear ray is
-    encoded as ``(max_range, 0, ...)``.  Once a transition has been observed,
-    the currently open interval extends to ``max_range`` if its closing
-    transition is not observed.  Sampling starts at zero, so a configuration
-    already in collision has ``first_entry == 0``.
-
-    Other args are identical to :func:`cost_rays_3d`.
-
-    Returns:
-        ``(N, num_intervals, num_beams, nz)`` in metres.
-    """
-    if isinstance(num_intervals, bool) or not isinstance(num_intervals, int):
-        raise TypeError("num_intervals must be an integer")
-    if num_intervals < 1:
-        raise ValueError("num_intervals must be at least 1")
-
-    N, nx, ny, nz = cspace.shape
-    dev = cspace.device
-    acc = g_min / 2.0 if acc is None else acc
-    n_steps = int(math.ceil(max_range / acc))
-
-    beam_ang = torch.arange(num_beams, device=dev).float() \
-        * math.radians(h_res_deg)
-    dx = torch.cos(beam_ang).view(1, num_beams, 1)
-    dy = torch.sin(beam_ang).view(1, num_beams, 1)
-    k_layer = torch.arange(nz, device=dev).view(1, 1, nz)
-
-    ri = robot_cell[:, 0].float().view(N, 1, 1)
-    rj = robot_cell[:, 1].float().view(N, 1, 1)
-    cspace_flat = cspace.to(torch.uint8).reshape(N, nx * ny * nz)
-    stride_ij = ny * nz
-
-    boundaries = torch.full(
-        (N, num_intervals, num_beams, nz), max_range, device=dev
-    )
-    # phase is the number of observed free/occupied transitions.  Even phases
-    # wait for an occupied sample; odd phases wait for a free sample.
-    phase = torch.zeros((N, num_beams, nz), dtype=torch.int32, device=dev)
-
-    # max_range is a sentinel/boundary rather than a collision sample.  This
-    # makes (R,R) unambiguously mean no interval within the local window.
-    for s in range(n_steps):
-        t = s * acc
-        if t >= max_range:
-            break
-
-        ci = (ri + torch.round(dx * t / g_min)).long() \
-            .expand(N, num_beams, nz)
-        cj = (rj + torch.round(dy * t / g_min)).long() \
-            .expand(N, num_beams, nz)
-        ck = k_layer.expand(N, num_beams, nz)
-
-        in_bounds = (ci >= 0) & (ci < nx) & (cj >= 0) & (cj < ny)
-        flat = ci * stride_ij + cj * nz + ck
-        flat_safe = flat.clamp(0, nx * ny * nz - 1)
-        occupied = cspace_flat.gather(1, flat_safe.reshape(N, -1))
-        occupied = occupied.reshape(N, num_beams, nz).bool() & in_bounds
-
-        active = phase < num_intervals
-        expected_occupied = (phase % 2) == 0
-        transition = active & (occupied == expected_occupied)
-        for interval_idx in range(num_intervals):
-            found = transition & (phase == interval_idx)
-            boundaries[:, interval_idx] = torch.where(
-                found,
-                torch.full_like(boundaries[:, interval_idx], t),
-                boundaries[:, interval_idx],
-            )
-        phase = phase + transition.to(phase.dtype)
-
-        if torch.all(phase == num_intervals):
-            break
-
-    intervals = torch.zeros_like(boundaries)
-    intervals[:, 0] = boundaries[:, 0]
-    for interval_idx in range(1, num_intervals):
-        previous_boundary_seen = phase >= interval_idx
-        intervals[:, interval_idx] = torch.where(
-            previous_boundary_seen,
-            boundaries[:, interval_idx] - boundaries[:, interval_idx - 1],
-            intervals[:, interval_idx],
-        )
-    return intervals
-
-
-def preprocess_cost_ray_intervals(intervals, max_range=5.0, epsilon=0.05):
+def preprocess_cost_ray_intervals(intervals, max_range=5.0):
     """Normalize ray-segment distance channels to ``[0, 1]``.
 
     Input ``(N, C, B, nz)`` is in metres, where ``C`` is the configured number
     of consecutive radial intervals.  Dividing every distance by ``max_range``
-    gives the CNN a common numeric scale.  ``epsilon`` remains an accepted
-    argument for compatibility with existing callers but is no longer used.
+    gives the CNN a common numeric scale.
     """
     if intervals.ndim != 4 or intervals.shape[1] < 1:
         raise ValueError(
@@ -270,14 +54,12 @@ def preprocess_cost_ray_intervals(intervals, max_range=5.0, epsilon=0.05):
 
 
 # ---------------------------------------------------------------------------
-# Analytic point-set backend (no grid): obstacle = lidar hit points
+# Cost rays from a point set: obstacle = lidar hit point
 # ---------------------------------------------------------------------------
-# The grid backend rasterizes the footprint (`make_footprint_masks`) and dilates
-# the occupancy grid, so surfaces land on `g_min` cell centres and two adjacent
-# hit cells can each round the *wrong* way, opening a phantom gap in a wall that
-# should be closed.  This backend drops the grid: an obstacle is a point, and
-# "would driving along beam b at heading theta_k touch that point?" is answered
-# in closed form.
+# An obstacle is a point, not a cell.  A raster puts surfaces on `g_min` cell
+# centres, and two adjacent hit cells can each round the *wrong* way, opening a
+# phantom gap in a wall that should be closed; a point set has no such failure
+# and keeps the hits at full metric precision.
 #
 # The robot drives along `u_b` with its heading FIXED at theta_k and the
 # obstacle points do not move, so at travel distance t the point sits at
@@ -296,9 +78,24 @@ def preprocess_cost_ray_intervals(intervals, max_range=5.0, epsilon=0.05):
 # parallel to that edge, leaving only lateral feasibility (<p, n_j> <= h_j).
 # Edges are ANDed (intersect the half-planes) while pieces, points and theta
 # layers are ORed (take the minimum) -- unions, not intersections.
-#
-# This is an *alternative* to the grid path, not a refinement of it: it shares
-# the c-space observation's shapes and semantics but none of its quantization.
+def rectangles_to_polygons(rectangles):
+    """``(length_m, width_m, angle_rad)`` rows -> convex (V, 2) polygons.
+
+    The axis-aligned box ``|x| <= L/2, |y| <= W/2`` rotated by ``+angle`` in the
+    robot frame, one convex piece per rectangle, in the same convention the
+    env's random-footprint generator writes its ``(L, W, A)`` rows.
+    """
+    polygons = []
+    for length, width, angle in rectangles:
+        hl, hw = length / 2.0, width / 2.0
+        c, s = math.cos(angle), math.sin(angle)
+        rot = np.array([[c, -s], [s, c]], dtype=np.float64)
+        box = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]],
+                       dtype=np.float64)
+        polygons.append(box @ rot.T)          # row i -> rot @ box[i]
+    return polygons
+
+
 def polygon_constraints(polygons):
     """Convex polygons -> per-piece outward edge normals and offsets.
 
@@ -357,15 +154,45 @@ def footprint_constraints(polygons, num_beams, nz, a, h_res_degrees=None,
     """Precompute the per-episode edge table for `pointset_intervals`.
 
     Returns ``nrm (P, V, 2)``, ``h (P, V)`` and ``c (P, B, nz, V)``.
-    ``h_res_degrees`` must be the same beam spacing the grid backend scans with
-    (`cost_ray_intervals_3d`'s `h_res_deg`, i.e. 360/num_beams), otherwise the
-    two backends do not describe the same beams.
+    ``h_res_degrees`` must be the beam spacing the env actually scans with
+    (i.e. 360/num_beams), otherwise the cost rays would not describe the beams
+    the lidar reports.
     """
     nrm_list, h_list = polygon_constraints(polygons)
     nrm = torch.as_tensor(np.stack(nrm_list), dtype=dtype, device=device)
     h = torch.as_tensor(np.stack(h_list), dtype=dtype, device=device)
     c = _edge_cosines(nrm.unsqueeze(0), num_beams, nz, a, h_res_degrees,
                       device, dtype).squeeze(0)
+    return nrm, h, c
+
+
+def footprint_constraint_batch(polygons_per_env, num_beams, nz, a,
+                               h_res_degrees=None, device=None,
+                               dtype=torch.float32):
+    """Per-environment edge tables, padded to the widest footprint.
+
+    Environment i draws its own footprint (random footprints change per
+    episode), so the tables carry a leading env axis: ``nrm (N,P,V,2)``,
+    ``h (N,P,V)``, ``c (N,P,B,nz,V)``.  Missing pieces are padded with a zero
+    normal and ``h = -1``: the only constraint they add has ``c = 0`` and
+    ``g = -h = 1 > 0``, which is infeasible -- exactly what "this piece does not
+    exist" should contribute (no contact, no collision).
+    """
+    tables = [polygon_constraints(polygons) for polygons in polygons_per_env]
+    n_env = len(tables)
+    p_max = max(len(polygons) for polygons in polygons_per_env)
+    v_max = max(len(polygon) for polygons in polygons_per_env
+                for polygon in polygons)
+    nrm = torch.zeros((n_env, p_max, v_max, 2), dtype=dtype, device=device)
+    h = -torch.ones((n_env, p_max, v_max), dtype=dtype, device=device)
+    for i, (normals, offsets) in enumerate(tables):
+        pieces = len(normals)
+        edges = normals[0].shape[0]
+        nrm[i, :pieces, :edges] = torch.as_tensor(np.stack(normals),
+                                                  dtype=dtype, device=device)
+        h[i, :pieces, :edges] = torch.as_tensor(np.stack(offsets), dtype=dtype,
+                                                device=device)
+    c = _edge_cosines(nrm, num_beams, nz, a, h_res_degrees, device, dtype)
     return nrm, h, c
 
 
@@ -464,6 +291,25 @@ def pointset_intervals(pts, nrm, h, c, a, c_eps=1e-9):
     return best_entry, best_exit
 
 
+def pointset_batch(pts, nrm, h, c, a, max_range):
+    """Observation-ready point-set rays: entry, contact width, and collision.
+
+    ``entry (N, B, nz)`` is the usual first-obstacle distance clipped to
+    ``[0, max_range]`` (``max_range`` = nothing in reach).  ``width (N, B, nz)``
+    is how far the robot would travel inside that first contact before coming
+    out the far side -- the "first occupied width" that channel 1 of the live
+    observation holds.  ``collide (N,)`` is the current-pose test at theta = 0.
+    """
+    entry_raw, exit_ = pointset_intervals(pts, nrm, h, c, a)
+    # Clip *after* deciding hit/no-hit: clamped entry == max_range is also the
+    # "nothing in reach" value, and exit_ is +inf there.
+    hit = entry_raw <= max_range
+    entry = entry_raw.clamp(0.0, max_range)
+    width = torch.where(hit, (exit_ - entry_raw).clamp_min(0.0),
+                        torch.zeros_like(entry))
+    return entry, width, pointset_collision(pts, nrm, h)
+
+
 def pointset_collision(pts, nrm, h):
     """Current-pose collision test: is any point inside any footprint piece?
 
@@ -482,22 +328,3 @@ def pointset_collision(pts, nrm, h):
         inside_any |= inside.any(dim=1)
     return inside_any
 
-
-def pointset_batch(pts, nrm, h, c, a, max_range):
-    """Observation-ready point-set rays: entry, contact width, and collision.
-
-    ``entry (N, B, nz)`` is the usual first-obstacle distance clipped to
-    ``[0, max_range]`` (``max_range`` = nothing in reach).  ``width (N, B, nz)``
-    is how far the robot would travel inside that first contact before coming
-    out the far side -- the point-set analogue of the grid backend's
-    ``first_occupied_width``, which is what channel 1 of the live observation
-    holds.  ``collide (N,)`` is the current-pose test at theta = 0.
-    """
-    entry_raw, exit_ = pointset_intervals(pts, nrm, h, c, a)
-    # Clip *after* deciding hit/no-hit: clamped entry == max_range is also the
-    # "nothing in reach" value, and exit_ is +inf there.
-    hit = entry_raw <= max_range
-    entry = entry_raw.clamp(0.0, max_range)
-    width = torch.where(hit, (exit_ - entry_raw).clamp_min(0.0),
-                        torch.zeros_like(entry))
-    return entry, width, pointset_collision(pts, nrm, h)

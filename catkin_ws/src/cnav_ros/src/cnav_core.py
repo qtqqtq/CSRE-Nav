@@ -20,13 +20,13 @@ The kinematic block contains goal-relative geometry and normalized velocity from
 odometry.  These are measured velocities, not the previous actor command, matching
 the post-filter `car_state[:, 3:5]` values used during Sparrow training.
 
-FOUR things differ between checkpoint families, and each is a knob here:
+THREE things differ between checkpoint families, and each is a knob here:
 
   1. `architecture` -- sniffed out of the state dict, never configured: backbone
      4->8->8 stride 2 vs 4->16->16 stride [1,1]/[1,2], and head
      `layer_3 -> action_dim*2` (stochastic, tanh of the mean) vs
      `layer_3 -> action_dim` (deterministic, tanh inside forward).
-  2. `geometry` -- nz / a / g_min / cost_ray_max_range / footprint.  Not
+  2. `geometry` -- nz / a / cost_ray_max_range / footprint.  Not
      recoverable from a checkpoint, so it comes from the YAML and is *validated*
      against the loaded network's fc width; a mismatch aborts the node instead of
      silently degrading the policy.
@@ -37,17 +37,10 @@ FOUR things differ between checkpoint families, and each is a knob here:
      2 rad/s action scale; the older Gazebo models read ROS-frame rays from the C++
      mapper with a linear `max_range - d` encoding and the actor output published
      to /cmd_vel unscaled.
-  4. `backend` -- how the rays are derived from the scan, and the one knob that is
-     not recoverable from a checkpoint *or* from the geometry: `grid` rasterizes
-     the footprint and marches through a c-space grid, `points` intersects the
-     analytic footprint with the lidar hit points.  The two share shapes and
-     semantics but not geometry, so a checkpoint must be deployed on the backend
-     it was trained with (see `cnav_cspace`).
 
 The current deployment profile is `config/cnav_sparrow.yaml` for the
-one-channel, 36x30 first-entry model `exact_castray_interval1_0`, trained with
-the point-set backend. Legacy profiles are retained as geometry references but
-are intentionally rejected by this build.
+one-channel, 36x30 first-entry model `exact_castray_interval1_0`. Legacy profiles
+are retained as geometry references but are intentionally rejected by this build.
 
 Developed for the DRL-robot-navigation workspace.
 """
@@ -72,9 +65,8 @@ from visualization_msgs.msg import Marker
 # so make the sibling module importable before touching it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cnav_cspace import (build_cspace, cost_ray_intervals_3d,
-                         footprint_constraints, make_footprint_masks,
-                         pointset_batch, preprocess_cost_ray_intervals)
+from cnav_cspace import (footprint_constraints, pointset_batch,
+                         preprocess_cost_ray_intervals)
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +331,6 @@ class CnavCore(object):
                              % self.cost_ray_image_cell)
 
         # ---- geometry (must match the checkpoint's training run) ---------
-        self.g_min = float(rospy.get_param("~g_min", 0.1))
         self.nz = int(rospy.get_param("~nz", 30))
         self.a = float(rospy.get_param("~a", 2.0 * math.pi / 30.0))
         self.max_range = float(rospy.get_param("~cost_ray_max_range", 3.0))
@@ -367,23 +358,10 @@ class CnavCore(object):
             raise ValueError("~preprocess must be 'interval' for the current "
                              "observation, got %r" % self.preprocess)
 
-        # How the rays are derived from the scan.  Shapes and semantics are the
-        # same either way; the geometry is not, so this must match the training
-        # run of the checkpoint (see cnav_cspace).
-        #   `grid`   -- rasterize the footprint, dilate the occupancy grid into a
-        #               3D c-space, march rays through it.
-        #   `points` -- no grid at all: the obstacles are the lidar hit points
-        #               and the footprint is intersected with them in closed form.
-        self.backend = rospy.get_param("~backend", "grid")
-        if self.backend not in ("grid", "points"):
-            raise ValueError("~backend must be 'grid' or 'points', got %r"
-                             % self.backend)
-
         # ---- action scaling ---------------------------------------------
-        # Sparrow: v_phys = continuous_scale * a with (50 cm/s, 2 rad/s).  The
-        # Gazebo pipeline published the actor output straight to /cmd_vel, so its
-        # scale is 1.0 in m/s and rad/s.
-        self.allow_reverse = bool(rospy.get_param("~allow_reverse", True))
+        # Sparrow: v_phys = continuous_scale * a with (50 cm/s, 2 rad/s), a0 in
+        # [-1,1] taken as-is (negative = reverse).  The Gazebo pipeline published
+        # the actor output straight to /cmd_vel, so its scale is 1.0 in m/s and rad/s.
         self.v_linear_max = float(rospy.get_param("~v_linear_max", 0.5))
         self.v_angular_max = float(rospy.get_param("~v_angular_max", 2.0))
         if self.v_linear_max <= 0.0 or self.v_angular_max <= 0.0:
@@ -416,8 +394,6 @@ class CnavCore(object):
         self.robot_state = None        # np.array([x, y, yaw]) in `map_frame`
         self.robot_velocity = np.zeros(2, dtype=np.float64)  # [m/s, rad/s]
         self.goal = None               # np.array([x, y])
-        self.occ_grid = None
-        self.known_free_grid = None
         self.hit_points = None         # (M, 2) lidar hits, c-space frame, metres
         self.arrived = False
 
@@ -435,11 +411,10 @@ class CnavCore(object):
         rospy.loginfo("cnav: model=%s backbone=%s head=%s feature_dim=%d device=%s",
                       self.model_name, self.backbone, self.action_head,
                       self.feature_dim, self.device)
-        rospy.loginfo("cnav: backend=%s geometry nz=%d a=%.4f g_min=%.3f range=%.2f "
-                      "beams=%d -> ray_grid=%dx%d, occ_grid=%s, state_dim=%d",
-                      self.backend, self.nz, self.a, self.g_min, self.max_range,
+        rospy.loginfo("cnav: geometry nz=%d a=%.4f range=%.2f beams=%d -> "
+                      "ray_grid=%dx%d, state_dim=%d",
+                      self.nz, self.a, self.max_range,
                       self.num_beams, self.num_beams, self.nz,
-                      "%dx%d" % (self.G, self.G) if self.G else "none",
                       self.num_intervals * self.num_beams * self.nz + KINEMATIC_DIM)
         rospy.loginfo("cnav: ray_frame=%s preprocess=%s scale=(%.2f m/s, %.2f rad/s) "
                       "filter_k=(%.2f, %.2f) rate=%.1f Hz",
@@ -489,30 +464,17 @@ class CnavCore(object):
         self.actor = actor.to(self.device).eval()
 
     def _build_geometry(self):
-        """One-time footprint geometry, in whichever form the backend needs.
+        """One-time footprint geometry: the outward edge normals, edge offsets
+        and per-(beam, theta) cosines of the fixed footprint.
 
-        The grid path mirrors `SparrowCspaceEnv.__init__`: R = ceil(max_range/g_min)
-        + 2, the grid is (2R+1)^2, and the robot always sits at cell (R, R).  The
-        point-set path needs no grid -- just the footprint's outward edge normals,
-        offsets and per-(beam, theta) cosines, which are rotation-invariant in `h`
-        and therefore built once for the one fixed footprint.
+        The offsets are rotation-invariant (`h` does not depend on theta), so
+        the whole table is built once, here, and merely broadcast over every
+        scan in `_pointset_intervals`.
         """
-        if self.backend == "points":
-            self._fp_nrm, self._fp_h, self._fp_c = footprint_constraints(
-                [np.asarray(self.footprint, dtype=np.float64)],
-                num_beams=self.num_beams, nz=self.nz, a=self.a,
-                h_res_degrees=self.h_res_deg, device=self.device)
-            self.masks = None
-            self.R = self.G = self.robot_cell = None
-            return
-
-        self.masks = torch.as_tensor(
-            make_footprint_masks(self.g_min, self.a, self.nz, self.footprint),
-            dtype=torch.float32, device=self.device)
-        self.R = int(math.ceil(self.max_range / self.g_min)) + 2
-        self.G = 2 * self.R + 1
-        self.robot_cell = torch.full((1, 2), self.R, dtype=torch.long,
-                                     device=self.device)
+        self._fp_nrm, self._fp_h, self._fp_c = footprint_constraints(
+            [np.asarray(self.footprint, dtype=np.float64)],
+            num_beams=self.num_beams, nz=self.nz, a=self.a,
+            h_res_degrees=self.h_res_deg, device=self.device)
 
     # ------------------------------------------------------------- callbacks
     def odom_callback(self, msg):
@@ -534,15 +496,12 @@ class CnavCore(object):
             self._publish_goal_marker()
 
     def scan_callback(self, msg):
-        """Turn one scan into whatever the backend consumes.
+        """Turn one scan into the obstacle point set the cost rays are built from.
 
-        The grid backend keeps occupied and observed-free robot-centric rasters:
-        cells crossed by each usable beam are known free up to its return, and a
-        finite obstacle return marks the endpoint occupied.  Cells beyond returns
-        and outside the scan field of view remain unknown.
-
-        The point-set backend keeps the hit endpoints themselves, unquantised --
-        rasterising is the thing that backend exists to avoid.
+        The obstacle model is the lidar hit endpoints themselves, unquantised:
+        there is no raster, so an obstacle keeps full metric precision all the
+        way into the contact test and two adjacent hits cannot round *past* each
+        other into a phantom gap.
         """
         if self.robot_state is None:
             return
@@ -556,8 +515,6 @@ class CnavCore(object):
         hi = min(msg.range_max, self.scan_max_range)
         usable = (~np.isnan(ranges)) & (ranges > lo)
         if not np.any(usable):
-            self.occ_grid = None
-            self.known_free_grid = None
             self.hit_points = None
             return
 
@@ -586,52 +543,14 @@ class CnavCore(object):
         rel_y = (px * sy + py * cy) + trans[1]
 
         # The trained grid's axis 1 runs to the robot's RIGHT, so the ROS left
-        # component is negated (see `ray_frame`).  Both backends share the
-        # conversion; only what happens to the result differs.
+        # component is negated (see `ray_frame`).
         j = -rel_y if self.mirror_y else rel_y
 
-        if self.backend == "points":
-            # Obstacle points in the cost-ray frame, metres.  A beam that
-            # returned nothing is simply absent, which is equivalent to the
-            # training env's "push it far outside the window": the nearest
-            # contact with such a point is ~10x the sensor range away.
-            self.hit_points = np.stack((rel_x, j), axis=1)
-            self.occ_grid = None
-            self.known_free_grid = None
-            return
-
-        g, R, G = self.g_min, self.R, self.G
-        ci = R + np.round(rel_x / g).astype(np.int64)
-        cj = R + np.round(j / g).astype(np.int64)
-
-        occ = np.zeros((G, G), dtype=bool)
-        inb = (ci >= 0) & (ci < G) & (cj >= 0) & (cj < G)
-        occ[ci[inb], cj[inb]] = True
-
-        known_free = np.zeros((G, G), dtype=bool)
-        th_valid = th_all + lyaw
-        # ROS body frame is converted into the selected c-space frame. The
-        # learned env frame mirrors y; the ROS frame keeps y pointing left.
-        dir_x = np.cos(th_valid)
-        dir_y = np.sin(th_valid)
-        if self.mirror_y:
-            dir_y = -dir_y
-        radial_step = self.g_min / 2.0
-        radial = np.arange(0.0, hi, radial_step)
-        free_limit = r_all.copy()
-        free_limit[np.isfinite(r_all) & (r_all < hi)] = np.maximum(
-            0.0, free_limit[np.isfinite(r_all) & (r_all < hi)] - radial_step
-        )
-        free_mask = radial[None, :] < free_limit[:, None]
-        free_x = trans[0] + dir_x[:, None] * radial[None, :]
-        free_y = trans[1] + dir_y[:, None] * radial[None, :]
-        free_i = R + np.round(free_x / g).astype(np.int64)
-        free_j = R + np.round(free_y / g).astype(np.int64)
-        free_inb = free_mask & (free_i >= 0) & (free_i < G) \
-            & (free_j >= 0) & (free_j < G)
-        known_free[free_i[free_inb], free_j[free_inb]] = True
-        self.occ_grid = occ
-        self.known_free_grid = known_free
+        # Obstacle points in the cost-ray frame, metres.  A beam that returned
+        # nothing is simply absent, which is equivalent to the training env's
+        # "push it far outside the window": the nearest contact with such a
+        # point is ~10x the sensor range away.
+        self.hit_points = np.stack((rel_x, j), axis=1)
 
     # ------------------------------------------------------------- inference
     def _pointset_intervals(self):
@@ -639,10 +558,9 @@ class CnavCore(object):
 
         Mirrors `SparrowCspaceEnv._pointset_intervals`: channel 0 is the entry
         distance and channel 1 the contact's own width, in metres, shaped
-        `(1, C, B, nz)` -- the same tensor the grid backend produces.  Only the
-        configured channels are kept; a C above 2 is degenerate once obstacles
-        are points (there is no second gap), so the extra ones are zeroed rather
-        than left undefined.
+        `(1, C, B, nz)`.  Only the configured channels are kept; a C above 2 is
+        degenerate once obstacles are points (there is no second gap), so the
+        extra ones are zeroed rather than left undefined.
         """
         shape = (1, self.num_beams, self.nz)
         entry = torch.full(shape, self.max_range, dtype=torch.float32,
@@ -661,7 +579,7 @@ class CnavCore(object):
         return torch.stack(channels, dim=1)                     # (1,C,B,nz) m
 
     def _build_perception(self):
-        """Scan -> ray segments -> processed grid, via the configured backend.
+        """Scan -> ray segments -> processed ray grid.
 
         Returns `(entry_rays, cr4)`: raw first-collision distances `(1,B,nz)`
         in metres and the processed `(1,C,B,nz)` ray grid consumed by the
@@ -673,31 +591,9 @@ class CnavCore(object):
         from startup, so it looks like a dead publisher rather than a policy
         that is simply not driving anywhere yet.
         """
-        if self.backend == "points":
-            intervals = self._pointset_intervals()
-        else:
-            if self.occ_grid is None or self.known_free_grid is None:
-                # Without a scan, every cell is unknown and every pose is invalid.
-                occ = torch.zeros((1, self.G, self.G), dtype=torch.bool,
-                                  device=self.device)
-                known_free = torch.zeros_like(occ)
-            else:
-                occ = torch.as_tensor(self.occ_grid[None, ...], dtype=torch.bool,
-                                      device=self.device)
-                known_free = torch.as_tensor(
-                    self.known_free_grid[None, ...], dtype=torch.bool,
-                    device=self.device)
-
-            cspace = build_cspace(occ, self.masks, known_free)
-            intervals = cost_ray_intervals_3d(
-                cspace, self.robot_cell,
-                num_beams=self.num_beams, h_res_deg=self.h_res_deg,
-                max_range=self.max_range, g_min=self.g_min,
-                num_intervals=self.num_intervals)            # (1,C,B,nz) m
-
+        intervals = self._pointset_intervals()
         cr4 = preprocess_cost_ray_intervals(
-            intervals, max_range=self.max_range,
-            epsilon=self.g_min / 2.0).float()                   # (1,C,B,nz)
+            intervals, max_range=self.max_range).float()        # (1,C,B,nz)
         return intervals[:, 0], cr4
 
     def _build_state(self, rays, cr4):
@@ -726,13 +622,14 @@ class CnavCore(object):
         return torch.cat([cr, kin], dim=1), distance
 
     def _command_to_twist(self, action):
-        """Actor output in [-1,1] -> filtered physical Twist (m/s, rad/s)."""
-        a0 = float(action[0])
-        if not self.allow_reverse:
-            a0 = (a0 + 1.0) / 2.0
+        """Actor output in [-1,1] -> filtered physical Twist (m/s, rad/s).
 
+        The actor's linear output is already the signed velocity fraction
+        (negative = reverse), so it scales straight through -- there is no
+        forward-only remapping.
+        """
         target_velocity = np.array([
-            self.v_linear_max * a0,
+            self.v_linear_max * float(action[0]),
             self.v_angular_max * float(action[1]),
         ], dtype=np.float64)
         self.filtered_velocity = (

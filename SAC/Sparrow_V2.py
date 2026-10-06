@@ -10,10 +10,6 @@ import math
 
 import settings
 from cspace_cost_rays import (
-    make_footprint_masks,
-    make_rectangle_union_masks,
-    build_cspace,
-    cost_ray_intervals_3d,
     preprocess_cost_ray_intervals,
     rectangles_to_polygons,
     footprint_constraints,
@@ -1159,8 +1155,7 @@ observation live in a single module.
 #     cost_rays : (36 beams × 30 theta layers) NavRL cost rays, metres
 #     distance  : distance to goal, metres
 #     heading   : heading error (robot heading -> goal), radians
-#     v_lin     : linear velocity command  (Continuous: a[:,0] in [-1,1];
-#                 settings.ALLOW_REVERSE=True 时负值即倒车，否则经 (a0+1)/2 约束为 [0,1])
+#     v_lin     : linear velocity command  (Continuous: a[:,0] in [-1,1]，负值即倒车)
 #     v_ang     : angular velocity command (Continuous: a[:,1] in [-1,1])
 #
 # Coordinate / unit mapping (Sparrow is pygame y-down, cm; the c-space is metre):
@@ -1174,13 +1169,11 @@ observation live in a single module.
 #       C-space collisions use the active footprint. Override the fixed shape
 #       via `cspace_cfg={'footprint': [[x,y], ...]}` (metres).
 #
-# The obstacle occupancy grid is rasterised from the robot's *lidar* hit points
-# (`ld_scan_result` / `ld_vectors_wd`) — the robot's actual line-of-sight
-# perception rather than the
-# ground-truth obstacle boundary points (`vec_*_obs_P_shaped`).  Beam paths are
-# known-free, hit endpoints are occupied, and cells outside observed paths are
-# unknown. A footprint is invalid in c-space if it overlaps an obstacle or has
-# no overlap with any known-free cell (entirely unknown footprint).
+# The obstacles are the robot's *lidar* hit points (`ld_scan_result` /
+# `ld_vectors_wd`) — its actual line-of-sight perception rather than the
+# ground-truth obstacle boundary points (`vec_*_obs_P_shaped`).  They stay
+# points: no rasterisation, no known/unknown bookkeeping, so an obstacle's
+# position keeps full metric precision all the way into the contact test.
 #
 # Run the self-test inside the container:
 #     python SAC/Sparrow_V2.py
@@ -1192,17 +1185,12 @@ observation live in a single module.
 # (a=0.698/nz=10)，只改 settings 的 RAY_V_LAYERS 而这里不动，就会出现 30 vs 10 的
 # 维度错位（reshape/load 报错）。
 SPARROW_CSPACE_CFG = dict(
-    g_min=settings.CSPACE_G_MIN,                  # c-space cell size, m (10 cm)
     a=settings.CSPACE_A,                          # θ 分辨率, rad (=2π/nz -> nz 个唯一朝向)
     nz=settings.CSPACE_NZ,                        # θ 层数（观测层）
     cost_ray_max_range=settings.CSPACE_COST_RAY_MAX_RANGE,  # m（= 局部观测窗口半径）
     cost_ray_num_beams=settings.CSPACE_COST_RAY_NUM_BEAMS,
     cost_ray_h_res_degrees=settings.CSPACE_COST_RAY_H_RES_DEGREES,
     cost_ray_num_intervals=settings.CSPACE_COST_RAY_NUM_INTERVALS,
-    # 观测的几何后端："grid"（栅格 + conv 膨胀）或 "points"（激光点集 + 解析
-    # 闵可夫斯基半平面）。两者输出同形状同语义的 (N,C,B,nz) 区间张量，所以
-    # 切换后端不改观测维数、不改网络结构，但**会改变策略看到的世界**。
-    backend=settings.CSPACE_BACKEND,
 )
 
 
@@ -1256,13 +1244,6 @@ class SparrowCspaceEnv(Sparrow):
         self.cspace_cfg.setdefault("footprint", settings.ROBOT_FOOTPRINT)
 
         self.footprint_rectangles = [None] * self.N
-        # c-space 观测的几何后端（见 SPARROW_CSPACE_CFG 的 backend 说明）：
-        #   grid   —— 需要光栅化 footprint（_cspace_masks）
-        #   points —— 需要解析边表（_fp_nrm/_fp_h/_fp_c），完全不需要栅格
-        self.cspace_backend = self.cspace_cfg["backend"]
-        if self.cspace_backend not in ("grid", "points"):
-            raise ValueError("unknown c-space backend: %r" % (self.cspace_backend,))
-        self._pointset = self.cspace_backend == "points"
         # 足迹多边形是单一真源，`footprint_polygons[i]` 恒为**多边形列表**：
         # 固定足迹取 settings.ROBOT_FOOTPRINT 的顶点（一块），随机足迹由
         # _randomize_footprint 逐环境重写（1..3 块）。
@@ -1285,30 +1266,19 @@ class SparrowCspaceEnv(Sparrow):
             self._wall_grid_x, self._wall_grid_y = np.indices(
                 (self.window_size, self.window_size), dtype=np.float32)
         if self.random_footprint:
-            max_length = settings.RANDOM_FOOTPRINT_LENGTH[1]
-            max_width = settings.RANDOM_FOOTPRINT_WIDTH[1]
-            radius = math.hypot(max_length, max_width) / 2
-            self._footprint_half = int(math.ceil(radius / self.cspace_cfg["g_min"])) + 1
-            if self._pointset:
-                # Padded table: every env can draw up to RANDOM_FOOTPRINT_COUNT[1]
-                # pieces, and missing pieces must read as "no piece" (see
-                # footprint_constraint_batch).  Filled in by _randomize_footprint.
-                p_max = settings.RANDOM_FOOTPRINT_COUNT[1]
-                self._fp_nrm = torch.zeros(
-                    (self.N, p_max, 4, 2), dtype=torch.float32, device=self.dvc)
-                self._fp_h = -torch.ones(
-                    (self.N, p_max, 4), dtype=torch.float32, device=self.dvc)
-                self._fp_c = torch.zeros(
-                    (self.N, p_max, self.cspace_cfg["cost_ray_num_beams"],
-                     self.cspace_cfg["nz"], 4),
-                    dtype=torch.float32, device=self.dvc)
-            else:
-                self._cspace_masks = torch.empty(
-                    self.N, self.cspace_cfg["nz"],
-                    2 * self._footprint_half + 1, 2 * self._footprint_half + 1,
-                    dtype=torch.float32, device=self.dvc,
-                )
-        elif self._pointset:
+            # Padded table: every env can draw up to RANDOM_FOOTPRINT_COUNT[1]
+            # pieces, and missing pieces must read as "no piece" (see
+            # footprint_constraint_batch).  Filled in by _randomize_footprint.
+            p_max = settings.RANDOM_FOOTPRINT_COUNT[1]
+            self._fp_nrm = torch.zeros(
+                (self.N, p_max, 4, 2), dtype=torch.float32, device=self.dvc)
+            self._fp_h = -torch.ones(
+                (self.N, p_max, 4), dtype=torch.float32, device=self.dvc)
+            self._fp_c = torch.zeros(
+                (self.N, p_max, self.cspace_cfg["cost_ray_num_beams"],
+                 self.cspace_cfg["nz"], 4),
+                dtype=torch.float32, device=self.dvc)
+        else:
             # One shared footprint for every env: build the edge table once and
             # let the point-set functions broadcast it over the env axis.
             fixed = [np.asarray(self.cspace_cfg["footprint"], dtype=np.float64)]
@@ -1321,20 +1291,6 @@ class SparrowCspaceEnv(Sparrow):
                 h_res_degrees=self.cspace_cfg["cost_ray_h_res_degrees"],
                 device=self.dvc,
             )
-        else:
-            self._cspace_masks = torch.as_tensor(
-                make_footprint_masks(
-                    self.cspace_cfg["g_min"], self.cspace_cfg["a"],
-                    self.cspace_cfg["nz"], self.cspace_cfg["footprint"],
-                ), dtype=torch.float32, device=self.dvc,
-            )
-        self._cR = int(math.ceil(
-            self.cspace_cfg["cost_ray_max_range"] / self.cspace_cfg["g_min"]
-        )) + 2
-        self._cG = 2 * self._cR + 1
-        self._robot_cell = torch.full(
-            (self.N, 2), self._cR, dtype=torch.long, device=self.dvc
-        )
 
         # output state dims
         self.cost_ray_num_beams = self.cspace_cfg["cost_ray_num_beams"]
@@ -1360,31 +1316,24 @@ class SparrowCspaceEnv(Sparrow):
         ]
         self.footprint_rectangles[i] = rectangles
         self.footprint_polygons[i] = rectangles_to_polygons(rectangles)
-        if self._pointset:
-            # Rebuild env i's edge table only (h is rotation-invariant, but the
-            # footprint itself changed, so c follows it).  The table is sized for
-            # the maximum piece count, so refill the whole row: pieces this
-            # episode did not draw go back to the zero-normal / h=-1 sentinel.
-            nrm, h, c = footprint_constraint_batch(
-                self.footprint_polygons[i:i + 1],
-                num_beams=self.cost_ray_num_beams, nz=self.cspace_cfg["nz"],
-                a=self.cspace_cfg["a"],
-                h_res_degrees=self.cspace_cfg["cost_ray_h_res_degrees"],
-                device=self.dvc,
-            )
-            pieces = nrm.shape[1]
-            self._fp_nrm[i].zero_()
-            self._fp_h[i].fill_(-1.0)
-            self._fp_c[i].zero_()
-            self._fp_nrm[i, :pieces].copy_(nrm[0])
-            self._fp_h[i, :pieces].copy_(h[0])
-            self._fp_c[i, :pieces].copy_(c[0])
-            return
-        masks = make_rectangle_union_masks(
-            self.cspace_cfg["g_min"], self.cspace_cfg["a"],
-            self.cspace_cfg["nz"], rectangles, self._footprint_half,
+        # Rebuild env i's edge table only (h is rotation-invariant, but the
+        # footprint itself changed, so c follows it).  The table is sized for
+        # the maximum piece count, so refill the whole row: pieces this
+        # episode did not draw go back to the zero-normal / h=-1 sentinel.
+        nrm, h, c = footprint_constraint_batch(
+            self.footprint_polygons[i:i + 1],
+            num_beams=self.cost_ray_num_beams, nz=self.cspace_cfg["nz"],
+            a=self.cspace_cfg["a"],
+            h_res_degrees=self.cspace_cfg["cost_ray_h_res_degrees"],
+            device=self.dvc,
         )
-        self._cspace_masks[i].copy_(torch.from_numpy(masks))
+        pieces = nrm.shape[1]
+        self._fp_nrm[i].zero_()
+        self._fp_h[i].fill_(-1.0)
+        self._fp_c[i].zero_()
+        self._fp_nrm[i, :pieces].copy_(nrm[0])
+        self._fp_h[i, :pieces].copy_(h[0])
+        self._fp_c[i, :pieces].copy_(c[0])
 
     def _static_obstacle_init(self):
         super()._static_obstacle_init()
@@ -1459,12 +1408,23 @@ class SparrowCspaceEnv(Sparrow):
         """Place the robot near one opening, on either side of the wall."""
         if not self.cross_wall:
             return super()._car_loc_init(i)
-        for _ in range(1000):
-            left, right = self.wall_openings[i][
-                np.random.randint(len(self.wall_openings[i]))]
-            side = np.random.choice((-1, 1))
-            along = (left + right) / 2 + np.random.randint(-50, 51)
-            across = side * self.wall_start_offset + np.random.randint(-20, 21)
+        for attempt in range(1000):
+            if attempt < 500:
+                left, right = self.wall_openings[i][
+                    np.random.randint(len(self.wall_openings[i]))]
+                side = np.random.choice((-1, 1))
+                along = (left + right) / 2 + np.random.randint(-50, 51)
+                across = side * self.wall_start_offset + np.random.randint(-20, 21)
+            else:
+                # The band around an opening is ~1 m x 0.4 m, while one moving
+                # obstacle blanks a `4*car_radius` box around every one of its
+                # contour points (Sparrow._rect_in_bound), so two or three of
+                # them drifting into the corridor can leave the band with no
+                # free pose at all.  Widen to anywhere along the wall -- still
+                # either side of it -- rather than aborting the whole run.
+                side = np.random.choice((-1, 1))
+                along = np.random.uniform(-self.window_size / 2, self.window_size / 2)
+                across = side * np.random.randint(1, 2 * self.wall_start_offset)
             x, y = np.rint(self.wall_origin[i] +
                            along * self.wall_tangent[i] +
                            across * self.wall_normal[i]).astype(int)
@@ -1489,14 +1449,28 @@ class SparrowCspaceEnv(Sparrow):
         openings = sorted(self.wall_openings[i],
                           key=lambda opening: abs(car_along - sum(opening) / 2))
         side = -1 if car_across > 0 else 1
+        margin = self.target_area + self.car_radius
         for attempt in range(2000):
-            left, right = openings[0 if attempt < 1000 else attempt % len(openings)]
-            along = (left + right) / 2 + np.random.randint(-75, 76)
-            across = side * self.wall_start_offset + np.random.randint(-35, 36)
-            x, y = np.rint(self.wall_origin[i] +
-                           along * self.wall_tangent[i] +
-                           across * self.wall_normal[i]).astype(int)
-            margin = self.target_area + self.car_radius
+            if attempt < 1000:
+                left, right = openings[0]
+                along = (left + right) / 2 + np.random.randint(-75, 76)
+                across = side * self.wall_start_offset + np.random.randint(-35, 36)
+                x, y = np.rint(self.wall_origin[i] +
+                               along * self.wall_tangent[i] +
+                               across * self.wall_normal[i]).astype(int)
+            else:
+                # Same widening as _car_loc_init, plus the rule the wall exists
+                # to create: the moving obstacles can park in both openings'
+                # bands (each is only ~1.5 m x 0.7 m) and reject every draw
+                # there, so search the whole local planning window and keep
+                # only the draws on the far side of the wall.
+                angle = np.random.uniform(0.0, 2 * math.pi)
+                radius = self.D * math.sqrt(np.random.uniform(0.0, 1.0))
+                x = int(round(car[0] + radius * math.cos(angle)))
+                y = int(round(car[1] + radius * math.sin(angle)))
+                if side * float((np.array([x, y], dtype=np.float32) -
+                                 self.wall_origin[i]) @ self.wall_normal[i]) <= 0:
+                    continue
             if not (margin <= x < self.window_size - margin and
                     margin <= y < self.window_size - margin):
                 continue
@@ -1520,84 +1494,11 @@ class SparrowCspaceEnv(Sparrow):
         return (alpha + torch.pi) % (2 * torch.pi) - torch.pi
 
     # ------------------------------------------------------------------- core
-    def _build_occ_grid(self):
-        """Build occupied and known-free robot-centric grids, each (N,G,G).
-
-        Only cells traversed by a lidar beam are known free. A hit endpoint is
-        occupied; cells outside all beam paths remain unknown. Both grids are
-        built from sensor readings rather than ground-truth obstacle geometry.
-
-        World (cm) -> robot frame (m) -> cell index at `g_min` resolution,
-        robot always at the grid centre.
-        """
-        hit = self.ld_scan_result < self.ld_d_range                 # (N, ld_num)
-        # hit point world coords (cm): robot centre + distance * unit direction
-        hit_pts = (
-            self.car_state[:, None, 0:2]
-            + self.ld_scan_result[:, :, None] * self.ld_vectors_wd
-        )                                                            # (N, ld_num, 2)
-
-        # world -> robot frame, metres
-        dx = hit_pts[:, :, 0] - self.car_state[:, 0, None]
-        dy = hit_pts[:, :, 1] - self.car_state[:, 1, None]
-        cos_t = torch.cos(self.car_state[:, 2])[:, None]
-        sin_t = torch.sin(self.car_state[:, 2])[:, None]
-        rel_x = (dx * cos_t - dy * sin_t) / 100.0
-        rel_y = (dx * sin_t + dy * cos_t) / 100.0
-
-        g_min = self.cspace_cfg["g_min"]
-        G = self._cG
-        R = self._cR
-        ci = (R + torch.round(rel_x / g_min)).long()
-        cj = (R + torch.round(rel_y / g_min)).long()
-        inb = hit & (ci >= 0) & (ci < G) & (cj >= 0) & (cj < G)
-
-        occ_flat = torch.zeros(self.N * G * G, dtype=torch.bool, device=self.dvc)
-        n_idx = torch.arange(self.N, device=self.dvc)[:, None].expand_as(ci)[inb]
-        occ_flat[n_idx * (G * G) + ci[inb] * G + cj[inb]] = True
-        occ = occ_flat.view(self.N, G, G)
-
-        # Mark the beam paths as observed free. Sampling at half c-space-cell
-        # spacing closes gaps from the coarser lidar DDA, and stops before a hit
-        # endpoint so occupied evidence is not overwritten as free.
-        max_distance = self.ld_d_range / 100.0
-        step = g_min / 2.0
-        radial = torch.arange(
-            0.0, max_distance + step, step, device=self.dvc
-        )
-        beam_count = radial.numel()
-        ray_distance = (self.ld_scan_result / 100.0).clamp_max(max_distance)
-        free_sample = radial.view(1, 1, beam_count) < ray_distance.unsqueeze(-1)
-        free_sample &= radial.view(1, 1, beam_count) < max_distance
-        sample_pts = (
-            self.car_state[:, None, None, 0:2]
-            + radial.view(1, 1, beam_count, 1) * 100.0
-            * self.ld_vectors_wd[:, :, None, :]
-        )
-        dx_free = sample_pts[..., 0] - self.car_state[:, None, None, 0]
-        dy_free = sample_pts[..., 1] - self.car_state[:, None, None, 1]
-        cos_t = torch.cos(self.car_state[:, 2])[:, None, None]
-        sin_t = torch.sin(self.car_state[:, 2])[:, None, None]
-        rel_x_free = (dx_free * cos_t - dy_free * sin_t) / 100.0
-        rel_y_free = (dx_free * sin_t + dy_free * cos_t) / 100.0
-        free_i = R + torch.round(rel_x_free / g_min).long()
-        free_j = R + torch.round(rel_y_free / g_min).long()
-        free_inb = free_sample & (free_i >= 0) & (free_i < G) \
-            & (free_j >= 0) & (free_j < G)
-        known_flat = torch.zeros(
-            self.N * G * G, dtype=torch.bool, device=self.dvc
-        )
-        env_idx = torch.arange(self.N, device=self.dvc)[:, None, None] \
-            .expand_as(free_i)[free_inb]
-        known_flat[env_idx * (G * G) + free_i[free_inb] * G
-                   + free_j[free_inb]] = True
-        return occ, known_flat.view(self.N, G, G)
-
     def _lidar_hits_robot(self):
         """Lidar hit points in the robot frame (m), shape (N, ld_num, 2).
 
-        The same conversion `_build_occ_grid` uses (world cm -> robot frame m),
-        so the points live in exactly the frame the cost-ray beams are cast in.
+        World (cm) -> robot frame (m): `rel = R(-theta) @ (p - robot) / 100`,
+        which is exactly the frame the cost-ray beams are cast in.
         Beams that returned nothing are pushed far outside the observation
         window rather than left at the sensor's maximum range: `ld_scan_result`
         clamps a no-return beam to `ld_d_range`, and keeping it there would
@@ -1624,19 +1525,22 @@ class SparrowCspaceEnv(Sparrow):
     def _pointset_intervals(self):
         """Analytic (entry, width) intervals and collision, from lidar points.
 
-        Returns ``cost_intervals (N, C, B, nz)`` in metres -- the same tensor the
-        grid backend produces -- plus the collision flag, so everything
-        downstream of `_get_cspace_state` is backend-agnostic.
+        Returns ``cost_intervals (N, C, B, nz)`` in metres plus the collision
+        flag; everything downstream of `_get_cspace_state` only sees those two.
         """
         cfg = self.cspace_cfg
         entry, width, collide = pointset_batch(
             self._lidar_hits_robot(), self._fp_nrm, self._fp_h, self._fp_c,
             cfg["a"], cfg["cost_ray_max_range"],
         )                                                          # (N,B,nz) m
-        channels = [entry, width]
-        # A configured interval count above 2 is degenerate for this backend: no
-        # meaningful "second gap" exists once obstacles are points. Report an
-        # empty one, like the grid path does when it has no second interval.
+        # Channel 0 is the entry distance; channel 1 (this contact's own width)
+        # only exists when the configured interval count asks for it. Truncate as
+        # well as pad -- this backend always computes both, so a configured C=1
+        # would otherwise leave the observation two channels wide and every
+        # consumer that derives its flat dim from C would slice it wrong.
+        channels = [entry, width][:self.cost_ray_num_intervals]
+        # A configured interval count above 2 is degenerate: no meaningful
+        # "second gap" exists once obstacles are points. Report an empty one.
         while len(channels) < self.cost_ray_num_intervals:
             channels.append(torch.zeros_like(entry))
         return torch.stack(channels, dim=1), collide
@@ -1652,23 +1556,7 @@ class SparrowCspaceEnv(Sparrow):
         deliberately not part of the observation.
         """
         cfg = self.cspace_cfg
-        if self._pointset:
-            cost_intervals, collision = self._pointset_intervals()
-            # No grid exists on this path; the renderers that want one are
-            # short-circuited on None rather than fed a fake.
-            occ = known_free = cspace = None
-        else:
-            occ, known_free = self._build_occ_grid()
-            cspace = build_cspace(occ, self._cspace_masks, known_free)
-            collision = cspace[:, self._cR, self._cR, 0]
-            cost_intervals = cost_ray_intervals_3d(
-                cspace, self._robot_cell,
-                num_beams=cfg["cost_ray_num_beams"],
-                h_res_deg=cfg["cost_ray_h_res_degrees"],
-                max_range=cfg["cost_ray_max_range"],
-                g_min=cfg["g_min"],
-                num_intervals=cfg["cost_ray_num_intervals"],
-            )                                                      # (N,C,B,nz) m
+        cost_intervals, collision = self._pointset_intervals()     # (N,C,B,nz) m
         self.footprint_collision = collision.clone()
         # Preserve boundary-style attributes for stuck detection and rendering.
         self.cost_ray_enter_raw = cost_intervals[:, 0].detach()    # (N,B,nz) m
@@ -1689,15 +1577,9 @@ class SparrowCspaceEnv(Sparrow):
             self.cost_ray_exit_raw + self.cost_ray_second_gap_raw
         ).clamp_max(cfg["cost_ray_max_range"])
         self.cost_rays_raw = self.cost_ray_enter_raw
-        self.occ_grid = None if occ is None else occ.detach()       # (N,G,G) bool
-        self.known_free_grid = (
-            None if known_free is None else known_free.detach()
-        )                                                           # (N,G,G) bool
-        self.cspace = None if cspace is None else cspace.detach()   # (N,G,G,nz) bool
         cr_proc = preprocess_cost_ray_intervals(
             cost_intervals,
             max_range=cfg["cost_ray_max_range"],
-            epsilon=cfg["g_min"] / 2.0,
         )                                                          # (N,C,B,nz)
         self.cost_rays_proc = cr_proc.detach()
         cr = cr_proc.reshape(self.N, -1)                           # (N,C*B*nz)
@@ -1838,7 +1720,7 @@ class SparrowCspaceEnv(Sparrow):
         for polygon in polygons:
             pts = []
             for fx, fy in polygon:
-                # robot frame (m) -> world (cm); matches _build_occ_grid convention
+                # robot frame (m) -> world (cm); matches _lidar_hits_robot
                 wx = cx + 100.0 * (fx * cos_t + fy * sin_t)
                 wy = cy + 100.0 * (-fx * sin_t + fy * cos_t)
                 pts.append(self._world_2_grid(torch.tensor([wx, wy])).numpy())
@@ -1899,102 +1781,6 @@ class SparrowCspaceEnv(Sparrow):
                                (int(255 * (1 - frac)), int(255 * frac), 0),
                                sta_gd, ends_gd[i])
 
-    def _plot_cspace(self, env_idx=0, save_path="cspace_viz.png"):
-        """Render the occupancy grid, 3-D c-space and cost rays to a PNG.
-
-        Headless-safe (matplotlib Agg).  `env_idx` selects which vectorized
-        environment to draw; the grid is robot-centric (robot at the centre,
-        +x = forward).  Returns the absolute path of the saved figure.
-        """
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.gridspec import GridSpec
-
-        if self.occ_grid is None or self.cspace is None:
-            # points backend: there is no grid to draw.  Say so instead of
-            # crashing in the middle of a 30-panel figure.
-            raise RuntimeError(
-                "c-space plot needs the grid backend (CSPACE_BACKEND='grid')"
-            )
-
-        cfg = self.cspace_cfg
-        nz = cfg["nz"]
-        R = self._cR
-
-        occ = self.occ_grid[env_idx].detach().cpu().numpy()          # (G,G) bool
-        cspace = self.cspace[env_idx].detach().cpu().numpy()         # (G,G,nz) bool
-        cr_raw = self.cost_rays_raw[env_idx].detach().cpu().numpy()  # (B,nz) m
-
-        ncol = 5
-        nrow = math.ceil(nz / ncol)
-        fig = plt.figure(figsize=(4 * ncol, 3 * nrow + 8))
-        gs_top = GridSpec(1, 3, top=0.92, bottom=0.70, hspace=0.4, figure=fig)
-        gs_bot = GridSpec(nrow, ncol, top=0.62, bottom=0.04,
-                          hspace=0.35, wspace=0.25, figure=fig)
-
-        # --- overview: occupancy grid / collapsed c-space / cost rays ---
-        ax_occ = fig.add_subplot(gs_top[0, 0])
-        ax_occ.imshow(occ, origin="lower", cmap="gray_r", interpolation="nearest")
-        ax_occ.arrow(R, R, 4, 0, head_width=0.7, head_length=0.7,
-                     fc="b", ec="b", length_includes_head=True)
-        ax_occ.plot(R, R, "bo", ms=4, mfc="none")
-        ax_occ.set_title("Occupancy grid\n(robot-centric, +x fwd)")
-        ax_occ.set_xlabel("x cell")
-        ax_occ.set_ylabel("y cell")
-
-        ax_any = fig.add_subplot(gs_top[0, 1])
-        ax_any.imshow(cspace.any(axis=-1), origin="lower", cmap="Reds",
-                      vmin=0, vmax=1, interpolation="nearest")
-        ax_any.arrow(R, R, 4, 0, head_width=0.7, head_length=0.7,
-                     fc="b", ec="b", length_includes_head=True)
-        ax_any.plot(R, R, "bo", ms=4, mfc="none")
-        ax_any.set_title("C-space collapsed\n(any θ in collision)")
-        ax_any.set_xlabel("x cell")
-        ax_any.set_ylabel("y cell")
-
-        ax_cr = fig.add_subplot(gs_top[0, 2])
-        im = ax_cr.imshow(cr_raw.T, origin="lower", aspect="auto", cmap="hot",
-                          interpolation="nearest")
-        ax_cr.set_title("Cost rays (raw, m)")
-        ax_cr.set_xlabel("beam")
-        ax_cr.set_ylabel("theta layer")
-        plt.colorbar(im, ax=ax_cr, shrink=0.8)
-
-        # --- c-space slices, one per theta layer ---
-        for k in range(nz):
-            ax = fig.add_subplot(gs_bot[k // ncol, k % ncol])
-            ax.imshow(cspace[:, :, k], origin="lower", cmap="Reds",
-                      vmin=0, vmax=1, interpolation="nearest")
-            ax.plot(R, R, "bo", ms=3, mfc="none")
-            ax.set_title("θ = %.2f rad" % (k * cfg["a"]))
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-        fig.suptitle(
-            "SparrowCspaceEnv c-space (env %d, g_min=%.2f m, %d θ layers)"
-            % (env_idx, cfg["g_min"], nz), fontsize=12,
-        )
-        fig.savefig(save_path, dpi=110)
-        plt.close(fig)
-        return os.path.abspath(save_path)
-
-    def xy_projection_rgb(self, env_idx=0):
-        """Project the fraction of usable heading layers at each XY cell.
-
-        C-space ``True`` means the pose is unavailable (obstacle or entirely
-        unknown footprint). The grayscale value is linear in the usable theta
-        fraction: black means no heading is usable, white means every heading
-        is usable. Returns an RGB uint8 image in robot-centric grid coordinates.
-
-        Needs the grid backend (the points backend keeps no c-space grid);
-        returns None there so renderers can skip the layer.
-        """
-        if self.cspace is None:
-            return None
-        available_fraction = (~self.cspace[env_idx]).float().mean(dim=-1)
-        intensity = (available_fraction * 255.0).round().to(torch.uint8)
-        return intensity.unsqueeze(-1).expand(-1, -1, 3).contiguous()
 
     # ------------------------------------------------------------- gym-like API
     def reset(self):
@@ -2099,10 +1885,4 @@ if __name__ == "__main__":
     print("reward:", r.tolist(), "done:", dw.tolist())
     assert s.shape == exp_shape and s_next.shape == exp_shape
     assert s.dtype == torch.float32
-
-    # visualize the generated c-space (occ grid + c-space slices + cost rays)
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-    os.makedirs(out_dir, exist_ok=True)
-    png = env._plot_cspace(env_idx=0, save_path=os.path.join(out_dir, "cspace_viz.png"))
-    print("c-space visualization saved to:", png)
     print("self-test OK")

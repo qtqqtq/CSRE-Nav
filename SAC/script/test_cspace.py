@@ -12,8 +12,8 @@ over completed episodes, in m/s; unfinished episodes are excluded.
 Nothing here may drift from train.py: the lidar settings, the footprint regime
 and the c-space geometry all take their defaults from settings.py, so a
 checkpoint is evaluated in the regime it was trained under. `--random_footprint`
-and `--backend` change what the policy sees, so any comparison across them must
-hold the weights and the seed fixed.
+changes what the policy sees, so any comparison across it must hold the weights
+and the seed fixed.
 """
 
 import argparse
@@ -47,11 +47,6 @@ def parse_args():
     parser.add_argument("--intervals", type=positive_int,
                         default=settings.CSPACE_COST_RAY_NUM_INTERVALS,
                         help="ray interval channels used when training the model")
-    parser.add_argument("--backend", choices=("grid", "points"),
-                        default=settings.CSPACE_BACKEND,
-                        help="c-space observation geometry used for evaluation; "
-                             "switching it changes what the policy sees, so "
-                             "compare backends with one checkpoint and one seed")
     parser.add_argument("--random_footprint", type=str2bool,
                         default=settings.RANDOM_FOOTPRINT_ENABLED,
                         help="draw a new footprint every episode, as train.py does; "
@@ -103,12 +98,12 @@ def main():
         action_type="Continuous",
         stuck_reset=settings.SPARROW_STUCK_RESET,
         stuck_threshold=settings.SPARROW_STUCK_THRESHOLD,
+        ld_num=settings.SPARROW_LD_NUM,
         ld_acc=settings.SPARROW_LD_ACC,
         random_footprint=args.random_footprint,
         render_mode=None,
         max_ep_steps=settings.MAX_STEPS,
-        cspace_cfg={"cost_ray_num_intervals": args.intervals,
-                    "backend": args.backend},
+        cspace_cfg={"cost_ray_num_intervals": args.intervals},
     )
 
     completed = successes = collisions = stuck_resets = timeouts = 0
@@ -133,9 +128,7 @@ def main():
                 )
                 kinematic = state[:, ray_grid_flat_dim:]
                 action = actor.get_mean_action(ray_grid, kinematic)
-                state, _, terminated, truncated, _ = env.step(
-                    settings.map_continuous_action(action)
-                )
+                state, _, terminated, truncated, _ = env.step(action)
 
                 dt = env.ctrl_interval.reshape(-1)  # seconds, one per env
                 episode_distance += env.car_state[:, 3].abs() * dt / 100.0
@@ -165,7 +158,6 @@ def main():
     metrics = {
         "model": args.model,
         "intervals": args.intervals,
-        "backend": args.backend,
         "random_footprint": args.random_footprint,
         "device": str(device),
         "seed": args.seed,
@@ -189,7 +181,7 @@ def main():
     print("model: %s | intervals: %d | device: %s | seed: %d | episodes: %d | envs: %d" % (
         args.model, args.intervals, device, args.seed, completed, env_count,
     ))
-    print("backend: %s | random footprint: %s" % (args.backend, args.random_footprint))
+    print("random footprint: %s" % (args.random_footprint,))
     print("success rate: %.2f%% (%d/%d)" % (
         100.0 * successes / completed, successes, completed,
     ))

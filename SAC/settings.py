@@ -30,28 +30,13 @@ ACTION_DIM = 2        # [linear_vel, angular_vel]
 MAX_ACTION = 1        # actor output is tanh-bounded to [-1, 1]
 
 # ---------------------------------------------------------------------------
-# Continuous action mapping (Sparrow c-space pipeline)
+# Continuous action convention (Sparrow c-space pipeline)
 # ---------------------------------------------------------------------------
-# 是否允许倒车：为 True 时连续线速度指令 a0 取 [-1,1]（-1 = 全速倒车），
-# 训练/play 的动作映射改为恒等映射；为 False 时保持原来的前向约束
-# a_in[0] = (a0+1)/2 ∈ [0,1]。env 端 _Continuous_Kinematic_model_vec 用
-# continuous_scale*a 直接把指令缩放成 cm/s，因此 a0=-1 即 -50 cm/s，
-# 与离散动作空间的倒车档 (a_state[5]) 语义一致。
-ALLOW_REVERSE = True
+# actor 的线性输出 a0 取 [-1,1]，-1 即全速倒车，**不需要任何映射**：env 端
+# _Continuous_Kinematic_model_vec 用 continuous_scale*a 直接把指令缩放成 cm/s，
+# 因此 a0=-1 即 -50 cm/s，与离散动作空间的倒车档 (a_state[5]) 语义一致。
+# （调用方直接把 actor 输出交给 env.step；"不允许倒车" 的前向分支已删除。）
 
-
-def map_continuous_action(action, allow_reverse=None):
-    """把 actor 输出 (tanh [-1,1], shape (N,2)) 映射为 env 速度指令。
-
-    allow_reverse=True -> 线性 [-1,1]（负值倒车）；False -> (a0+1)/2 进 [0,1]。
-    角速度恒为 [-1,1]。
-    """
-    if allow_reverse is None:
-        allow_reverse = ALLOW_REVERSE
-    if allow_reverse:
-        return action
-    a0, a1 = action[..., 0], action[..., 1]
-    return torch.stack([(a0 + 1) / 2, a1], dim=-1)
 
 # ---------------------------------------------------------------------------
 # C-space observation geometry — 单一来源（cost-ray 观测的真实几何参数）
@@ -61,28 +46,15 @@ def map_continuous_action(action, allow_reverse=None):
 # 之前 nz/a 有两份拷贝(settings 的 RAY_V_LAYERS 与 env 的 cspace_cfg["nz"])，只改
 # 一处就会维度错位(改 RAY_V_LAYERS=30 而观测仍 10 层 → reshape/load 报错)。
 # 现在观测管线与网络形状都从这里派生，想调 θ 分辨率只改 CSPACE_NZ 一处。
-# 注意: cspace_cost_rays.DEFAULT_CFG 仍是旧版参考配置(0.44 m 车 / 5 m 量程，
-# a=0.698/nz=10)，仅供该模块 --bench / verify 使用；实际训练评测走下面的值。
 # ---------------------------------------------------------------------------
-CSPACE_G_MIN = 0.1                  # c-space 网格分辨率 (m)
 CSPACE_COST_RAY_MAX_RANGE = 3.0     # cost-ray 最大探测范围 (m)（= 观测局部窗口半径）
 CSPACE_COST_RAY_NUM_BEAMS = 36      # 水平波束数（0°–360°）
 CSPACE_COST_RAY_H_RES_DEGREES = 360.0 / CSPACE_COST_RAY_NUM_BEAMS  # 10 deg
-CSPACE_COST_RAY_NUM_INTERVALS = 2   # 连续径向区间数：首次命中距离、障碍宽度、空闲宽度……
+CSPACE_COST_RAY_NUM_INTERVALS = 1   # 连续径向区间数：首次命中距离、障碍宽度、空闲宽度……
 CSPACE_NZ = 30                      # 观测 θ 朝向层数（cost-ray 第三维, = nz_）
 CSPACE_A = 2 * math.pi / CSPACE_NZ  # θ 分辨率 (rad)，~0.209 = 12°；nz·a=2π -> nz 个
                                     # 朝向唯一、无重复拷贝（旧观测 a=0.698≈2π/9 配
                                     # nz=10 时，第 10 层是第 0 层的拷贝）
-
-# c-space 观测的几何后端：
-#   "grid"   —— 栅格：occ_grid -> conv 膨胀 -> build_cspace -> 沿格 ray march
-#               （面位置受 g_min 量化 ±5 cm，且相邻命中点半格各自四舍五入会互相推远
-#                g_min，在本该闭合的开口上留下假缝 —— 见 g_min 与 w⊥ 的关系）
-#   "points" —— 解析：障碍 = 激光命中点集，判据 = 闵可夫斯基半平面不等式，完全不用栅格
-#               （cspace_cost_rays.pointset_batch / pointset_collision）
-# 两者输出**同一形状、同一语义**的 (N, C, B, nz) 区间张量 ⇒ 观测维数不变、权重可互换。
-# 注意它改变的是策略看到的世界，不是渲染开关：跨后端比成功率必须同一份权重 + 同一个 seed。
-CSPACE_BACKEND = "points"           # "grid" | "points"
 
 # CNN ray-grid dims (aliases kept — the network / reshape code reads these)
 RAY_CHANNELS = CSPACE_COST_RAY_NUM_INTERVALS             # 每个径向区间对应一个 CNN 通道
@@ -96,8 +68,9 @@ RAY_GRID_FLAT_DIM = RAY_CHANNELS * RAY_H_BEAMS * RAY_V_LAYERS
 # post-filter *actual* velocities, not the previous action command:
 # car_state[:, 3:5] / [v_linear_max, v_angular_max], clipped to [-1, 1].
 # This keeps the observation Markov under Sparrow's first-order actuator model.
-# The input is also a three-channel ray-segment grid, so checkpoints trained with
-# the old one-/two-channel rays or the old 2-D kinematic block are incompatible.
+# The ray half of the input is the C×36×30 ray-segment grid, so checkpoints
+# trained with a different channel count or the old 2-D kinematic block are
+# incompatible.
 KINEMATIC_DIM = 4
 CNN_STATE_DIM = RAY_GRID_FLAT_DIM + KINEMATIC_DIM      # CNN state
 
@@ -152,7 +125,7 @@ MAX_TIMESTEPS = 5e6   # total training steps
 # ---------------------------------------------------------------------------
 SAFETY_REWARD_WEIGHT = 0.0
 SPEED_REWARD_WEIGHT = 0.0
-SPARROW_DISTANCE_REWARD_WEIGHT = 8.0  # tuned goal-progress weight
+SPARROW_DISTANCE_REWARD_WEIGHT = 2.0  # tuned goal-progress weight
 SPARROW_FORWARD_REWARD_WEIGHT = 3.0   # tuned forward-motion reward
 SPARROW_REVERSE_PENALTY_WEIGHT = 1.5  # full-speed reverse motion: -1.5 per step
 SPARROW_ANGULAR_VEL_PENALTY = 0.1     # full angular command: -0.1 per step
@@ -162,9 +135,10 @@ SPARROW_STEP_PENALTY = 3.0            # tuned constant per-step penalty
 # Sparrow c-space environment (Sparrow_V2 / train.py)
 # ---------------------------------------------------------------------------
 SPARROW_N_ENVS = 32          # vectorized environments per training step
-SPARROW_N_OBSTACLES = 8      # moving obstacles per environment
-SPARROW_DYNAMIC_OBS = False   # whether to spawn moving obstacles in c-space environments
+SPARROW_N_OBSTACLES = 16      # moving obstacles per environment
+SPARROW_DYNAMIC_OBS = True   # whether to spawn moving obstacles in c-space environments
 SPARROW_OBS_V = 25           # maximum moving-obstacle speed (cm/s)
+SPARROW_LD_NUM = 72         # lidar rays per world (ld_a_range=360 deg -> 1 deg apart)
 SPARROW_LD_ACC = 8           # lidar DDA step size (cm); larger = faster but coarser scan
 # 6x6 regions x 2 attempts x 0.25 -> about 18 static line obstacles per map.
 SPARROW_GENERATE_RATE = 0.25

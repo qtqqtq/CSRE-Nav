@@ -20,7 +20,7 @@ if __name__ == "__main__":
     except rospy.ROSInterruptException:
         pass
     except Exception as exc:
-        # Configuration problems (missing checkpoint, geometry mismatch, bad
-        # backend) are fatal and must be loud rather than a silent traceback.
+        # Configuration problems (missing checkpoint, geometry mismatch) are
+        # fatal and must be loud rather than a silent traceback.
         rospy.logfatal("cnav: %s", exc)
         raise

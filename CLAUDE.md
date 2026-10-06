@@ -72,7 +72,7 @@ Gazebo simulation → /r1/front_laser/scan (LaserScan) → laser_callback()
 ### State and action spaces
 
 - **State** (44-dim MLP / 364-dim CNN): 40 laser distance bins (or 360-dim ray-grid) + `[distance_to_goal, heading_error, linear_vel, angular_vel]`
-- **Action** (2-dim): `[linear_vel ∈ [-1,1] (SAC c-space 管线设 settings.ALLOW_REVERSE=True，负值即倒车), angular_vel ∈ [-1,1]]` — sent to the robot via `/r1/cmd_vel`
+- **Action** (2-dim): `[linear_vel ∈ [-1,1] (负值即倒车), angular_vel ∈ [-1,1]]` — sent to the robot via `/r1/cmd_vel`
 - **Reward**: `+100` goal reached, `-100` collision, otherwise `speed_weight * r_vel + safety_weight * r_ss` (velocity alignment + log-average safety)
 
 ### Key files
@@ -85,7 +85,6 @@ Gazebo simulation → /r1/front_laser/scan (LaserScan) → laser_callback()
 | `SAC/test_sac.py` | Inference-only MLP SAC — loads trained Actor, runs deterministic eval |
 | `SAC/test_cnn.py` | Inference-only CNN SAC — loads trained Actor, runs deterministic eval |
 | `SAC/replay_buffer.py` | Standard deque-based experience replay buffer |
-| `SAC/assets/multi_robot_scenario.launch` | Launch file that starts Gazebo with the training environment |
 | `GDAM_env.py` | Alternative environment for the GDAM variant — 2D RPLIDAR and POI-based waypoint generation with `move_base` |
 
 ### SAC algorithm details
